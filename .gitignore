@@ -1,0 +1,33 @@
+# Rust
+/target/
+Cargo.lock
+
+# WASM build artifacts
+/build/
+/dist/
+
+# Secrets
+secrets.md
+
+# Cloudflare
+.wrangler/
+.dev.vars
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+D1-QUERIES.md
+.claude/
+
+# Local ad-hoc maintenance scripts (one-off ops tooling — not for distribution)
+repair_*.mjs
+verify_monitor.sh

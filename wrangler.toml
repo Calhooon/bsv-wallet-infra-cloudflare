@@ -1,0 +1,48 @@
+name = "wallet-infra"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+# account_id = "<your-cloudflare-account-id>"
+
+# Optional custom domain — uncomment and edit after initial deploy.
+# routes = [
+#   { pattern = "wallet-infra.example.com", custom_domain = true }
+# ]
+
+[vars]
+# Public chaintracker worker exposing /findHeaderHexForHeight.
+# Default points at the open `Calhooon/chaintracks-cloudflare` deployment;
+# replace with your own deploy if you'd rather not depend on it.
+CHAINTRACKS_URL = "https://chaintracks.example.com"
+
+# BEEF verification mode: "strict" | "log_only" | "skip"
+#   strict   — hard-reject on bad merkle root (recommended)
+#   log_only — validate + log, return BEEF anyway
+#   skip     — bypass tracker entirely (drain-time / emergency only)
+BEEF_VERIFICATION = "strict"
+
+# Secrets (set via `wrangler secret put`):
+#   ARC_API_KEY — TAAL ARC API key for broadcast acceleration (optional).
+#   WOC_API_KEY — WhatsOnChain API key for fallback broadcast (optional).
+
+[build]
+command = "worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "wallet-infra"
+database_id = "<your-d1-database-id>"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "wallet-infra-blobs"
+
+[[kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "<your-kv-namespace-id>"
+
+[triggers]
+# Background monitor: re-broadcasts unconfirmed txs and reconciles state.
+# */5 minutes is the conservative cadence. Tighter cadences combined with
+# upstream rate limits (e.g. WoC 429s) can cascade — only adjust after
+# observing the failure mode.
+crons = ["*/5 * * * *"]

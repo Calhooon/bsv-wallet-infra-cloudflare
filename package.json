@@ -1,0 +1,16 @@
+{
+  "name": "wallet-infra",
+  "private": true,
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "test": "cargo test 2>&1",
+    "test:e2e": "./tests/e2e/run_all.sh",
+    "test:e2e:health": "./tests/e2e/health_check.sh",
+    "test:e2e:monitor": "./tests/e2e/monitor_health.sh",
+    "test:e2e:smoke": "./tests/e2e/json_rpc_smoke.sh"
+  },
+  "devDependencies": {
+    "wrangler": "^3"
+  }
+}
