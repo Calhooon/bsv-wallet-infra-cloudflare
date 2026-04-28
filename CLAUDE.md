@@ -1,6 +1,8 @@
 # bsv-wallet-infra-cloudflare
 
-BSV wallet storage server on Cloudflare Workers. Rust compiled to WASM. JSON-RPC 2.0 API authenticated via BRC-31. Self-hosted alternative to `storage.babbage.systems`.
+Cloudflare Workers port of [`bsv-blockchain/wallet-infra`](https://github.com/bsv-blockchain/wallet-infra) (TypeScript Express + MySQL, built on [`wallet-toolbox`](https://github.com/bsv-blockchain/wallet-toolbox)). Rust → WASM, single Worker. JSON-RPC 2.0, BRC-31 auth, BRC-29 payments. Wire-compatible with `storage.babbage.systems`.
+
+Mapping: TS Express → CF Worker, MySQL → D1 (SQLite), MySQL `LONGBLOB` → R2 (4 KB overflow), in-memory session → KV (1 h TTL), Knex migrations → `wrangler d1 migrations apply`, separate cron process → `#[event(scheduled)]`.
 
 ## Build & Run
 

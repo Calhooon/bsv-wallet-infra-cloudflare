@@ -1,8 +1,22 @@
 # bsv-wallet-infra-cloudflare
 
-BSV wallet storage server on Cloudflare Workers. Rust compiled to WASM. JSON-RPC 2.0 API authenticated via [BRC-31](https://brc.dev/31). Drop-in replacement for `storage.babbage.systems`.
+Cloudflare Workers port of [`bsv-blockchain/wallet-infra`](https://github.com/bsv-blockchain/wallet-infra) — the BSV **UTXO Management Server** (also called "wallet storage server"). Rust compiled to WASM, packaged as a single Worker.
 
-Reimplementation of the TypeScript `bsv-wallet-toolbox` storage layer as a single Cloudflare Worker. Same JSON-RPC method surface, same response shapes — clients built against the TS reference (or against `bsv-wallet-toolbox-rs` `StorageClient`) work unchanged.
+The upstream TypeScript implementation runs as an Express service backed by MySQL + Knex, gluing together the [`wallet-toolbox`](https://github.com/bsv-blockchain/wallet-toolbox) storage library, [`auth-express-middleware`](https://github.com/bitcoin-sv/auth-express-middleware), and [`payment-express-middleware`](https://github.com/bitcoin-sv/payment-express-middleware). This port collapses all of that into a single Cloudflare Worker:
+
+| Concern | Upstream (TS) | This port (Rust/WASM) |
+|---|---|---|
+| Runtime | Node.js + Express | Cloudflare Workers (`wasm32-unknown-unknown`) |
+| Storage library | [`wallet-toolbox`](https://github.com/bsv-blockchain/wallet-toolbox) | Reimplemented inline in `src/storage/` |
+| Auth middleware | [`auth-express-middleware`](https://github.com/bitcoin-sv/auth-express-middleware) | [`bsv-middleware-cloudflare`](https://crates.io/crates/bsv-middleware-cloudflare) ([BRC-31](https://brc.dev/31)) |
+| Payment middleware | [`payment-express-middleware`](https://github.com/bitcoin-sv/payment-express-middleware) | Same crate (BRC-29) |
+| Structured data | MySQL + Knex | Cloudflare D1 (SQLite) |
+| Blob storage | MySQL `LONGBLOB` | R2 with 4 KB overflow threshold |
+| Session cache | Express memory / Redis | Cloudflare KV (1 h TTL) |
+| Migrations | Knex auto-migrate | `wrangler d1 migrations apply` |
+| Cron / monitor | Separate Node process | `#[event(scheduled)]` (`*/5 * * * *`) |
+
+**Wire-compatible with `storage.babbage.systems`.** Same JSON-RPC method names, same param shapes, same response shapes. Clients built against the TS reference work unchanged against this server.
 
 ## What it does
 
