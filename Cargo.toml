@@ -2,21 +2,12 @@
 name = "bsv-wallet-infra-cloudflare"
 version = "0.1.0"
 edition = "2021"
-description = "Self-hosted BSV wallet storage server on Cloudflare Workers (Rust → WASM). JSON-RPC 2.0, BRC-31 authenticated, drop-in replacement for storage.babbage.systems."
-license = "MIT"
-repository = "https://github.com/Calhooon/bsv-wallet-infra-cloudflare"
-keywords = ["bsv", "wallet", "cloudflare", "workers", "storage"]
-categories = ["web-programming", "cryptography"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# BRC-31 auth + BRC-29 payment middleware (published from
-# https://github.com/Calhooon/bsv-middleware-cloudflare). Aliased to
-# `bsv-auth-cloudflare` so the source's `use bsv_auth_cloudflare::...`
-# imports keep working — the package was renamed when published.
-bsv-auth-cloudflare = { package = "bsv-middleware-cloudflare", version = "0.1.2" }
+bsv-auth-cloudflare = { path = "../rust-middleware/bsv-auth-cloudflare" }
 bsv-sdk = { package = "bsv-rs", version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
 worker = { version = "0.7", features = ["d1"] }
 serde-wasm-bindgen = "0.6"
@@ -34,3 +25,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+# G5 tests: real-SQLite harness for the monitor's external-spend scan — runs
+# the ACTUAL migrations + the ACTUAL candidate/guard SQL consts against an
+# in-memory DB (D1 is SQLite, so semantics match). "bundled" compiles its own
+# libsqlite3 (no system dependency). Dev-only: does not touch the wasm build.
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -3,7 +3,9 @@
 //! Implements `BroadcastService` and `ProofService` using the WoC REST API.
 //! This is the legacy provider -- ARC is the primary provider.
 
-use super::{BroadcastError, BroadcastResult, BroadcastService, ProofResult, ProofService};
+use super::{
+    BroadcastError, BroadcastResult, BroadcastService, ProofResult, ProofService, SpentStatus,
+};
 use crate::services::chaintracker::RetryConfig;
 use bsv_sdk::transaction::{MerklePath, MerklePathLeaf};
 use serde::Deserialize;
@@ -43,6 +45,40 @@ struct WocTxStatus {
     error: Option<String>,
 }
 
+/// Response of WoC `GET /tx/{txid}/{vout}/spent` (HTTP 200 case).
+///
+/// Verified live 2026-07-05 against a mainnet spent outpoint:
+///   `{"txid":"<spending txid>","vin":0,"status":"confirmed"}`
+/// An UNSPENT (or unknown) outpoint returns HTTP 404 instead.
+/// `status` can also be "unconfirmed" for a mempool-only spend — per the
+/// owner rule (SEEN = final on BSV) we treat ANY 200 with a txid as spent,
+/// so `vin`/`status` are parsed but never gate the decision.
+#[derive(Debug, Deserialize)]
+struct WocSpentTxResponse {
+    txid: String,
+    #[allow(dead_code)]
+    vin: Option<u32>,
+    #[allow(dead_code)]
+    status: Option<String>,
+}
+
+/// Parse the HTTP-200 body of WoC's outpoint-spent endpoint.
+///
+/// Pure function so the classification is unit-testable. Any parseable body
+/// with a non-empty spending txid → `Spent`; a malformed/empty body is an
+/// error (ambiguous — the caller must count it as a service error and take
+/// NO action on the output).
+pub(crate) fn parse_spent_response(text: &str) -> std::result::Result<SpentStatus, String> {
+    let parsed: WocSpentTxResponse = serde_json::from_str(text)
+        .map_err(|e| format!("WoC spent-status parse: {} (body: {:?})", e, &text[..text.len().min(120)]))?;
+    if parsed.txid.is_empty() {
+        return Err("WoC spent-status: 200 with empty spending txid".to_string());
+    }
+    Ok(SpentStatus::Spent {
+        spending_txid: parsed.txid,
+    })
+}
+
 // =============================================================================
 // WocProvider
 // =============================================================================
@@ -69,7 +105,7 @@ pub struct WocProvider {
     api_key: Option<String>,
     /// Optional ChainTracks URL used to resolve the canonical block hash at a
     /// given height when filtering multi-entry TSC proof responses. Our own
-    /// Worker (`chaintracks-cloudflare`) is the authoritative source of canonical
+    /// Worker (`rust-chaintracks`) is the authoritative source of canonical
     /// chain state; falling back to WoC's `/block/height/{h}` when it isn't
     /// set or errors keeps this change backward-compatible.
     chaintracks_url: Option<String>,
@@ -504,6 +540,70 @@ impl ProofService for WocProvider {
         }
 
         Ok(all_results)
+    }
+
+    /// Outpoint spent-status via WoC `GET /tx/{txid}/{vout}/spent` (G5).
+    ///
+    /// Semantics (verified live 2026-07-05):
+    /// - 200 + `{"txid": ...}` → `Spent` — regardless of the `status` field:
+    ///   on BSV a SEEN spending tx is final (first-seen, no RBF), so an
+    ///   "unconfirmed" mempool spend counts exactly like a mined one.
+    /// - 404 → `Unspent`. NOTE: WoC also 404s for outpoints it has never
+    ///   indexed, which is indistinguishable — both mean "take no action".
+    /// - Retries 429/5xx via `RetryConfig` like the other WoC lookups; a
+    ///   still-failing call is an `Err` (transient — caller must not treat
+    ///   it as unspent OR spent).
+    async fn get_spent_status(
+        &self,
+        txid: &str,
+        vout: u32,
+    ) -> std::result::Result<SpentStatus, String> {
+        let url = format!("{}/tx/{}/{}/spent", WOC_BASE, txid, vout);
+        let retry = RetryConfig::default();
+        let mut last_err = String::new();
+
+        for attempt in 0..=retry.max_retries {
+            let mut init = worker::RequestInit::new();
+            init.with_method(worker::Method::Get);
+            if let Some(ref key) = self.api_key {
+                let headers = worker::Headers::new();
+                let _ = headers.set("woc-api-key", key);
+                init.with_headers(headers);
+            }
+            let request = worker::Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
+            let mut response = match worker::Fetch::Request(request).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = format!("WoC get_spent_status fetch: {}", e);
+                    if attempt < retry.max_retries {
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            };
+
+            let status = response.status_code();
+            if status == 404 {
+                return Ok(SpentStatus::Unspent);
+            }
+            if RetryConfig::is_retryable_status(status) && attempt < retry.max_retries {
+                last_err = format!(
+                    "WoC get_spent_status HTTP {} (attempt {}/{})",
+                    status,
+                    attempt + 1,
+                    retry.max_retries + 1
+                );
+                continue;
+            }
+            if status >= 400 {
+                return Err(format!("WoC get_spent_status HTTP {}", status));
+            }
+
+            let text = response.text().await.map_err(|e| e.to_string())?;
+            return parse_spent_response(&text);
+        }
+
+        Err(last_err)
     }
 }
 
@@ -1346,5 +1446,60 @@ mod tests {
         };
         assert_eq!(detail.status, "unknown");
         assert!(detail.depth.is_none());
+    }
+
+    // =========================================================================
+    // parse_spent_response — G5 outpoint spent-status (WoC /tx/{txid}/{vout}/spent)
+    // =========================================================================
+
+    #[test]
+    fn test_parse_spent_confirmed() {
+        // Exact live shape captured 2026-07-05 from a mainnet spent outpoint.
+        let body = r#"{"txid":"966982298fb694542673baed76c09cd35e8420610192ede11077abf8769d33b2","vin":0,"status":"confirmed"}"#;
+        let status = parse_spent_response(body).unwrap();
+        assert_eq!(
+            status,
+            SpentStatus::Spent {
+                spending_txid: "966982298fb694542673baed76c09cd35e8420610192ede11077abf8769d33b2"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_spent_unconfirmed_is_still_spent() {
+        // Owner rule: SEEN = final on BSV. A mempool-only spend counts as
+        // spent — the status field must never gate the decision.
+        let body = r#"{"txid":"aa11","vin":2,"status":"unconfirmed"}"#;
+        let status = parse_spent_response(body).unwrap();
+        assert_eq!(
+            status,
+            SpentStatus::Spent {
+                spending_txid: "aa11".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_spent_missing_optional_fields() {
+        // vin/status absent — txid alone is sufficient.
+        let body = r#"{"txid":"bb22"}"#;
+        let status = parse_spent_response(body).unwrap();
+        assert!(matches!(status, SpentStatus::Spent { spending_txid } if spending_txid == "bb22"));
+    }
+
+    #[test]
+    fn test_parse_spent_empty_txid_is_error() {
+        // Ambiguous 200 — must be a service error (no action), never Unspent.
+        let body = r#"{"txid":"","vin":0,"status":"confirmed"}"#;
+        assert!(parse_spent_response(body).is_err());
+    }
+
+    #[test]
+    fn test_parse_spent_garbage_is_error() {
+        assert!(parse_spent_response("Not Found").is_err());
+        assert!(parse_spent_response("").is_err());
+        assert!(parse_spent_response("null").is_err());
+        assert!(parse_spent_response("{}").is_err());
     }
 }

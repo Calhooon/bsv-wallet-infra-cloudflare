@@ -194,10 +194,16 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             return Ok((row.into_table(), false));
         }
 
-        // Insert new user
+        // Idempotent insert. `ON CONFLICT DO NOTHING` absorbs a concurrent insert that
+        // raced us between the SELECT above and here: during signup several storage RPCs
+        // (balance, history, enroll) call resolve_auth -> find_or_insert_user for the SAME
+        // device identity_key near-simultaneously, and the loser of that race previously
+        // hit `UNIQUE constraint failed: users.identity_key` (surfaced in the 100cash app
+        // as "Refresh failed: getBalance failed: ... SQLITE_CONSTRAINT_UNIQUE").
         let now = Utc::now();
         let meta = Query::new(
-            "INSERT INTO users (identity_key, active_storage, created_at, updated_at) VALUES (?, '', ?, ?)",
+            "INSERT INTO users (identity_key, active_storage, created_at, updated_at) \
+             VALUES (?, '', ?, ?) ON CONFLICT(identity_key) DO NOTHING",
         )
         .bind(identity_key)
         .bind(now)
@@ -205,15 +211,30 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         .execute(self.db)
         .await?;
 
-        let user = TableUser {
-            user_id: meta.last_row_id,
-            identity_key: identity_key.to_string(),
-            active_storage: Some(String::new()),
-            created_at: now,
-            updated_at: now,
-        };
+        if meta.changes > 0 {
+            // We won the insert; last_row_id is ours.
+            let user = TableUser {
+                user_id: meta.last_row_id,
+                identity_key: identity_key.to_string(),
+                active_storage: Some(String::new()),
+                created_at: now,
+                updated_at: now,
+            };
+            return Ok((user, true));
+        }
 
-        Ok((user, true))
+        // A concurrent caller inserted it first (DO NOTHING -> changes == 0). Select the
+        // canonical row so we return its real user_id (last_row_id is unreliable here).
+        let row: UserRow = Query::new("SELECT * FROM users WHERE identity_key = ?")
+            .bind(identity_key)
+            .fetch_optional(self.db)
+            .await?
+            .ok_or_else(|| {
+                crate::error::Error::InternalError(
+                    "user row missing after ON CONFLICT DO NOTHING".to_string(),
+                )
+            })?;
+        Ok((row.into_table(), false))
     }
 
     /// Resolve an AuthId: look up user_id if not already set.

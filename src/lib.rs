@@ -1,4 +1,4 @@
-//! bsv-wallet-infra-cloudflare: BSV Wallet Storage Server on Cloudflare Workers.
+//! rust-wallet-infra: BSV Wallet Storage Server on Cloudflare Workers.
 //!
 //! Self-hosted replacement for storage.babbage.systems.
 //! Backed by D1 (SQLite) + R2 (blob storage).
@@ -123,6 +123,8 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "reorg_detected": result.reorg_detected,
             "reorg_depth": result.reorg_depth,
             "proofs_reverified": result.proofs_reverified,
+            "ext_spends_scanned": result.ext_spends_scanned,
+            "ext_spends_found": result.ext_spends_found,
             "errors": result.errors,
         }))?;
         return Ok(add_cors_headers(response));
@@ -304,8 +306,18 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         woc_api_key,
         chaintracks_url,
     );
-    let mut storage =
-        StorageD1::new(&db, &blobs, &provider).with_beef_verification(beef_mode, &header_provider);
+    // ZERO-CONF dev lever: when INTERNALIZE_ZERO_CONF=true, a freshly-internalized
+    // deposit stays spendable even if the internalize-time broadcast hits a transient
+    // ServiceError — removing the ~1-block wait for the monitor to reconcile spendable.
+    let internalize_zero_conf = env
+        .var("INTERNALIZE_ZERO_CONF")
+        .ok()
+        .map(|v| matches!(v.to_string().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    let mut storage = StorageD1::new(&db, &blobs, &provider)
+        .with_beef_verification(beef_mode, &header_provider)
+        .with_internalize_zero_conf(internalize_zero_conf);
 
     // Build auth ID from BRC-31 context
     let auth = AuthId::new(&auth_context.identity_key);
@@ -364,7 +376,7 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     let result = monitor::run_monitor(&db, &blobs, &provider, &provider).await;
 
     console_log!(
-        "Monitor: {} sent, {} send errors, {} proofs found, {} checked, {} abandoned failed, {} status synced, {} beef compacted, {} unfail recovered, {} purged, {} nosend found, reorg={} depth={} reverified={}, {} errors",
+        "Monitor: {} sent, {} send errors, {} proofs found, {} checked, {} abandoned failed, {} status synced, {} beef compacted, {} unfail recovered, {} purged, {} nosend found, reorg={} depth={} reverified={}, ext_spends {}/{} scanned/found, {} errors",
         result.sent,
         result.send_errors,
         result.proofs_found,
@@ -378,6 +390,8 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
         result.reorg_detected,
         result.reorg_depth,
         result.proofs_reverified,
+        result.ext_spends_scanned,
+        result.ext_spends_found,
         result.errors.len()
     );
     for err in &result.errors {

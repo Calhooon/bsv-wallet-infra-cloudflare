@@ -64,12 +64,73 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             ));
         }
 
-        // Step 3: Validate — must be in an abortable status
-        if !is_abortable(status) {
+        // Step 3: Validate — must be in an abortable status.
+        //
+        // 'sending' is conditionally abortable (review M-A): a DELAYED
+        // action now commits as tx 'sending' with req 'unsent' — signed but
+        // never handed to the network. Aborting that is legitimate (and the
+        // req-invalidation below guarantees send_waiting can't post it
+        // later). A 'sending' tx whose req has progressed past 'unsent'/
+        // 'nosend' HAS potentially reached the network — refuse.
+        if status == "sending" {
+            #[derive(serde::Deserialize)]
+            struct ReqStatusRow {
+                status: Option<String>,
+            }
+            let req_row: Option<ReqStatusRow> = Query::new(
+                "SELECT status FROM proven_tx_reqs WHERE txid = (SELECT txid FROM transactions WHERE transaction_id = ?)",
+            )
+            .bind(tx_id)
+            .fetch_optional(self.db)
+            .await?;
+            let req_status = req_row.and_then(|r| r.status);
+            match req_status.as_deref() {
+                None | Some("unsent") | Some("nosend") => { /* never posted — abortable */ }
+                Some(other) => {
+                    return Err(Error::ValidationError(format!(
+                        "Cannot abort 'sending' transaction: its broadcast request is already '{}'",
+                        other
+                    )));
+                }
+            }
+        } else if !is_abortable(status) {
             return Err(Error::ValidationError(format!(
                 "Cannot abort transaction with status '{}'. Abortable statuses: {:?}",
                 status, ABORTABLE_STATUSES
             )));
+        }
+
+        // Step 3b: chain gate (ts-stack 2.4.0 StorageProvider.ts:281-345
+        // parity): a nosend/queued tx that is ALREADY known/mined on the
+        // network cannot be aborted — releasing its inputs would double-
+        // allocate coins the chain has consumed. Statuses that can have
+        // reached the network get a status check; pure drafts skip it.
+        if matches!(status, "nosend" | "sending" | "unprocessed") {
+            #[derive(serde::Deserialize)]
+            struct TxidRow {
+                txid: Option<String>,
+            }
+            let txid_row: Option<TxidRow> =
+                Query::new("SELECT txid FROM transactions WHERE transaction_id = ?")
+                    .bind(tx_id)
+                    .fetch_optional(self.db)
+                    .await?;
+            if let Some(txid) = txid_row.and_then(|r| r.txid).filter(|t| !t.is_empty()) {
+                let net_status = self
+                    .broadcast
+                    .get_status_for_txids(&[txid.clone()])
+                    .await
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+                    .map(|s| s.status)
+                    .unwrap_or_else(|| "unavailable".to_string());
+                if net_status == "known" || net_status == "mined" {
+                    return Err(Error::ValidationError(format!(
+                        "Cannot abort: transaction {} is already {} on the network",
+                        txid, net_status
+                    )));
+                }
+            }
         }
 
         // Step 4: Check that no outputs of this transaction have been spent elsewhere
@@ -94,15 +155,35 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
         let mut batch = BatchCollector::new(self.db);
 
-        // Release locked inputs (outputs that were marked as spent by this transaction)
+        // Release locked inputs (outputs that were marked as spent by this transaction).
+        // NOTE (G4): do NOT clear `reserved_until` here — reservations placed via
+        // the reserveOutputs RPC survive an abort and are released only by
+        // expiry or unreserveOutputs. See monitor.rs::fail_abandoned.
+        // NOTE (G5): `basket_id IS NOT NULL` keeps relinquished outputs
+        // (basket NULL + spendable 0, e.g. spent externally on-chain) from
+        // being resurrected to spendable=1 by this release.
         batch.add(
-            "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ?",
+            "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ? AND basket_id IS NOT NULL",
             vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
         )?;
 
         // Mark the transaction as failed
         batch.add(
             "UPDATE transactions SET status = 'failed', updated_at = ? WHERE transaction_id = ?",
+            vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
+        )?;
+
+        // Kill the proven_tx_req so the monitor can never broadcast an
+        // aborted transaction (reference: StorageProvider.ts:279-286 sets
+        // req 'invalid' on abort when the tx has a txid). Without this, a
+        // delayed action's req stays 'unsent' and send_waiting posts the
+        // signed tx on the next cron AFTER the inputs were released above —
+        // a real double-spend race against whatever re-spent them (audit
+        // C2). Only non-terminal, pre-proof statuses are clobbered.
+        batch.add(
+            "UPDATE proven_tx_reqs SET status = 'invalid', updated_at = ? \
+             WHERE txid = (SELECT txid FROM transactions WHERE transaction_id = ?) \
+               AND status IN ('unsent', 'nosend', 'sending', 'unprocessed', 'unmined', 'unknown', 'unconfirmed', 'callback')",
             vec![QVal::Text(now_str), QVal::Int(tx_id)],
         )?;
 

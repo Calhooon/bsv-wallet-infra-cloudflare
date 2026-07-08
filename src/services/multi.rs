@@ -8,7 +8,8 @@ use super::arc::ArcProvider;
 use super::bitails::BitailsProvider;
 use super::woc::WocProvider;
 use super::{
-    BroadcastError, BroadcastResult, BroadcastService, ProofResult, ProofService, TxStatusDetail,
+    BroadcastError, BroadcastResult, BroadcastService, ProofResult, ProofService, SpentStatus,
+    TxStatusDetail,
 };
 
 // =============================================================================
@@ -35,6 +36,8 @@ pub struct MultiProvider {
     arc: ArcProvider,
     woc: WocProvider,
     bitails: BitailsProvider,
+    /// Our own chaintracks Worker — preferred tip source when configured.
+    chaintracks_url: Option<String>,
 }
 
 impl MultiProvider {
@@ -56,8 +59,10 @@ impl MultiProvider {
             woc: WocProvider::new(woc_api_key.clone())
                 .with_chaintracks_url(chaintracks_url.clone()),
             bitails: BitailsProvider::new()
-                .with_chaintracks_url(chaintracks_url)
+                .with_chaintracks_url(chaintracks_url.clone())
                 .with_woc_api_key(woc_api_key),
+            chaintracks_url: chaintracks_url
+                .map(|u| u.trim_end_matches('/').to_string()),
         }
     }
 }
@@ -143,6 +148,24 @@ impl BroadcastService for MultiProvider {
 
 impl ProofService for MultiProvider {
     async fn get_chain_height(&self) -> std::result::Result<u32, String> {
+        // Chaintracks (our own Worker) first — it is the designated tip
+        // truth source for the monitor's block-clocked attempt gate. A zero
+        // height is a degraded-service signal (empty tip row — chaintracks
+        // audit C4), never chain state: fall back to WoC, and let the
+        // caller freeze the clock if both fail.
+        if let Some(base) = &self.chaintracks_url {
+            match fetch_chaintracks_height(base).await {
+                Ok(h) if h > 0 => return Ok(h),
+                Ok(h) => worker::console_error!(
+                    "chaintracks currentHeight returned {} — degraded, falling back to WoC",
+                    h
+                ),
+                Err(e) => worker::console_log!(
+                    "chaintracks currentHeight failed ({}), falling back to WoC",
+                    e
+                ),
+            }
+        }
         self.woc.get_chain_height().await
     }
 
@@ -220,6 +243,22 @@ impl ProofService for MultiProvider {
         self.woc.get_status_for_txids(txids).await
     }
 
+    /// Delegate outpoint spent-status to WoC (G5 external-spend scan).
+    ///
+    /// WoC is the only provider in this codebase with a working outpoint-spent
+    /// index (`GET /tx/{txid}/{vout}/spent`). ARC has no outpoint query API,
+    /// and Bitails' guessed equivalents all returned HTTP 500 when probed on
+    /// 2026-07-05 — so no fallback chain here: a WoC failure surfaces as an
+    /// error and the monitor's error budget bails the run (transient outages
+    /// must not burn the cron or mis-mark outputs).
+    async fn get_spent_status(
+        &self,
+        txid: &str,
+        vout: u32,
+    ) -> std::result::Result<SpentStatus, String> {
+        self.woc.get_spent_status(txid, vout).await
+    }
+
     fn reset_run_cache(&self) {
         // ARC is stateless; WoC holds the per-run header cache.
         self.woc.reset_run_cache();
@@ -245,4 +284,41 @@ mod tests {
         let provider = MultiProvider::new(None, None);
         assert_eq!(provider.arc.api_key, None);
     }
+}
+
+// =============================================================================
+// Chaintracks tip fetch
+// =============================================================================
+
+/// Fetch the current tip height from our chaintracks Worker
+/// (`GET {base}/currentHeight` → `{"status":"success","value":<u32>}`).
+async fn fetch_chaintracks_height(base_url: &str) -> std::result::Result<u32, String> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        status: String,
+        value: Option<u32>,
+    }
+
+    let url = format!("{}/currentHeight", base_url);
+    let mut init = worker::RequestInit::new();
+    init.with_method(worker::Method::Get);
+    let request = worker::Request::new_with_init(&url, &init)
+        .map_err(|e| format!("chaintracks request error: {}", e))?;
+    let mut response = worker::Fetch::Request(request)
+        .send()
+        .await
+        .map_err(|e| format!("chaintracks fetch error: {}", e))?;
+    let status = response.status_code();
+    if status >= 400 {
+        return Err(format!("chaintracks currentHeight HTTP {}", status));
+    }
+    let resp: Resp = response
+        .json()
+        .await
+        .map_err(|e| format!("chaintracks currentHeight parse: {}", e))?;
+    if resp.status != "success" {
+        return Err(format!("chaintracks currentHeight status={}", resp.status));
+    }
+    resp.value
+        .ok_or_else(|| "chaintracks currentHeight: missing value".to_string())
 }

@@ -253,3 +253,28 @@ No path deps. Everything resolves from crates.io.
 ## License
 
 [MIT](LICENSE).
+
+## 2026-07 hardening release (v0.2.0)
+
+This sync brings the public repo up to the fully audited implementation
+(verified against TS wallet-toolbox v2.4.0 + go-wallet-toolbox, then
+adversarially reviewed by a multi-agent pass; red→green tests included).
+
+**The invariant:** `transactions.status='failed'` / `proven_tx_reqs.status
+IN ('invalid','doubleSpend')` are reachable ONLY on a positive
+never-on-chain signal — a chain-truth-gated ARC hard-reject, a confirmed
+input double-spend by a network-known tx, rawTx-hash corruption, or a user
+abort of a never-broadcast draft. Never on attempt budgets, proof-provider
+lag, timeouts, or client claims. (The previous snapshot failed reqs after
+12 wall-clocked cron ticks with no chain check — that predicate is deleted,
+not tuned.)
+
+Highlights: block-clocked attempt counting (tip-advance gated, chaintracks-
+first), chain-truth escalation for network-unknown txs (input spent-status
+evidence → confirmed doubleSpend, else requeue for re-broadcast so ARC
+delivers the verdict), unbounded auto-unfail canary with
+`monitor_events('false_fail_canary')` receipts, SEEN-promotion, full BEEF
+merge (raw_tx + ancestry, R2 fallback) on monitor re-broadcast, abort/
+internalize/reorg/books fixes across the action lifecycle, strict BEEF
+verification that never silently downgrades, TTL'd output reservations,
+and the G5 external-spend sweep.

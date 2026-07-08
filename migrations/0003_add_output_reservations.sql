@@ -1,0 +1,16 @@
+-- 0003: Output reservations (G1 — reserveOutputs / unreserveOutputs RPCs).
+--
+-- Adds a nullable `reserved_until` timestamp to `outputs`. An output is
+-- RESERVED iff `reserved_until IS NOT NULL AND datetime(reserved_until) >
+-- datetime('now')`. Expired reservations count as FREE — crash-safe with no
+-- cron dependency (a caller that dies mid-hand simply lets its TTL lapse).
+--
+-- A reserved output is:
+--   * invisible to createAction auto-selection (allocate_change_input), and
+--   * not grabbable by a competing reserveOutputs call,
+-- but STILL spendable when explicitly named as a createAction input by the
+-- same (auth-scoped) user — that is how the reserver consumes its reservation.
+--
+-- Safe to run on the LIVE database: additive nullable column, no default
+-- rewrite, no table copy. Existing rows read as NULL = never reserved.
+ALTER TABLE outputs ADD COLUMN reserved_until DATETIME;

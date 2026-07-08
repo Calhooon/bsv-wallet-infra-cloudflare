@@ -110,6 +110,12 @@ struct ActionOutputRow {
 pub struct ListOutputsResult {
     pub total_outputs: u32,
     pub outputs: Vec<OutputItem>,
+    /// One aggregate BEEF covering every returned output's transaction plus
+    /// its full ancestry (mirrors wallet-toolbox `listOutputsKnex`). Present
+    /// only when `include: "entire transactions"` was requested. BRC-100
+    /// serializes this under the uppercase `BEEF` key as a number array.
+    #[serde(rename = "BEEF", skip_serializing_if = "Option::is_none")]
+    pub beef: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,6 +279,10 @@ pub struct GetAnalyticsSummaryArgs {
 
 const VALID_OUTPUT_STATUSES: &str = "'completed', 'unproven', 'nosend', 'sending'";
 
+/// Status set for BALANCE computation — excludes 'nosend' (deliberately
+/// unbroadcast txs are not money until sent; TS specOpWalletBalance parity).
+const BALANCE_OUTPUT_STATUSES: &str = "'completed', 'unproven', 'sending'";
+
 impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> StorageD1<'a, B> {
     /// List spendable outputs for a user, filtered by basket and optional tags.
     pub async fn list_outputs(
@@ -294,6 +304,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         let include_tags = args.include_tags.unwrap_or(false);
         let include_labels = args.include_labels.unwrap_or(false);
         let include_locking_scripts = args.include.as_deref() == Some("locking scripts");
+        let include_transactions = args.include.as_deref() == Some("entire transactions");
 
         // Find basket ID
         let basket_id: Option<i64> = if !args.basket.is_empty() {
@@ -311,6 +322,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     return Ok(ListOutputsResult {
                         total_outputs: 0,
                         outputs: vec![],
+                        beef: None,
                     });
                 }
             }
@@ -326,12 +338,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     return Ok(ListOutputsResult {
                         total_outputs: 0,
                         outputs: vec![],
+                        beef: None,
                     });
                 }
                 if tag_query_mode == "any" && tag_ids.is_empty() {
                     return Ok(ListOutputsResult {
                         total_outputs: 0,
                         outputs: vec![],
+                        beef: None,
                     });
                 }
             }
@@ -439,9 +453,31 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             total_count
         };
 
+        // `include: "entire transactions"` — build ONE aggregate BEEF covering
+        // every distinct subject txid in the returned page plus full ancestry
+        // (mirrors wallet-toolbox `listOutputsKnex`). Subject txids enter the
+        // BFS walk at depth 0, so an unresolvable wallet-owned output txid is
+        // a hard error (strict — same semantics as createAction's input BEEF).
+        let beef = if include_transactions {
+            let mut distinct_txids: Vec<String> = Vec::new();
+            for output in &outputs {
+                let txid = &output.outpoint.txid;
+                // Defensive: a NULL txid row is already tolerated above (it
+                // serializes with an empty outpoint.txid); there is no tx for
+                // the BEEF to cover, so skip it rather than hard-error.
+                if !txid.is_empty() && !distinct_txids.iter().any(|t| t == txid) {
+                    distinct_txids.push(txid.clone());
+                }
+            }
+            self.build_input_beef(&distinct_txids).await?
+        } else {
+            None
+        };
+
         Ok(ListOutputsResult {
             total_outputs,
             outputs,
+            beef,
         })
     }
 
@@ -893,12 +929,17 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             None => String::new(),
         };
 
+        // Balance statuses EXCLUDE 'nosend' (audit minor-1): a nosend tx is
+        // deliberately unbroadcast — its outputs are listable (TS listOutputs
+        // includes nosend too) but must not count as spendable balance (TS
+        // wallet balance uses completed/unproven/sending only —
+        // StorageProvider.ts:183-198 specOpWalletBalance).
         let sql = format!(
             "SELECT COALESCE(SUM(o.satoshis), 0) as balance, COUNT(*) as total \
              FROM outputs o \
              JOIN transactions t ON o.transaction_id = t.transaction_id \
              WHERE o.user_id = ? AND o.spendable = 1 AND t.status IN ({}){} ",
-            VALID_OUTPUT_STATUSES, basket_filter
+            BALANCE_OUTPUT_STATUSES, basket_filter
         );
 
         let row: BalanceRow = Query::new(&sql).bind(user_id).fetch_one(self.db).await?;
@@ -1222,6 +1263,27 @@ mod tests {
     }
 
     #[test]
+    fn list_outputs_args_include_entire_transactions() {
+        let val = json!({"include": "entire transactions"});
+        let args: ListOutputsArgs = serde_json::from_value(val).unwrap();
+        assert_eq!(args.include.as_deref(), Some("entire transactions"));
+
+        // Same expressions as list_outputs: "entire transactions" flips ONLY
+        // the transactions flag — locking scripts stays off (and vice versa).
+        let include_locking_scripts = args.include.as_deref() == Some("locking scripts");
+        let include_transactions = args.include.as_deref() == Some("entire transactions");
+        assert!(!include_locking_scripts);
+        assert!(include_transactions);
+
+        let val = json!({"include": "locking scripts"});
+        let args: ListOutputsArgs = serde_json::from_value(val).unwrap();
+        let include_locking_scripts = args.include.as_deref() == Some("locking scripts");
+        let include_transactions = args.include.as_deref() == Some("entire transactions");
+        assert!(include_locking_scripts);
+        assert!(!include_transactions);
+    }
+
+    #[test]
     fn list_outputs_args_include_flags() {
         let val = json!({
             "includeCustomInstructions": true,
@@ -1326,6 +1388,7 @@ mod tests {
         let result = ListOutputsResult {
             total_outputs: 0,
             outputs: vec![],
+            beef: None,
         };
         let val = serde_json::to_value(&result).unwrap();
         assert_eq!(val["totalOutputs"], 0);
@@ -1348,6 +1411,7 @@ mod tests {
                 labels: None,
                 locking_script: None,
             }],
+            beef: None,
         };
         let val = serde_json::to_value(&result).unwrap();
         assert_eq!(val["totalOutputs"], 1);
@@ -1378,12 +1442,50 @@ mod tests {
                 labels: Some(vec!["invoice".to_string()]),
                 locking_script: Some("76a914abcd1234".to_string()),
             }],
+            beef: None,
         };
         let val = serde_json::to_value(&result).unwrap();
         assert_eq!(val["outputs"][0]["customInstructions"], "redeem at x402");
         assert_eq!(val["outputs"][0]["tags"], json!(["payment"]));
         assert_eq!(val["outputs"][0]["labels"], json!(["invoice"]));
         assert_eq!(val["outputs"][0]["lockingScript"], "76a914abcd1234");
+    }
+
+    #[test]
+    fn list_outputs_result_with_beef_serializes_uppercase_key() {
+        let result = ListOutputsResult {
+            total_outputs: 1,
+            outputs: vec![OutputItem {
+                satoshis: 50000,
+                spendable: true,
+                outpoint: OutpointItem {
+                    txid: "abc123".to_string(),
+                    vout: 0,
+                },
+                custom_instructions: None,
+                tags: None,
+                labels: None,
+                locking_script: None,
+            }],
+            beef: Some(vec![1, 2, 3, 4]),
+        };
+        let val = serde_json::to_value(&result).unwrap();
+        // BRC-100 standard key is uppercase BEEF; Vec<u8> serializes as a
+        // number array (same convention as createAction's inputBeef).
+        assert_eq!(val["BEEF"], json!([1, 2, 3, 4]));
+        assert!(val.get("beef").is_none());
+    }
+
+    #[test]
+    fn list_outputs_result_without_beef_omits_key() {
+        let result = ListOutputsResult {
+            total_outputs: 0,
+            outputs: vec![],
+            beef: None,
+        };
+        let val = serde_json::to_value(&result).unwrap();
+        assert!(val.get("BEEF").is_none());
+        assert!(val.get("beef").is_none());
     }
 
     // =========================================================================

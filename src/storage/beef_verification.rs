@@ -5,8 +5,11 @@
 //! Structural verification (verify_valid) ALWAYS runs — catches incomplete
 //! BEEFs with missing inputs, orphaned bump txids, broken dependency chains.
 //!
-//! Root verification (merkle roots vs block headers) runs when a header
-//! provider is available. If no provider, structural checks still protect.
+//! Root verification (merkle roots vs block headers) is MANDATORY in strict
+//! mode whenever BUMPs are present: a missing header provider is a hard
+//! error, never a silent downgrade to structural-only checks (audit M5 —
+//! references verify unconditionally: internalizeAction.ts:272-275,
+//! Go internalize.go:103).
 //!
 //! Matches TS/Go/Rust reference toolboxes which always validate on internalizeAction.
 
@@ -47,26 +50,54 @@ pub async fn verify_beef(
             return Err(Error::ValidationError(msg.to_string()));
         }
 
-        if let Some(provider) = header_provider {
-            for (height, root) in &validation.roots {
-                match provider.is_valid_root_for_height(root, *height).await {
-                    Ok(true) => { /* valid */ }
-                    Ok(false) => {
-                        let msg = format!("Invalid merkle root {} at height {}", root, height);
-                        if log_only {
-                            worker::console_log!("BEEF verification warning (log_only): {}", msg);
-                            continue;
+        match header_provider {
+            Some(provider) => {
+                for (height, root) in &validation.roots {
+                    match provider.is_valid_root_for_height(root, *height).await {
+                        Ok(true) => { /* valid */ }
+                        Ok(false) => {
+                            let msg = format!("Invalid merkle root {} at height {}", root, height);
+                            if log_only {
+                                worker::console_log!(
+                                    "BEEF verification warning (log_only): {}",
+                                    msg
+                                );
+                                continue;
+                            }
+                            return Err(Error::ValidationError(msg));
                         }
-                        return Err(Error::ValidationError(msg));
-                    }
-                    Err(e) => {
-                        let msg = format!("Header verification error at height {}: {}", height, e);
-                        if log_only {
-                            worker::console_log!("BEEF verification warning (log_only): {}", msg);
-                            continue;
+                        Err(e) => {
+                            let msg =
+                                format!("Header verification error at height {}: {}", height, e);
+                            if log_only {
+                                worker::console_log!(
+                                    "BEEF verification warning (log_only): {}",
+                                    msg
+                                );
+                                continue;
+                            }
+                            return Err(Error::InternalError(msg));
                         }
-                        return Err(Error::InternalError(msg));
                     }
+                }
+            }
+            None => {
+                // Strict mode with BUMPs present but NO header provider must
+                // be a hard error, not a silent downgrade to structural-only
+                // checks (audit M5): a fabricated-but-self-consistent BUMP
+                // would otherwise pass and get recorded as 'completed' with
+                // spendable outputs. The references verify unconditionally
+                // (internalizeAction.ts:272-275; Go internalize.go:103) —
+                // 'completed' must always rest on a root checked against a
+                // real block header.
+                let msg = format!(
+                    "BEEF contains {} BUMP(s) but no header provider is configured — cannot verify merkle roots",
+                    beef.bumps.len()
+                );
+                if log_only {
+                    worker::console_log!("BEEF verification warning (log_only): {}", msg);
+                } else {
+                    return Err(Error::InternalError(msg));
                 }
             }
         }

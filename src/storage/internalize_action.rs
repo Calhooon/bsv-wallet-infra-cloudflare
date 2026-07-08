@@ -329,6 +329,41 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             .execute(self.db)
             .await?;
 
+            // nosend lifecycle advance (ts-stack 2.4.0
+            // internalizeAction.ts:526-553): someone internalizing a payment
+            // from our own nosend tx proves it was broadcast EXTERNALLY —
+            // leaving it 'nosend' kept it out of the balance and out of the
+            // proof pipeline forever (funds invisible). BUMP present ⇒
+            // 'completed'; else 'unproven' and the req flips to 'unmined' so
+            // the monitor proves it. Chain-factual: the counterparty holds
+            // the tx (and possibly its proof) in hand.
+            if matches!(
+                existing_tx.as_ref().unwrap().status,
+                TransactionStatus::NoSend
+            ) {
+                let promoted = if has_proof { "completed" } else { "unproven" };
+                Query::new(
+                    "UPDATE transactions SET status = ?, updated_at = ? WHERE transaction_id = ? AND status = 'nosend'",
+                )
+                .bind(promoted)
+                .bind(now)
+                .bind(tx_id)
+                .execute(self.db)
+                .await?;
+                Query::new(
+                    "UPDATE proven_tx_reqs SET status = 'unmined', updated_at = ? WHERE txid = ? AND status = 'nosend'",
+                )
+                .bind(now)
+                .bind(txid.as_str())
+                .execute(self.db)
+                .await?;
+                worker::console_log!(
+                    "internalize: nosend tx {} externally broadcast — promoted to {}",
+                    txid,
+                    promoted
+                );
+            }
+
             tx_id
         } else {
             // Create new transaction. Two-phase: transaction_id is autoincrement
@@ -407,11 +442,18 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     if let Some(output_id) = od.existing_output_id {
                         // Update existing output
                         Query::new(
+                            // spendable: only re-enable when the row is not
+                            // already consumed by a live createAction
+                            // (spent_by set) — the TS merge never rewrites
+                            // spendable at all (internalizeAction.ts:494-509);
+                            // unconditionally forcing 1 here could resurrect
+                            // a locked/spent output (audit minor-6).
                             r#"UPDATE outputs
-                            SET basket_id = ?, type = 'P2PKH', change = 1, spendable = 1,
+                            SET basket_id = ?, type = 'P2PKH', change = 1,
+                                spendable = CASE WHEN spent_by IS NULL THEN 1 ELSE spendable END,
                                 derivation_prefix = ?, derivation_suffix = ?,
                                 sender_identity_key = ?, custom_instructions = NULL, updated_at = ?
-                            WHERE output_id = ?"#,
+                            WHERE output_id = ? AND basket_id IS NOT NULL"#,
                         )
                         .bind(change_basket_id)
                         .bind(payment.derivation_prefix.as_str())
@@ -571,14 +613,28 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             // find the already-mined proof. For !has_proof, it will broadcast and
             // watch for confirmation.
             if !linked {
-                let broadcast_failed = self.create_proven_tx_req(&txid, &raw_tx, &args.tx).await?;
+                let broadcast_failed = self
+                    .create_proven_tx_req(&txid, &raw_tx, &args.tx, has_proof)
+                    .await?;
 
-                if broadcast_failed {
+                if broadcast_failed && !self.internalize_zero_conf {
                     // Broadcast hit a network error (WoC down, DNS failure, timeout).
                     // Mark outputs non-spendable to prevent phantom UTXOs from inflating
                     // the user's balance. The monitor will retry the broadcast every 5
                     // minutes and set spendable = 1 once the transaction is confirmed
                     // on-chain.
+                    //
+                    // ZERO-CONF dev lever (env INTERNALIZE_ZERO_CONF=true): SKIP this
+                    // demotion. The operator funds from their own already-broadcast
+                    // wallet, so the funding tx is genuinely on-network and the only
+                    // reason it would land here is a transient provider hiccup
+                    // (ARC/WoC timeout). Keeping spendable = 1 makes the deposit usable
+                    // immediately (0-conf) instead of waiting ~1 block for the monitor
+                    // to reconcile. The proven_tx_req still exists, so the monitor
+                    // fetches the proof and completes the status normally. NOTE: a true
+                    // DoubleSpend/InvalidTx still hard-rejects upstream in
+                    // create_proven_tx_req — only the transient ServiceError path is
+                    // affected here.
                     Query::new(
                         "UPDATE outputs SET spendable = 0, updated_at = ? WHERE transaction_id = ? AND user_id = ?",
                     )
@@ -587,6 +643,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     .bind(user_id)
                     .execute(self.db)
                     .await?;
+                } else if broadcast_failed && self.internalize_zero_conf {
+                    worker::console_log!(
+                        "internalize: broadcast ServiceError for {} but INTERNALIZE_ZERO_CONF=true — keeping outputs spendable (0-conf)",
+                        txid
+                    );
                 }
             }
         }
@@ -660,6 +721,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         txid: &str,
         raw_tx: &[u8],
         input_beef: &[u8],
+        has_verified_proof: bool,
     ) -> Result<bool> {
         #[derive(Deserialize)]
         #[allow(dead_code)]
@@ -686,31 +748,74 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         // This matches `bsv-wallet-toolbox-rs`'s broadcast intent — the full
         // BEEF contains raw_tx + parent raw_txs + merkle bumps, so miners can
         // validate the entire chain without needing their mempool to contain
-        // the parents. Without the parent ancestry, mempool-orphan txs accrue
-        // into a stuck backlog that the monitor cron has to drain.
+        // the parents. See UNPROVEN-BACKLOG-DESIGN.md for the incident that
+        // made this critical (2026-04-15 bulk cleanup of 805 stuck txs).
         //
         // A Rejected error means double-spend → reject the payment.
         // Permanent errors (DoubleSpend/InvalidTx) reject the payment.
         // ServiceError means transient failure -- monitor will retry.
+        //
+        // PROVEN TXS ARE NOT RE-BROADCAST (adversarial review H2): a payment
+        // whose BUMP root was strict-verified against a real header is a
+        // chain fact. Re-posting an old mined tx to ARC can come back
+        // "missing inputs" (spent by ITSELF, past the cache window), which
+        // maps to DoubleSpend/InvalidTx and used to de-credit a genuinely
+        // mined payment with no proven_tx_req row for the canary to rescue.
         let beef_hex = hex::encode(input_beef);
-        let broadcast_network_error = match self.broadcast.broadcast_beef(&beef_hex).await {
+        let broadcast_result = if has_verified_proof {
+            Ok(crate::services::BroadcastResult {
+                txid: txid.to_string(),
+                tx_status: "proof-verified, broadcast skipped".to_string(),
+                seen_on_network: true,
+            })
+        } else {
+            self.broadcast.broadcast_beef(&beef_hex).await
+        };
+        let broadcast_network_error = match broadcast_result {
             Ok(_result) => {
                 // Broadcast succeeded (new or already known) -- proceed
                 false
             }
             Err(crate::services::BroadcastError::DoubleSpend(msg)) => {
-                // Double-spend -- reject the payment, do NOT store the transaction.
-                return Err(Error::ValidationError(format!(
-                    "Transaction {} rejected by network (double-spend): {}",
-                    txid, msg
-                )));
+                // Double-spend verdict from ARC. CHAIN-TRUTH GATE first
+                // (review H2): an old-but-mined tx re-validated fresh can
+                // come back "inputs missing/spent" — spent by ITSELF. Only
+                // compensate when the network genuinely doesn't know the
+                // txid; a known/mined tx proceeds as an accepted payment.
+                if self.network_knows_txid(txid).await {
+                    worker::console_log!(
+                        "internalize: ARC said double-spend for {} but the network knows it — treating as accepted",
+                        txid
+                    );
+                    false
+                } else {
+                    // COMPENSATE: the caller already wrote the transaction
+                    // row and its spendable=1 outputs (D1 has no rollback;
+                    // audit C1 — reference internalizes transactionally,
+                    // internalizeAction.ts:417-437).
+                    self.compensate_rejected_internalize(txid, raw_tx).await;
+                    return Err(Error::ValidationError(format!(
+                        "Transaction {} rejected by network (double-spend): {}",
+                        txid, msg
+                    )));
+                }
             }
             Err(crate::services::BroadcastError::InvalidTx(msg)) => {
-                // Invalid tx -- reject the payment, do NOT store the transaction.
-                return Err(Error::ValidationError(format!(
-                    "Transaction {} rejected by network (invalid tx): {}",
-                    txid, msg
-                )));
+                // Same chain-truth gate + compensation as the double-spend
+                // arm (audit C1 + review H2).
+                if self.network_knows_txid(txid).await {
+                    worker::console_log!(
+                        "internalize: ARC said invalid-tx for {} but the network knows it — treating as accepted",
+                        txid
+                    );
+                    false
+                } else {
+                    self.compensate_rejected_internalize(txid, raw_tx).await;
+                    return Err(Error::ValidationError(format!(
+                        "Transaction {} rejected by network (invalid tx): {}",
+                        txid, msg
+                    )));
+                }
             }
             Err(crate::services::BroadcastError::ServiceError(_)) => {
                 // Service error -- proceed cautiously, monitor will retry broadcast.
@@ -754,6 +859,76 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
         Ok(broadcast_network_error)
     }
+
+    /// Compensation for an internalize whose broadcast came back with a
+    /// positive ARC reject (DoubleSpend/InvalidTx) AFTER the transaction and
+    /// output rows were written (audit C1). D1 exposes no real transactions
+    /// to roll back, so undo the credit explicitly:
+    ///   * transactions.status → 'failed' (factual: ARC hard-rejected it);
+    ///   * its created outputs → spendable=0 (they will never exist
+    ///     on-chain — leaving them spendable is phantom balance forever,
+    ///     since no proven_tx_req exists yet for the monitor to police).
+    /// Keyed on txid across users: a network-rejected tx is rejected for
+    /// every row that references it. Best-effort (errors logged, not
+    /// propagated — the caller is already returning the reject).
+    async fn network_knows_txid(&self, txid: &str) -> bool {
+        self.broadcast
+            .get_status_for_txids(&[txid.to_string()])
+            .await
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .map(|s| s.status == "known" || s.status == "mined")
+            .unwrap_or(false)
+    }
+
+    async fn compensate_rejected_internalize(&self, txid: &str, raw_tx: &[u8]) {
+        let now = Utc::now();
+        let r1 = Query::new(
+            "UPDATE transactions SET status = 'failed', updated_at = ? WHERE txid = ?",
+        )
+        .bind(now)
+        .bind(txid)
+        .execute(self.db)
+        .await;
+        let r2 = Query::new(
+            "UPDATE outputs SET spendable = 0, updated_at = ? WHERE txid = ?",
+        )
+        .bind(now)
+        .bind(txid)
+        .execute(self.db)
+        .await;
+        // Canary coverage (review H2c): the auto-unfail sweep JOINs on
+        // proven_tx_reqs — without a row here, a wrong verdict would be
+        // permanently invisible to self-correction. INSERT OR IGNORE keyed
+        // on the txid uniqueness in practice (existing row = already
+        // covered).
+        let _ = Query::new(
+            r#"INSERT INTO proven_tx_reqs (
+                txid, status, attempts, history, notify, notified, raw_tx, input_beef, created_at, updated_at
+            ) SELECT ?, 'invalid', 0, '{}', '{}', 0, ?, NULL, ?, ?
+              WHERE NOT EXISTS (SELECT 1 FROM proven_tx_reqs WHERE txid = ?)"#,
+        )
+        .bind(txid)
+        .bind(raw_tx)
+        .bind(now)
+        .bind(now)
+        .bind(txid)
+        .execute(self.db)
+        .await;
+        if r1.is_err() || r2.is_err() {
+            worker::console_error!(
+                "internalize compensation for rejected txid={} incomplete: tx={:?} outputs={:?}",
+                txid,
+                r1.err().map(|e| e.to_string()),
+                r2.err().map(|e| e.to_string())
+            );
+        } else {
+            worker::console_log!(
+                "internalize compensation: txid={} de-credited after network reject",
+                txid
+            );
+        }
+    }
 }
 
 // =============================================================================
@@ -762,9 +937,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
 fn validate_merge_status(status: &TransactionStatus) -> Result<()> {
     match status {
-        TransactionStatus::Completed | TransactionStatus::Unproven | TransactionStatus::NoSend => {
-            Ok(())
-        }
+        // 'sending' accepted per 2.4.0 (internalizeAction.ts:327) — our M2
+        // delayed-commit design parks queued txs at 'sending', so rejecting
+        // it here would bounce legitimate payment merges onto our own
+        // in-flight transactions.
+        TransactionStatus::Completed
+        | TransactionStatus::Unproven
+        | TransactionStatus::NoSend
+        | TransactionStatus::Sending => Ok(()),
         _ => Err(Error::ValidationError(format!(
             "Target transaction of internalizeAction has invalid status: {:?}",
             status
@@ -826,9 +1006,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_merge_status_sending_rejected() {
+    fn test_validate_merge_status_sending_accepted() {
+        // 2.4.0 parity (internalizeAction.ts:327): 'sending' is a legal
+        // merge target — our delayed txs park there (M2), so rejecting it
+        // bounced payment merges onto our own in-flight transactions.
         let result = validate_merge_status(&TransactionStatus::Sending);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]

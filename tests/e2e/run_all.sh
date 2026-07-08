@@ -14,7 +14,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_URL="${1:-https://wallet-infra.example.com}"
+BASE_URL="${1:-https://<your-worker-domain>}"
 
 TOTAL_PASSED=0
 TOTAL_FAILED=0

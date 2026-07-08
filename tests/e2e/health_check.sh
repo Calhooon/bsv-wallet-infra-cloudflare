@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-BASE_URL="${1:-https://wallet-infra.example.com}"
+BASE_URL="${1:-https://<your-worker-domain>}"
 PASSED=0
 FAILED=0
 

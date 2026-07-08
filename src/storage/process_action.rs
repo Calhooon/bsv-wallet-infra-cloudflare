@@ -270,7 +270,15 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         let (tx_status, req_status) = if args.is_no_send && !args.is_send_with {
             ("nosend", "nosend")
         } else if args.is_delayed {
-            ("unprocessed", "unsent")
+            // 'sending', NOT 'unprocessed' (audit M2): the TS reference
+            // promotes a queued delayed send to 'sending' immediately
+            // (processAction.ts:177-186), which keeps it structurally out of
+            // TaskFailAbandoned's unsigned/unprocessed sweep. Leaving it
+            // 'unprocessed' let fail_abandoned kill a fully signed,
+            // queued-for-broadcast tx on a pure timeout whenever ARC flapped
+            // past the window — releasing inputs that the pending req could
+            // still broadcast later.
+            ("sending", "unsent")
         } else {
             ("sending", "unprocessed")
         };
@@ -301,10 +309,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         //    it during BEEF construction. ... input_beef is cleared because the
         //    proven_tx_req record now holds the authoritative copy."
         //
-        // A prior bug caused payment raw_tx to be destroyed at broadcast time.
-        // When later txs spent from those parents, BEEF reconstruction was
-        // impossible, broadcasts sent only raw_tx (no parent context), miners
-        // put the children into orphan mempool, and they never mined.
+        // Our bug caused every x402 payment's raw_tx to be destroyed at broadcast
+        // time. When later txs spent from those parents, BEEF reconstruction was
+        // impossible, broadcasts sent only raw_tx (no parent context), miners put
+        // the children into orphan mempool, and they never mined. This created
+        // the ~800 stuck backlog diagnosed on 2026-04-15. See UNPROVEN-BACKLOG-DESIGN.md.
         // Route raw_tx through BlobStore so >4KB blobs land in R2 instead
         // of blowing up the D1 1MB row limit on multi-input drain/consolidate
         // txs. tx_id is known here so single-phase works.
@@ -504,10 +513,16 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         //  2. Fall back to broadcast_raw_tx only if input_beef is unavailable
         //     or the BEEF merge fails.
         //
-        // Sending raw_tx alone is the failure mode that strands children of
-        // unproven parents in the orphan mempool — full BEEF avoids that.
+        // This is the fix for the 2026-04-15 incident (805 stuck txs). See
+        // UNPROVEN-BACKLOG-DESIGN.md for full context.
         // =====================================================================
-        if tx_status == "sending" {
+        // Delayed actions NEVER broadcast inline (review M-A: the M2 status
+        // change made tx_status 'sending' for delayed too, which
+        // accidentally routed them through this inline block — blocking the
+        // RPC on ARC and defeating the whole point of is_delayed; the
+        // monitor's send_waiting owns delayed broadcast via the 'unsent'
+        // req).
+        if tx_status == "sending" && !args.is_delayed {
             let beef_hex_opt: Option<String> = input_beef_bytes.as_ref().and_then(|ib| {
                 use bsv_sdk::transaction::Beef;
                 match Beef::from_binary(ib) {
@@ -577,7 +592,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         vec![QVal::Text(now_str.clone()), QVal::Text(provided_txid.to_string())],
                     );
                     let _ = fail_batch.add(
-                        "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ?",
+                        "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ? AND basket_id IS NOT NULL",
                         vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
                     );
                     // Clean up the outputs this tx was going to create: since the
@@ -609,7 +624,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         vec![QVal::Text(now_str.clone()), QVal::Text(provided_txid.to_string())],
                     );
                     let _ = fail_batch.add(
-                        "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ?",
+                        "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ? AND basket_id IS NOT NULL",
                         vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
                     );
                     // Clean up the outputs this tx was going to create — phantoms
@@ -633,7 +648,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     // mark future outputs unspendable. Monitor's `check_for_proofs`
                     // polls `proven_tx_reqs.status='sending'` and reconciles on
                     // proof arrival. True zombies eventually drain via
-                    // MAX_PROOF_ATTEMPTS → ptr.status='invalid' → review_status.
+                    // the canary/escalation machinery (never by attempt count).
                     worker::console_log!(
                         "processAction: broadcast service error for txid={} — leaving 'sending' for monitor: {}",
                         provided_txid,
@@ -682,6 +697,26 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .bind(user_id)
                 .execute(self.db)
                 .await?;
+
+                // Queue the companion's proven_tx_req for ACTUAL broadcast
+                // (audit M6): the reference posts the whole sendWith batch
+                // (processAction.ts shareReqsWithWorld). The old code set the
+                // tx 'sending' but left the req at 'nosend' — a status
+                // claiming broadcast activity that never happens (send_waiting
+                // only selects 'unsent'/'sending' reqs). 'nosend' → 'unsent'
+                // hands it to the next monitor cycle; ARC's verdict then
+                // drives the real status.
+                Query::new(
+                    "UPDATE proven_tx_reqs SET status = 'unsent', updated_at = ? \
+                     WHERE txid = ? AND status = 'nosend' \
+                       AND EXISTS (SELECT 1 FROM transactions tx \
+                                   WHERE tx.txid = proven_tx_reqs.txid AND tx.user_id = ?)",
+                )
+                .bind(now)
+                .bind(sw_txid.as_str())
+                .bind(user_id)
+                .execute(self.db)
+                .await?;
             }
         }
         bench.done();
@@ -707,6 +742,29 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         let now_str = now.to_rfc3339();
 
         if success {
+            // Chain-truth gate (audit minor-2): 'unproven'/'unmined' are
+            // statements that the tx IS on the network — a client claim is
+            // not evidence. Verify with the status service before promoting;
+            // if the network doesn't know the txid (or the check fails),
+            // leave the current status alone — the server's own broadcast
+            // path and the monitor own the truth.
+            let net_status = self
+                .broadcast
+                .get_status_for_txids(&[txid.to_string()])
+                .await
+                .ok()
+                .and_then(|v| v.into_iter().next())
+                .map(|s| s.status)
+                .unwrap_or_else(|| "unavailable".to_string());
+            if net_status != "known" && net_status != "mined" {
+                worker::console_log!(
+                    "update_transaction_status_after_broadcast: client claims success for {} but network says '{}' — not promoting",
+                    txid,
+                    net_status
+                );
+                return Ok(());
+            }
+
             let mut batch = BatchCollector::new(self.db);
 
             batch.add(
@@ -755,6 +813,26 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 // server owns the truth and the monitor can retry/verify.
                 const FAILABLE_FROM: &[&str] =
                     &["unsigned", "unprocessed", "nosend", "nonfinal", "sending"];
+                // Chain-truth gate, mirroring the success branch (parity
+                // audit Q1a): a client's failure claim must not fail a tx
+                // the network already knows — the server's own broadcast
+                // may have raced ahead of the client's.
+                let net_status = self
+                    .broadcast
+                    .get_status_for_txids(&[txid.to_string()])
+                    .await
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+                    .map(|s| s.status)
+                    .unwrap_or_else(|| "unavailable".to_string());
+                if net_status == "known" || net_status == "mined" {
+                    worker::console_log!(
+                        "update_transaction_status_after_broadcast: client claims failure for {} but network says '{}' — refusing to fail",
+                        txid,
+                        net_status
+                    );
+                    return Ok(());
+                }
                 if !FAILABLE_FROM.contains(&current_status) {
                     worker::console_log!(
                         "update_transaction_status_after_broadcast: refusing to mark \
@@ -767,9 +845,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
                 let mut batch = BatchCollector::new(self.db);
 
-                // Restore locked inputs
+                // Restore locked inputs. All three input-release statements in
+                // this file share two invariants with abort_action/fail_abandoned:
+                //   G4 — never clear `reserved_until` (reserveOutputs
+                //        reservations release only by expiry/unreserveOutputs);
+                //   G5 — `basket_id IS NOT NULL` so relinquished (externally
+                //        spent) outputs are not resurrected to spendable=1.
                 batch.add(
-                    "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ?",
+                    "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ? AND basket_id IS NOT NULL",
                     vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
                 )?;
 
@@ -1135,7 +1218,10 @@ mod tests {
         if is_no_send && !is_send_with {
             ("nosend", "nosend")
         } else if is_delayed {
-            ("unprocessed", "unsent")
+            // M2: delayed commits as tx 'sending' (TS processAction.ts:177-186
+            // parity) — structurally outside fail_abandoned's draft sweep.
+            // Inline broadcast is separately gated on !is_delayed (M-A).
+            ("sending", "unsent")
         } else {
             ("sending", "unprocessed")
         }
@@ -1158,7 +1244,7 @@ mod tests {
     #[test]
     fn target_status_delayed() {
         let (tx, req) = determine_target_status(false, false, true);
-        assert_eq!(tx, "unprocessed");
+        assert_eq!(tx, "sending"); // M2: TS parity — see determine_target_status
         assert_eq!(req, "unsent");
     }
 

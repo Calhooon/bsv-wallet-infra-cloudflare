@@ -1,4 +1,25 @@
-//! relinquishOutput — remove an output from its basket by setting basket_id = NULL.
+//! relinquishOutput — remove an output from wallet tracking.
+//!
+//! Sets `basket_id = NULL` AND `spendable = 0` (G5 — external-spend safety).
+//!
+//! The TS reference (`wallet-toolbox/src/storage/StorageProvider.ts:652`) only
+//! nulls basketId; we deliberately go further. In our deployments tracked
+//! outpoints get spent ON-CHAIN outside wallet-infra's view (e.g. a blackjack
+//! stake consumed by the escrow covenant). Basket-null alone kept the row
+//! `spendable = 1`, so it still inflated getBalance and no-basket listOutputs,
+//! and remained explicitly lockable by createAction — a phantom UTXO. Every
+//! known caller (blackjack pool reconcile, refund middleware, agents cmd_send)
+//! relinquishes precisely BECAUSE the output has left the wallet, so
+//! spendable=0 is the correct terminal state for all of them.
+//!
+//! G5 monitor spent-scan — IMPLEMENTED (2026-07-05): `monitor.rs` task 10,
+//! `scan_external_spends`. Relinquish stays the client-driven fast path; the
+//! monitor cron is the service-side safety net for clients that skip it. It
+//! pages candidates (`spendable = 1`, unlocked, chain-real parent) against
+//! WoC's outpoint-spent endpoint (`GET /tx/{txid}/{vout}/spent` — the Bitails
+//! equivalent guessed below turned out not to exist; probed 500 on
+//! 2026-07-05) and sets `spendable = 0` under a spent_by-guard. SEEN = final
+//! (owner rule): a mempool-only spending tx counts, no waiting for mining.
 
 use crate::d1::Query;
 use crate::error::{Error, Result};
@@ -86,7 +107,7 @@ struct OutputBasketRow {
 // =============================================================================
 
 impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> StorageD1<'a, B> {
-    /// Relinquish an output by setting its basket_id to NULL.
+    /// Relinquish an output: set basket_id = NULL AND spendable = 0 (G5).
     ///
     /// Verifies the output exists, belongs to the user, currently has a basket,
     /// and that the basket matches the one specified in the args.
@@ -127,9 +148,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
         let output_id = row.output_id.map(|v| v as i64).unwrap_or(0);
 
-        // Set basket_id = NULL to relinquish
+        // Relinquish = terminal untracking: basket_id = NULL (out of every
+        // basket-scoped view) AND spendable = 0 (out of balance, listOutputs,
+        // and explicit createAction locking — G5). Also clear any leftover
+        // reservation: a relinquished output can never return to the free
+        // pool, so its reservation is moot (this does NOT weaken the G4 rule —
+        // expiry stays the only path back to FREE; this path goes to GONE).
         let meta = Query::new(
-            "UPDATE outputs SET basket_id = NULL, updated_at = ? WHERE output_id = ? AND user_id = ?",
+            "UPDATE outputs SET basket_id = NULL, spendable = 0, reserved_until = NULL, updated_at = ? WHERE output_id = ? AND user_id = ?",
         )
         .bind(now.as_str())
         .bind(output_id)

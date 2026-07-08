@@ -224,6 +224,23 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
             // =====================================================================
             // Step 7a: Lock any user-specified inputs by outpoint
+            //
+            // G2 (hard-error on unavailable explicit input): an explicitly-named
+            // input that cannot be locked is a HARD ERROR, never a silent skip.
+            // The old behavior silently dropped the input and fell back to
+            // auto-selecting from the default basket — a lost race degraded to
+            // spending the WRONG UTXO. Hard-erroring also matches the canonical
+            // TS toolbox (`wallet-toolbox/src/storage/methods/createAction.ts`
+            // ~line 263): an explicit input that is not spendable throws
+            // WERR_INVALID_PARAMETER / a doubleSpend review error.
+            //
+            // Reservation interaction (G1): this lock does NOT filter on
+            // `reserved_until` — an output the caller reserved via the
+            // reserveOutputs RPC is deliberately still lockable here. Both the
+            // reservation and this createAction are scoped to the same
+            // auth-resolved user_id, so naming a reserved output explicitly is
+            // the reserver consuming its own reservation. Only auto-selection
+            // (step 7b) and competing reserveOutputs calls honor reservations.
             // =====================================================================
             let mut allocated_inputs: Vec<AllocatedInput> = Vec::new();
             let mut input_txids: Vec<String> = Vec::new();
@@ -256,21 +273,35 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .fetch_all(self.db)
                 .await?;
 
-                if let Some(row) = rows.into_iter().next() {
-                    let ci = AllocatedInput {
-                        output_id: row.output_id.map(|v| v as i64).unwrap_or(0),
-                        satoshis: row.satoshis.map(|v| v as u64).unwrap_or(0),
-                        txid: row.txid.unwrap_or_default(),
-                        vout: row.vout.map(|v| v as u32).unwrap_or(0),
-                        locking_script_hex: row.locking_script.unwrap_or_default(),
-                        derivation_prefix: row.derivation_prefix,
-                        derivation_suffix: row.derivation_suffix,
-                        sender_identity_key: row.sender_identity_key,
-                    };
-                    input_txids.push(ci.txid.clone());
-                    allocated_inputs.push(ci);
+                match rows.into_iter().next() {
+                    Some(row) => {
+                        let ci = AllocatedInput {
+                            output_id: row.output_id.map(|v| v as i64).unwrap_or(0),
+                            satoshis: row.satoshis.map(|v| v as u64).unwrap_or(0),
+                            txid: row.txid.unwrap_or_default(),
+                            vout: row.vout.map(|v| v as u32).unwrap_or(0),
+                            locking_script_hex: row.locking_script.unwrap_or_default(),
+                            derivation_prefix: row.derivation_prefix,
+                            derivation_suffix: row.derivation_suffix,
+                            sender_identity_key: row.sender_identity_key,
+                        };
+                        input_txids.push(ci.txid.clone());
+                        allocated_inputs.push(ci);
+                    }
+                    None => {
+                        // Failure path only: diagnose WHY so the error names
+                        // the outpoint and the precise reason. The outer
+                        // wrapper aborts the action, releasing any inputs
+                        // locked so far.
+                        let reason = self
+                            .diagnose_unavailable_input(user_id, txid_str, vout_val)
+                            .await;
+                        return Err(Error::ValidationError(format!(
+                            "createAction: explicit input {}.{} is unavailable ({})",
+                            txid_str, vout_val, reason
+                        )));
+                    }
                 }
-                // Silently skip inputs that don't exist or are already spent.
             }
 
             // =====================================================================
@@ -323,8 +354,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             let total_available: u64 = allocated_inputs.iter().map(|i| i.satoshis).sum();
             let change_amount = total_available.saturating_sub(total_output_sats + final_fee);
 
-            // Update transaction satoshis (net outflow, negative for outgoing)
-            let net_satoshis = -(total_output_sats as i64);
+            // Update transaction satoshis (net balance delta, negative for outgoing). BRC-100:
+            // this is the wallet's net change — the recipient outputs AND the fee leave; the
+            // change returns. So it must include `final_fee`, else the history under-reports the
+            // deduction (a 1000-sat send with a 23-sat fee showed as −1000 instead of −1023).
+            let net_satoshis = -((total_output_sats + final_fee) as i64);
             Query::new(
                 "UPDATE transactions SET satoshis = ?, updated_at = ? WHERE transaction_id = ?",
             )
@@ -473,22 +507,18 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 change_vout = Some(vout);
                 let change_suffix = generate_base64_random();
 
-                // Change outputs are self-sends: the wallet is both sender and
-                // receiver. Record the user's identity_key as sender_identity_key
-                // so the next spend can derive the unlocking key via BRC-29.
-                // Without this, the output is unsignable when re-selected as an
-                // input (silent signing failure).
-                #[derive(Deserialize)]
-                struct IdentityRow {
-                    identity_key: Option<String>,
-                }
-                let identity_key: Option<String> = Query::new(
-                    "SELECT identity_key FROM users WHERE user_id = ?",
-                )
-                .bind(user_id)
-                .fetch_optional::<IdentityRow>(self.db)
-                .await?
-                .and_then(|r| r.identity_key);
+                // Change outputs are BRC-29 SELF-SENDS (Counterparty::Self_) under the wallet
+                // ROOT key — which in the MPC client IS the 4-of-6 joint key. The CANONICAL
+                // encoding leaves sender_identity_key NULL; the spend-side classifier resolves
+                // Self_ from that NULL marker (matches rust-wallet-toolbox wallet.rs:2048-2058:
+                // `if !sender_identity_key.is_empty() { Other(pk) } else { Self_ }`). Storing the
+                // DEVICE identity_key here (the prior behavior) was WRONG: it is neither the
+                // Self_ marker nor the joint key the funds are locked to, so the client would
+                // mis-derive the change as Other(deviceKey) and strand it. The client fills the
+                // change locking_script via the Self_ ECDH against the joint pubkey
+                // (FfiCounterparty::SelfWallet); see 100cash #50. Forward-only: any pre-existing
+                // change rows written with the device key need a NULL migration or stay stranded.
+                let sender_identity_key: Option<String> = None;
 
                 Query::new(
                     r#"INSERT INTO outputs
@@ -505,7 +535,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .bind(change_amount as i64)
                 .bind(derivation_prefix.as_str())
                 .bind(change_suffix.as_str())
-                .bind(identity_key)
+                .bind(sender_identity_key)
                 .bind(now)
                 .bind(now)
                 .execute(self.db)
@@ -649,6 +679,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         // Filtering on `change=1` was the half-port that left consolidation
         // outputs auto-selectable by `process_action.rs`'s broader is_ours
         // predicate but invisible to this allocator.
+        // G1 (reservations): exclude outputs with a LIVE reservation placed via
+        // the reserveOutputs RPC — `reserved_until` in the future. An expired
+        // reservation counts as free (expiry is the reservation's only
+        // automatic release path; no cron needed). Explicitly-named inputs
+        // (step 7a) bypass this gate — see the comment there.
         let rows: Vec<UtxoRow> = Query::new(
             r#"UPDATE outputs SET spendable = 0, spent_by = ?, updated_at = ?
                WHERE output_id = (
@@ -657,11 +692,15 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                    JOIN transactions t ON o.transaction_id = t.transaction_id
                    WHERE o.user_id = ? AND o.basket_id = ?
                      AND o.spent_by IS NULL AND o.spendable = 1
+                     AND (o.reserved_until IS NULL
+                          OR datetime(o.reserved_until) <= datetime('now'))
                      AND t.status IN ('completed', 'unproven', 'nosend', 'sending')
                    ORDER BY CASE WHEN o.satoshis >= ? THEN 0 ELSE 1 END,
                             ABS(o.satoshis - ?) ASC
                    LIMIT 1
                ) AND spent_by IS NULL
+                 AND (reserved_until IS NULL
+                      OR datetime(reserved_until) <= datetime('now'))
                RETURNING output_id, satoshis, txid, vout,
                          hex(locking_script) as locking_script,
                          derivation_prefix, derivation_suffix, sender_identity_key"#,
@@ -690,6 +729,64 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         }
     }
 
+    /// Diagnose why an explicitly-named createAction input could not be locked
+    /// (G2 failure path only). Best-effort read — if the diagnostic query
+    /// itself fails, return a generic reason rather than masking the original
+    /// unavailability error.
+    async fn diagnose_unavailable_input(
+        &self,
+        user_id: i64,
+        txid: &str,
+        vout: i64,
+    ) -> String {
+        #[derive(Deserialize)]
+        struct DiagRow {
+            spendable: Option<f64>,
+            spent_by: Option<f64>,
+            status: Option<String>,
+        }
+
+        let row: Option<DiagRow> = match Query::new(
+            r#"SELECT o.spendable, o.spent_by, t.status
+               FROM outputs o
+               JOIN transactions t ON o.transaction_id = t.transaction_id
+               WHERE o.user_id = ? AND o.txid = ? AND o.vout = ?
+               LIMIT 1"#,
+        )
+        .bind(user_id)
+        .bind(txid)
+        .bind(vout)
+        .fetch_optional(self.db)
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return "not spendable — diagnostic lookup failed".to_string();
+            }
+        };
+
+        match row {
+            None => "outpoint not tracked by storage for this user".to_string(),
+            Some(r) => {
+                if let Some(spent_by) = r.spent_by {
+                    return format!(
+                        "already spent or locked by transaction_id {}",
+                        spent_by as i64
+                    );
+                }
+                let spendable = r.spendable.map(|v| v as i64).unwrap_or(0);
+                if spendable == 0 {
+                    return "not spendable (spendable=0 — spent externally, relinquished, or never confirmed spendable)".to_string();
+                }
+                let status = r.status.unwrap_or_else(|| "unknown".to_string());
+                format!(
+                    "source transaction status '{}' is not spendable (need completed/unproven/nosend/sending)",
+                    status
+                )
+            }
+        }
+    }
+
     // =========================================================================
     // BEEF Building
     // =========================================================================
@@ -708,7 +805,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
     /// - R2 BlobStore fallback when the D1 hex column is NULL (blob overflow >4KB)
     /// - `console_log!` instead of `tracing::`
     /// - `HeaderProvider` enum instead of `&dyn ChainTracker`
-    async fn build_input_beef(&self, input_txids: &[String]) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn build_input_beef(&self, input_txids: &[String]) -> Result<Option<Vec<u8>>> {
         if input_txids.is_empty() {
             return Ok(None);
         }
@@ -741,7 +838,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         // this doesn't fire. But `merge_beef(stored_beef)` calls
         // `merge_raw_tx(raw, None)` which triggers try_to_validate, and a
         // collision with a sibling hash in an earlier bump mis-assigns the
-        // index. See: bsv-rs `transaction::beef`:308-313.
+        // index. See: rust-sdk/src/transaction/beef.rs:308-313.
         //
         // Fix: after the walk, validate every BeefTx's bump_index against its
         // bump's level-0 leaves. If the index points to a bump that does not

@@ -19,6 +19,10 @@ CHAINTRACKS_URL = "https://chaintracks.example.com"
 #   log_only — validate + log, return BEEF anyway
 #   skip     — bypass tracker entirely (drain-time / emergency only)
 BEEF_VERIFICATION = "strict"
+# Zero-conf internalize lever: "true" keeps deposited outputs spendable on a
+# transient broadcast provider error (operator-funded deployments only —
+# hard DoubleSpend/InvalidTx rejects still reject). Default off.
+INTERNALIZE_ZERO_CONF = "false"
 
 # Secrets (set via `wrangler secret put`):
 #   ARC_API_KEY — TAAL ARC API key for broadcast acceleration (optional).

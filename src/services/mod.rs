@@ -123,6 +123,27 @@ pub struct TxStatusDetail {
     pub depth: Option<u32>,
 }
 
+/// Spent-status of a single outpoint from a chain-index provider (G5).
+///
+/// Owner rule (non-negotiable): on BSV a tx SEEN_ON_NETWORK is FINAL
+/// (first-seen, no RBF). A mempool-only spend therefore counts as `Spent` —
+/// callers must NOT wait for the spending tx to be mined before acting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpentStatus {
+    /// A spending transaction exists (mined OR merely seen — both final).
+    Spent {
+        /// txid of the spending transaction, as reported by the provider.
+        spending_txid: String,
+    },
+    /// The provider reports the outpoint unspent — or does not know the
+    /// outpoint at all (indistinguishable on WoC's endpoint; both mean
+    /// "take no action").
+    Unspent,
+    /// The provider cannot answer outpoint-spent queries (default impl).
+    /// Callers must treat this as "no information", never as unspent.
+    Unsupported,
+}
+
 /// Transaction proof service.
 pub trait ProofService {
     /// Fetch merkle proof for a transaction. Returns None if not yet proven.
@@ -157,6 +178,19 @@ pub trait ProofService {
                 depth: None,
             })
             .collect()))
+    }
+
+    /// Spent-status lookup for a single outpoint (G5 — external-spend scan).
+    ///
+    /// Default implementation returns `Unsupported` so existing providers stay
+    /// source-compatible (additive change). Providers with an outpoint-spent
+    /// index (WoC `GET /tx/{txid}/{vout}/spent`) override this.
+    fn get_spent_status(
+        &self,
+        _txid: &str,
+        _vout: u32,
+    ) -> impl std::future::Future<Output = std::result::Result<SpentStatus, String>> {
+        std::future::ready(Ok(SpentStatus::Unsupported))
     }
 
     /// Reset any per-monitor-run internal cache state before a new check_for_proofs run.

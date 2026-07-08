@@ -1,6 +1,6 @@
 //! Cron-triggered monitor for wallet-infra.
 //!
-//! Runs every 5 minutes via `#[event(scheduled)]`. Nine tasks:
+//! Runs every 5 minutes via `#[event(scheduled)]`. Ten tasks:
 //! 1. `send_waiting` — broadcast txs with status 'unsent'/'sending'
 //! 2. `check_for_proofs` — collect merkle proofs for broadcast transactions
 //! 3. `fail_abandoned` — fail stuck unsigned/unprocessed transactions, release UTXOs
@@ -10,6 +10,9 @@
 //! 7. `check_no_sends` — (daily) detect nosend txs mined externally
 //! 8. `purge_data` — (hourly) nullify old completed blobs, delete old failed reqs
 //! 9. `check_chain_reorg` — detect chain reorgs via height tracking, reverify affected proofs
+//! 10. `scan_external_spends` — (G5) detect tracked outputs spent on-chain OUTSIDE
+//!     wallet-infra (e.g. a blackjack stake consumed by an escrow covenant) and
+//!     mark them `spendable = 0`
 
 #[cfg(test)]
 use bsv_sdk::transaction::MerklePathLeaf;
@@ -20,22 +23,355 @@ use worker::*;
 
 use crate::d1::batch::BatchCollector;
 use crate::d1::{QVal, Query};
-use crate::services::{BroadcastService, ProofService};
+use crate::services::{BroadcastService, ProofService, SpentStatus};
 
-/// Max attempts before marking a proven_tx_req as 'invalid'.
-/// At 5-min intervals, 12 attempts ≈ 60 minutes.
+// NOTE: the old `MAX_PROOF_ATTEMPTS = 12 → invalid` predicate lived here. Its
+// comment claimed reference alignment ("Go default is 10 attempts") — that
+// was wrong on two counts: the Go default is 100 (defs/sync_tx_statuses.go),
+// and BOTH references clock attempts on new-block events, not cron ticks —
+// AND Go recycles exhausted broadcast reqs to 'unsent' for re-broadcast
+// instead of invalidating them (known_tx.go proofTimeoutUpdates). The
+// wall-clocked 12-tick fail predicate false-failed mined mainnet txs twice
+// (170,227 + 97,727 sat). Deleted; see the decision core below.
+
+/// Block-clocked attempt ceiling used ONLY for alerting (never for failing).
+/// Mirrors the TS reference `unprovenAttemptsLimitMain = 144` (Monitor.ts:106)
+/// — with block-clocked attempts, 144 ≈ 144 blocks ≈ ~24h of confirmed
+/// on-chain absence. A req crossing this is loudly logged for operator
+/// attention; the ONLY fail paths remain ARC rejects and confirmed
+/// double-spends.
+#[allow(dead_code)]
+const UNPROVEN_ATTEMPTS_ALERT: i64 = 144;
+
+/// Consecutive block-clocked attempts while the network reports a txid
+/// "unknown" before the monitor runs the chain-truth escalation (input
+/// spent-status check → confirmed doubleSpend, else requeue for
+/// re-broadcast). ~3 blocks (~30 min) of confirmed network absence — fast
+/// enough to recover a relay-lost tx quickly, slow enough to ride out
+/// provider indexing lag. Mirrors the TS confirmDoubleSpend re-poll pattern
+/// (attemptToPostReqsToNetwork) and Go's rebroadcast-on-timeout.
+const UNKNOWN_ESCALATION_ATTEMPTS: i64 = 3;
+
+/// Max chain-truth escalations per monitor run. Each escalation costs one
+/// batch status re-poll plus one spent-status call per tx input, so this
+/// caps the per-run API budget the same way EXT_SPEND_BATCH does for G5.
+#[allow(dead_code)]
+const ESCALATION_BUDGET_PER_RUN: usize = 5;
+
+// =============================================================================
+// Task 10 (G5) — scan_external_spends policy knobs
+// =============================================================================
+
+/// Max candidate outputs checked per monitor run. Each candidate costs one
+/// WoC call, so this also caps the task's per-run API budget. 20/run at the
+/// */5 cron = a hard ceiling of 5,760 calls/day, hit only while a backlog
+/// exists; steady state is bounded by `EXT_SPEND_SWEEP_COOLDOWN_MINUTES`.
+const EXT_SPEND_BATCH: usize = 20;
+
+/// Bail out of the run after this many spent-status service errors. A
+/// transient WoC outage must not burn the cron (or the retry budget) on a
+/// batch that is going to keep failing; unprocessed candidates are retried
+/// next run because the cursor only advances past processed rows.
+const EXT_SPEND_MAX_SERVICE_ERRORS: u32 = 3;
+
+/// Once a full sweep of the candidate set completes, wait this long before
+/// starting the next sweep. Keeps steady-state WoC load at ~(set size) calls
+/// per hour instead of continuously re-scanning (the same throttling concern
+/// as `shallow_reorg_sweep`'s hourly gate).
+const EXT_SPEND_SWEEP_COOLDOWN_MINUTES: i64 = 60;
+
+/// Candidate query for the external-spend scan (G5).
 ///
-/// Reference-aligned: the Go toolbox default is 10 attempts
-/// (`go-wallet-toolbox/pkg/defs/sync_tx_statuses.go`), the Rust toolbox uses
-/// 144 (`bsv-wallet-toolbox-rs/src/storage/sqlx/storage_sqlx.rs:2709`).
-/// We picked 12 (2 above Go) — conservative enough to not invalidate
-/// briefly-lagged TSC lookups, aggressive enough to purge true phantoms
-/// within an hour of broadcast. On the next monitor cycle, any req already
-/// past this threshold transitions unmined → invalid in a single UPDATE,
-/// matching reference semantics exactly (just the proven_tx_reqs status,
-/// no cascading transactions/outputs updates — the wallet layer handles
-/// UTXO release when needed).
-const MAX_PROOF_ATTEMPTS: i64 = 12;
+/// A candidate is an output wallet-infra still believes it can spend AND that
+/// actually exists on-chain:
+/// - `spendable = 1` — still in balance / selectable;
+/// - `spent_by IS NULL` — NOT tx-locked by a live createAction (never race a
+///   pending action; if that action fails, `fail_abandoned` releases the row
+///   and the next sweep re-checks it);
+/// - `txid` present — the outpoint is addressable;
+/// - parent tx `unproven`/`completed` — broadcast/settled, so the output
+///   genuinely exists on-chain ('unsigned'/'unprocessed'/'nosend'/'sending'/
+///   'failed' parents are excluded: their outputs are not (yet) chain-real —
+///   `check_no_sends` owns the nosend-mined-externally case).
+///
+/// Deliberately NO `reserved_until` predicate: reservations (G1) are an
+/// orthogonal soft-lock layer — a reserved-but-chain-spent output is GONE and
+/// must still be marked. The scan never WRITES `reserved_until` either.
+///
+/// Paged by `output_id > ?` cursor, `LIMIT ?` (= EXT_SPEND_BATCH).
+pub(crate) const EXT_SPEND_CANDIDATES_SQL: &str =
+    "SELECT o.output_id, o.txid, o.vout \
+     FROM outputs o \
+     JOIN transactions t ON o.transaction_id = t.transaction_id \
+     WHERE o.output_id > ? \
+       AND o.spendable = 1 \
+       AND o.spent_by IS NULL \
+       AND o.txid IS NOT NULL AND o.txid != '' \
+       AND t.status IN ('unproven', 'completed') \
+     ORDER BY o.output_id ASC \
+     LIMIT ?";
+
+/// Mark-spent guard for a confirmed external spend (G5).
+///
+/// The WHERE re-checks BOTH liveness predicates at write time so the scan can
+/// never clobber a row that changed between the candidate SELECT and this
+/// UPDATE:
+/// - `spent_by IS NULL` — a live createAction locked it meanwhile: hands off
+///   (the owner rule still holds — the on-chain spend will surface as that
+///   action's doubleSpend failure, which releases the row for the next sweep);
+/// - `spendable = 1` — already relinquished/marked meanwhile: no-op (keeps
+///   the UPDATE idempotent and `changes` an accurate found-counter).
+///
+/// Sets `spent_by = NULL` explicitly (terminal external state — no local
+/// transaction owns the spend) and touches NOTHING else: not `basket_id`
+/// (relinquish semantics belong to the client), not `reserved_until` (G4:
+/// expiry/unreserve are the only reservation release paths).
+pub(crate) const EXT_SPEND_MARK_SQL: &str =
+    "UPDATE outputs SET spendable = 0, spent_by = NULL, updated_at = ? \
+     WHERE output_id = ? AND spendable = 1 AND spent_by IS NULL";
+
+/// Cursor persistence (G5) — same `monitor_events` latest-row-wins mechanism
+/// as `'chain_height'`, but UPDATEd in place (single row in steady state;
+/// INSERT only fires the first time). `event_id DESC` tiebreak because
+/// `created_at` has second granularity.
+pub(crate) const EXT_SPEND_CURSOR_READ_SQL: &str =
+    "SELECT details FROM monitor_events \
+     WHERE event = 'external_spend_cursor' \
+     ORDER BY created_at DESC, event_id DESC LIMIT 1";
+
+pub(crate) const EXT_SPEND_CURSOR_UPDATE_SQL: &str =
+    "UPDATE monitor_events SET details = ?, updated_at = CURRENT_TIMESTAMP \
+     WHERE event_id = (SELECT event_id FROM monitor_events \
+                       WHERE event = 'external_spend_cursor' \
+                       ORDER BY created_at DESC, event_id DESC LIMIT 1)";
+
+pub(crate) const EXT_SPEND_CURSOR_INSERT_SQL: &str =
+    "INSERT INTO monitor_events (event, details, created_at, updated_at) \
+     VALUES ('external_spend_cursor', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)";
+
+// =============================================================================
+// Proof-lifecycle decision core (pure functions, unit-tested)
+//
+// THE INVARIANT (owner rule, non-negotiable): `proven_tx_reqs.status='invalid'`
+// / `'doubleSpend'` and `transactions.status='failed'` may be reached ONLY on a
+// positive never-on-chain signal:
+//   (a) ARC hard-reject at/after broadcast (InvalidTx / DoubleSpend verdict);
+//   (b) a CONFIRMED double-spend — an input of ours spent by a DIFFERENT
+//       network-known tx (get_spent_status);
+//   (c) [reorg handling demotes, never fails — kept as-is].
+// NEVER on attempt-budget or get_proof timeout. Reference semantics:
+//   * TS wallet-toolbox: attempts only advance on a new-block event
+//     (TaskCheckForProofs.ts:50 `countsAsAttempt = checkNow`, set by
+//     Monitor.processNewBlockHeader — Monitor.ts:397-403), limit 144 blocks
+//     (Monitor.ts:106).
+//   * Go go-wallet-toolbox: the whole status sync is skipped unless the tip
+//     advanced (synchronize_tx_statuses.go lastBlockKey gate), mempool-only
+//     txs never accumulate attempts (filterTxsByConfirmationDepth), and
+//     attempt exhaustion REBROADCASTS (status → unsent, attempts reset —
+//     known_tx.go proofTimeoutUpdates) so ARC delivers a real verdict; it
+//     never jumps straight to invalid for a broadcast tx.
+// =============================================================================
+
+/// Per-req chain triage outcome (from `get_status_for_txids`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TriageStatus {
+    /// Confirmed in a block (depth >= 1): fetch the proof.
+    Mined,
+    /// In the mempool / SEEN on network. On BSV SEEN = final (first-seen, no
+    /// RBF): this tx WILL mine. Never a fail candidate.
+    Known,
+    /// The network does not know this txid. NOT proof of death by itself —
+    /// only input-spend evidence or an ARC reject may fail it.
+    Unknown,
+    /// Triage unavailable (provider error / batch fallback). No evidence.
+    Unavailable,
+}
+
+/// What to do with one pending proven_tx_req this cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReqAction {
+    /// Triage says mined: fetch + store the merkle proof.
+    FetchProof,
+    /// Keep waiting; optionally advance the block-clocked attempt counter.
+    Wait { count_attempt: bool },
+    /// Network-unknown for >= UNKNOWN_ESCALATION_ATTEMPTS blocks: run the
+    /// chain-truth escalation (confirm double-spend or requeue for
+    /// re-broadcast). Attempt counting still applies.
+    Escalate { count_attempt: bool },
+    /// LEGACY ONLY — attempt budget exhausted → invalid. The fixed decision
+    /// function NEVER returns this; it exists so tests can prove the old
+    /// semantics violated the invariant (red) and the new ones don't (green).
+    #[allow(dead_code)]
+    MarkInvalid,
+}
+
+/// Verdict of the chain-truth escalation for a network-unknown tx.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EscalationVerdict {
+    /// An input is spent by a DIFFERENT network-known tx — positive
+    /// never-on-chain signal. req → 'doubleSpend', tx → 'failed'.
+    ConfirmedDoubleSpend { spending_txid: String },
+    /// No conflicting spend found: requeue for re-broadcast ('unsent') so ARC
+    /// delivers a real verdict (Go proofTimeoutUpdates semantics).
+    Rebroadcast,
+    /// Evidence incomplete (recheck no longer unknown, parse failure, or a
+    /// spent-status service error with no positive DS hit): do nothing.
+    Hold,
+}
+
+/// Block-clock gate: an attempt only "counts" when the chain tip has advanced
+/// past the height at which we last counted one (TS `countsAsAttempt`, Go
+/// `lastBlockKey`). Tip unavailable → no attempt (no evidence, no clock).
+pub(crate) fn attempt_counts_now(current_tip: Option<u32>, last_counted_tip: Option<u32>) -> bool {
+    match (current_tip, last_counted_tip) {
+        // Tip unavailable: no chain evidence, no clock. A provider outage
+        // must freeze the attempt clock, not run it.
+        (None, _) => false,
+        // First observation: counts (starts the clock).
+        (Some(_), None) => true,
+        // Only strictly-new blocks count. Equal tip = zero blocks passed
+        // without the tx; a LOWER tip is a reorg/provider flap, not evidence
+        // of absence.
+        (Some(cur), Some(last)) => cur > last,
+    }
+}
+
+/// Decide the action for one pending req given triage evidence.
+pub(crate) fn decide_req_action(
+    triage: &TriageStatus,
+    attempts: i64,
+    counts_as_attempt: bool,
+    escalation_budget_left: bool,
+) -> ReqAction {
+    match triage {
+        // Confirmed in a block: fetch the proof, whatever the attempt count.
+        TriageStatus::Mined => ReqAction::FetchProof,
+        // SEEN on network = final on BSV: it WILL mine. Wait for the proof
+        // provider to catch up — never escalate, never fail, and do NOT
+        // tick the counter (review L1: attempts feed the UNKNOWN-streak
+        // escalation trigger, so a long-SEEN tx accruing them would
+        // escalate on the first WoC flap; Go's depth filter likewise never
+        // counts attempts for mempool txs).
+        TriageStatus::Known => ReqAction::Wait {
+            count_attempt: false,
+        },
+        // Network-unknown: after UNKNOWN_ESCALATION_ATTEMPTS blocks of
+        // confirmed absence, gather real evidence (input spends / ARC
+        // re-verdict). Until then, wait.
+        TriageStatus::Unknown => {
+            if attempts >= UNKNOWN_ESCALATION_ATTEMPTS && escalation_budget_left {
+                ReqAction::Escalate {
+                    count_attempt: counts_as_attempt,
+                }
+            } else {
+                ReqAction::Wait {
+                    count_attempt: counts_as_attempt,
+                }
+            }
+        }
+        // No triage evidence at all: freeze. Do not count, do not escalate —
+        // a provider outage must never advance any req toward any verdict.
+        TriageStatus::Unavailable => ReqAction::Wait {
+            count_attempt: false,
+        },
+    }
+}
+
+/// Decide the escalation verdict from re-checked status + per-input
+/// spent-status evidence. `input_spends` = (input_prev_txid, vout, status).
+pub(crate) fn decide_escalation(
+    recheck: &TriageStatus,
+    input_spends: &[(String, u32, SpentStatus)],
+    our_txid: &str,
+    had_service_error: bool,
+) -> EscalationVerdict {
+    // A positive double-spend hit wins regardless of other errors: an input
+    // consumed by a DIFFERENT network-known tx is conclusive (SEEN = final).
+    for (_, _, s) in input_spends {
+        if let SpentStatus::Spent { spending_txid } = s {
+            if spending_txid != our_txid {
+                return EscalationVerdict::ConfirmedDoubleSpend {
+                    spending_txid: spending_txid.clone(),
+                };
+            }
+            // Spent by OUR OWN txid → the network knows our tx after all.
+            return EscalationVerdict::Hold;
+        }
+    }
+    // No positive signal. Only act further if the evidence is complete and
+    // the tx is still network-unknown.
+    if *recheck != TriageStatus::Unknown || had_service_error || input_spends.is_empty() {
+        return EscalationVerdict::Hold;
+    }
+    EscalationVerdict::Rebroadcast
+}
+
+/// Books mutation on a positive ARC fail verdict (DoubleSpend/InvalidTx) for
+/// a tx identified by txid: RELEASE the inputs the tx had locked. Mirrors
+/// process_action's inline DoubleSpend branch and Go reviewKnownTxStatuses
+/// `RecreateSpentOutputs` (synchronize_tx_statuses.go). `basket_id IS NOT
+/// NULL` keeps relinquished (chain-gone) rows dead — G5 guard.
+/// Binds: (updated_at, txid).
+pub(crate) const FAIL_RELEASE_INPUTS_SQL: &str =
+    "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? \
+     WHERE spent_by IN (SELECT transaction_id FROM transactions WHERE txid = ?) \
+       AND basket_id IS NOT NULL \
+       AND transaction_id NOT IN (SELECT transaction_id FROM transactions WHERE status = 'failed')";
+
+/// Companion to FAIL_RELEASE_INPUTS_SQL: the failed tx's own CREATED outputs
+/// will never exist on-chain — force spendable=0 so the coin selector can
+/// never pick a phantom (Go `MarkCreatedOutputsAsNotSpendable`).
+/// Binds: (updated_at, txid).
+pub(crate) const FAIL_DERECOGNIZE_CREATED_SQL: &str =
+    "UPDATE outputs SET spendable = 0, updated_at = ? \
+     WHERE transaction_id IN (SELECT transaction_id FROM transactions WHERE txid = ?)";
+
+/// Row type for COUNT(*) queries.
+#[derive(Debug, Deserialize)]
+struct CountRow {
+    n: Option<f64>,
+}
+
+/// Read the chain height at which the block-clocked attempt counter last
+/// advanced (monitor_events 'proof_attempt_height', UPDATE-in-place row like
+/// the G5 cursor). None = never counted (or unparseable → restart clock).
+async fn read_proof_attempt_height(db: &D1Database) -> Option<u32> {
+    let row: Option<ChainHeightRow> = Query::new(
+        "SELECT details FROM monitor_events \
+         WHERE event = 'proof_attempt_height' \
+         ORDER BY created_at DESC, event_id DESC LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    row.and_then(|r| r.details)
+        .and_then(|d| d.trim().parse::<u32>().ok())
+}
+
+/// Persist the attempt-clock height after a counted run (single-row upsert).
+async fn store_proof_attempt_height(db: &D1Database, height: u32) {
+    let updated = Query::new(
+        "UPDATE monitor_events SET details = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE event_id = (SELECT event_id FROM monitor_events \
+                           WHERE event = 'proof_attempt_height' \
+                           ORDER BY created_at DESC, event_id DESC LIMIT 1)",
+    )
+    .bind(height.to_string().as_str())
+    .execute(db)
+    .await
+    .map(|m| m.changes)
+    .unwrap_or(0);
+    if updated == 0 {
+        let _ = Query::new(
+            "INSERT INTO monitor_events (event, details, created_at, updated_at) \
+             VALUES ('proof_attempt_height', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(height.to_string().as_str())
+        .execute(db)
+        .await;
+    }
+}
 
 // =============================================================================
 // Legacy WoC types — kept for parse_tsc_proof_response / tsc_proof_to_binary tests.
@@ -138,6 +474,78 @@ struct UnsentTxRow {
     input_beef: Option<String>, // hex from hex(input_beef)
 }
 
+/// Row type for scan_external_spends candidates (G5).
+#[derive(Debug, Deserialize)]
+struct ExtSpendCandidateRow {
+    output_id: Option<f64>,
+    txid: Option<String>,
+    vout: Option<f64>,
+}
+
+// =============================================================================
+// Task 10 (G5) — persistent scan cursor
+// =============================================================================
+
+/// Persistent cursor for the external-spend scan.
+///
+/// Stored in `monitor_events` under `event = 'external_spend_cursor'` — the
+/// same latest-row-wins mechanism `check_chain_reorg` uses for
+/// `'chain_height'` (no migration needed). Unlike chain_height (which keeps
+/// history for reorg forensics) the cursor row is UPDATEd in place, with an
+/// INSERT only on first use — a single row in steady state.
+#[derive(Debug, Default, PartialEq)]
+struct ExtSpendCursor {
+    /// Scan resumes at `output_id > last_output_id`. 0 = start of a sweep.
+    last_output_id: i64,
+    /// RFC3339 timestamp of the last COMPLETED full sweep. Only consulted
+    /// while parked at `last_output_id == 0` (sweep-cooldown gate).
+    sweep_completed_at: Option<String>,
+}
+
+/// Parse a stored cursor `details` JSON. Malformed/missing fields degrade to
+/// the default (restart the sweep from 0 immediately) — never an error, the
+/// scan must self-heal from a corrupt cursor.
+fn parse_ext_spend_cursor(details: &str) -> ExtSpendCursor {
+    let v: serde_json::Value = match serde_json::from_str(details) {
+        Ok(v) => v,
+        Err(_) => return ExtSpendCursor::default(),
+    };
+    ExtSpendCursor {
+        last_output_id: v.get("last_output_id").and_then(|x| x.as_i64()).unwrap_or(0),
+        sweep_completed_at: v
+            .get("sweep_completed_at")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+    }
+}
+
+/// Serialize a cursor to the `details` JSON stored in monitor_events.
+fn ext_spend_cursor_json(cursor: &ExtSpendCursor) -> String {
+    serde_json::json!({
+        "last_output_id": cursor.last_output_id,
+        "sweep_completed_at": cursor.sweep_completed_at,
+    })
+    .to_string()
+}
+
+/// True while a completed sweep is inside its cooldown window (parked).
+fn ext_spend_sweep_parked(cursor: &ExtSpendCursor, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if cursor.last_output_id != 0 {
+        return false; // mid-sweep — keep going
+    }
+    match cursor
+        .sweep_completed_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    {
+        Some(done) => {
+            now.signed_duration_since(done.with_timezone(&chrono::Utc))
+                < chrono::Duration::minutes(EXT_SPEND_SWEEP_COOLDOWN_MINUTES)
+        }
+        None => false, // never completed (or unparseable) — sweep now
+    }
+}
+
 // =============================================================================
 // Monitor result
 // =============================================================================
@@ -156,6 +564,10 @@ pub struct MonitorResult {
     pub reorg_detected: bool,
     pub reorg_depth: u32,
     pub proofs_reverified: u32,
+    /// Task 10 (G5): candidate outputs whose spent-status was checked this run.
+    pub ext_spends_scanned: u32,
+    /// Task 10 (G5): outputs found externally spent and marked spendable=0.
+    pub ext_spends_found: u32,
     pub errors: Vec<String>,
 }
 
@@ -183,11 +595,13 @@ pub async fn run_monitor<B: BroadcastService, P: ProofService>(
         reorg_detected: false,
         reorg_depth: 0,
         proofs_reverified: 0,
+        ext_spends_scanned: 0,
+        ext_spends_found: 0,
         errors: Vec::new(),
     };
 
     // Task 1: Broadcast unsent/sending transactions
-    match send_waiting(db, broadcast).await {
+    match send_waiting(db, blobs, broadcast).await {
         Ok((sent_count, err_count, send_errors)) => {
             result.sent = sent_count;
             result.send_errors = err_count;
@@ -278,6 +692,16 @@ pub async fn run_monitor<B: BroadcastService, P: ProofService>(
         Err(e) => result.errors.push(format!("check_chain_reorg: {}", e)),
     }
 
+    // Task 10 (G5): Scan tracked outpoints for spends made OUTSIDE wallet-infra
+    match scan_external_spends(db, proof_service).await {
+        Ok((scanned, found, scan_errors)) => {
+            result.ext_spends_scanned = scanned;
+            result.ext_spends_found = found;
+            result.errors.extend(scan_errors);
+        }
+        Err(e) => result.errors.push(format!("scan_external_spends: {}", e)),
+    }
+
     // Log to monitor_events table
     let _ = log_monitor_event(db, &result).await;
 
@@ -290,14 +714,19 @@ pub async fn run_monitor<B: BroadcastService, P: ProofService>(
 
 async fn send_waiting<B: BroadcastService>(
     db: &D1Database,
+    blobs: &worker::Bucket,
     broadcast: &B,
 ) -> Result<(u32, u32, Vec<String>)> {
+    // ORDER BY attempts ASC first (review M-C): rows that fail or no-op
+    // accrue attempts and sink, so a wall of stuck rows can no longer
+    // permanently occupy the LIMIT-100 window and starve fresh sends
+    // (including the escalation's Rebroadcast → 'unsent' handoff).
     let rows: Vec<UnsentTxRow> = Query::new(
         "SELECT proven_tx_req_id, txid, status, attempts, hex(raw_tx) as raw_tx, \
          batch, hex(input_beef) as input_beef \
          FROM proven_tx_reqs \
          WHERE status IN ('unsent', 'sending') \
-         ORDER BY created_at ASC \
+         ORDER BY attempts ASC, created_at ASC \
          LIMIT 100",
     )
     .fetch_all(db)
@@ -316,26 +745,73 @@ async fn send_waiting<B: BroadcastService>(
         let req_id = row.proven_tx_req_id.unwrap_or(0.0) as i64;
         let attempts = row.attempts.unwrap_or(0.0) as i64;
 
-        // Prefer BEEF broadcast if input_beef is available, otherwise fall back to raw_tx.
-        let broadcast_result = if let Some(ref beef_hex) = row.input_beef {
-            if !beef_hex.is_empty() {
-                broadcast.broadcast_beef(beef_hex).await
-            } else if let Some(ref raw_tx_hex) = row.raw_tx {
-                if !raw_tx_hex.is_empty() {
-                    broadcast.broadcast_raw_tx(raw_tx_hex).await
-                } else {
-                    continue;
+        // Broadcast the SUBJECT TX with its ancestry: stored input_beef is
+        // ancestors-only (build_input_beef), so it MUST be merged with raw_tx
+        // before posting — the reference merges req.rawTx + inputBEEF
+        // (StorageProvider.ts mergeReqToBeefToShareExternally), and
+        // process_action's inline path does the same merge. The old code
+        // posted input_beef verbatim: ARC received only already-known
+        // ancestors, answered success, and every status advanced on a tx
+        // that never reached the network (audit C3).
+        let raw_tx_hex: Option<&String> = row.raw_tx.as_ref().filter(|h| !h.is_empty());
+
+        // input_beef may live in R2 (D1 column NULL for >4KB blobs — the
+        // COMMON case for deep ancestry; review M-D: without this fallback
+        // the largest txs silently downgraded to raw-tx-only broadcast,
+        // the exact orphan-mempool failure of the 2026-04-15 incident).
+        let beef_bytes: Option<Vec<u8>> = match &row.input_beef {
+            Some(h) if !h.is_empty() => hex::decode(h).ok(),
+            _ => {
+                let store = crate::r2::BlobStore::new(blobs);
+                store
+                    .get("proven_tx_reqs", req_id, "input_beef", None)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+
+        let merged_beef_hex: Option<String> = match (beef_bytes, raw_tx_hex) {
+            (Some(beef_bytes), Some(raw_hex)) => hex::decode(raw_hex).ok().and_then(|raw_bytes| {
+                match Beef::from_binary(&beef_bytes) {
+                    Ok(mut beef) => {
+                        beef.merge_raw_tx(raw_bytes, None);
+                        Some(hex::encode(beef.to_binary()))
+                    }
+                    Err(e) => {
+                        console_error!(
+                            "send_waiting: BEEF rebuild failed for {} (falling back to raw_tx): {}",
+                            txid,
+                            e
+                        );
+                        None
+                    }
                 }
-            } else {
-                continue;
-            }
-        } else if let Some(ref raw_tx_hex) = row.raw_tx {
-            if !raw_tx_hex.is_empty() {
-                broadcast.broadcast_raw_tx(raw_tx_hex).await
-            } else {
-                continue;
-            }
+            }),
+            _ => None,
+        };
+
+        let broadcast_result = if let Some(ref beef_hex) = merged_beef_hex {
+            broadcast.broadcast_beef(beef_hex).await
+        } else if let Some(raw_hex) = raw_tx_hex {
+            broadcast.broadcast_raw_tx(raw_hex).await
         } else {
+            // Nothing broadcastable (no raw_tx). Bump attempts so the row
+            // sinks in the ordering instead of clogging the window forever
+            // (review M-C), and surface it — this state should not exist.
+            console_error!(
+                "send_waiting: req {} for {} has no raw_tx — cannot broadcast (attempts+1)",
+                req_id,
+                txid
+            );
+            let now = Utc::now().to_rfc3339();
+            let _ = Query::new(
+                "UPDATE proven_tx_reqs SET attempts = attempts + 1, updated_at = ? WHERE proven_tx_req_id = ?",
+            )
+            .bind(now.as_str())
+            .bind(req_id)
+            .execute(db)
+            .await;
             continue;
         };
 
@@ -371,10 +847,24 @@ async fn send_waiting<B: BroadcastService>(
                     "UPDATE transactions SET status = 'failed', updated_at = ? WHERE txid = ?",
                     vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
                 );
-                // Release locked outputs: set spendable=1 on outputs created by this tx
-                // that aren't already spent, and release input locks.
+                // Books on a positive ARC fail verdict (audit M1; reference:
+                // Go reviewKnownTxStatuses — RecreateSpentOutputs +
+                // MarkCreatedOutputsAsNotSpendable; same statements as
+                // process_action's inline DoubleSpend branch):
+                //  1. RELEASE the INPUTS this tx had locked (spent_by → this
+                //     transaction) — the tx will never consume them. The
+                //     basket_id IS NOT NULL guard keeps relinquished rows dead.
+                //  2. De-recognize the tx's own CREATED outputs — they will
+                //     never exist on-chain; spendable=1 here would be phantom
+                //     money the coin selector picks and bricks on.
+                // (The old code did the exact inverse: re-enabled the created
+                // outputs and never touched the input locks.)
                 let _ = batch.add(
-                    "UPDATE outputs SET spendable = 1, updated_at = ? WHERE txid = ? AND spendable = 0 AND spent_by IS NULL AND (change = 1 OR custom_instructions IS NOT NULL)",
+                    FAIL_RELEASE_INPUTS_SQL,
+                    vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
+                );
+                let _ = batch.add(
+                    FAIL_DERECOGNIZE_CREATED_SQL,
                     vec![QVal::Text(now), QVal::Text(txid.clone())],
                 );
                 let _ = batch.execute().await;
@@ -399,8 +889,14 @@ async fn send_waiting<B: BroadcastService>(
                     "UPDATE transactions SET status = 'failed', updated_at = ? WHERE txid = ?",
                     vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
                 );
+                // Same books correction as the DoubleSpend arm (audit M1):
+                // release the inputs, de-recognize the created outputs.
                 let _ = batch.add(
-                    "UPDATE outputs SET spendable = 1, updated_at = ? WHERE txid = ? AND spendable = 0 AND spent_by IS NULL AND (change = 1 OR custom_instructions IS NOT NULL)",
+                    FAIL_RELEASE_INPUTS_SQL,
+                    vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
+                );
+                let _ = batch.add(
+                    FAIL_DERECOGNIZE_CREATED_SQL,
                     vec![QVal::Text(now), QVal::Text(txid.clone())],
                 );
                 let _ = batch.execute().await;
@@ -450,31 +946,55 @@ async fn check_for_proofs<P: ProofService>(
     // a reorg changed the block at a given hash.
     proof_service.reset_run_cache();
 
-    // Stale-unmined sweep: bulk-invalidate any proven_tx_req stuck above
-    // MAX_PROOF_ATTEMPTS. Runs before the proof-fetch loop so stuck zombies
-    // never block fresh arrivals from getting WoC slots. Pure SQL — zero
-    // API calls. Matches reference behavior of eventually transitioning
-    // post-broadcast states → invalid, but in a batched form so bursts of
-    // fresh traffic don't starve the increment path.
+    // THE FALSE-FAIL FIX (HANDOFF-MONITOR-FALSE-FAIL.md): the old code
+    // bulk-invalidated any req with attempts >= 12 here — 12 wall-clocked
+    // cron ticks ≈ 60 min, no chain-truth check. That predicate false-failed
+    // mined transactions twice on mainnet (170,227 + 97,727 sat) whenever the
+    // proof provider lagged mining. It is deleted, not tuned: NO attempt
+    // count may ever set 'invalid'. Attempts are now a block-clocked
+    // observability counter (reference: TS TaskCheckForProofs.ts:50,229 —
+    // countsAsAttempt fires only on a new-header event; Go
+    // synchronize_tx_statuses.go skips the whole sync unless the tip moved).
     //
-    // Status set matches Go toolbox's `statusesReadyToSync` in
-    // `pkg/storage/internal/actions/synchronize_tx_statuses.go:31`:
-    // callback, unmined, sending, unknown, unconfirmed, reorg. Excludes
-    // `unprocessed` deliberately — that's a pre-broadcast state, handled
-    // by SendWaitingTransactions, not by the proof-fetch path.
-    let swept = Query::new(
-        "UPDATE proven_tx_reqs SET status = 'invalid', updated_at = ? \
+    // Block-clock gate: an attempt counts only if the chain tip advanced
+    // since the last counted attempt. Tip source is the ProofService
+    // (chaintracks-first via MultiProvider). Tip unavailable → clock frozen.
+    let current_tip: Option<u32> = match proof_service.get_chain_height().await {
+        // A zero tip is a service-degraded signal (empty tip row), never
+        // chain state — treat as unavailable (rust-chaintracks audit C4).
+        Ok(0) => {
+            console_error!("check_for_proofs: tip source returned 0 — attempt clock frozen");
+            None
+        }
+        Ok(h) => Some(h),
+        Err(e) => {
+            console_error!("check_for_proofs: tip unavailable ({}) — attempt clock frozen", e);
+            None
+        }
+    };
+    let last_counted_tip: Option<u32> = read_proof_attempt_height(db).await;
+    let counts_as_attempt = attempt_counts_now(current_tip, last_counted_tip);
+
+    // Alert (never fail) on reqs stuck past the reference ceiling: 144
+    // block-clocked attempts ≈ 144 blocks ≈ ~24h of confirmed absence
+    // (TS Monitor.ts:106). Operator signal only.
+    if let Ok(stuck) = Query::new(
+        "SELECT COUNT(*) AS n FROM proven_tx_reqs \
          WHERE status IN ('unmined', 'unknown', 'unconfirmed', 'callback', 'sending', 'reorg') \
            AND attempts >= ?",
     )
-    .bind(Utc::now().to_rfc3339().as_str())
-    .bind(MAX_PROOF_ATTEMPTS)
-    .execute(db)
+    .bind(UNPROVEN_ATTEMPTS_ALERT)
+    .fetch_optional::<CountRow>(db)
     .await
-    .map(|m| m.changes)
-    .unwrap_or(0);
-    if swept > 0 {
-        console_log!("check_for_proofs: swept {} stale unmined → invalid", swept);
+    {
+        let n = stuck.and_then(|r| r.n).unwrap_or(0.0) as i64;
+        if n > 0 {
+            console_error!(
+                "ALERT check_for_proofs: {} req(s) unproven past {} block-clocked attempts (~24h) — investigate; they will NOT be auto-failed",
+                n,
+                UNPROVEN_ATTEMPTS_ALERT
+            );
+        }
     }
 
     let rows: Vec<PendingProofRow> = Query::new(
@@ -510,9 +1030,12 @@ async fn check_for_proofs<P: ProofService>(
         .filter_map(|r| r.txid.as_ref().filter(|t| !t.is_empty()).cloned())
         .collect();
 
-    // Triage: batch status check to skip txids that aren't mined yet.
-    // On failure OR suspicious results, fall through to old behavior (check all).
-    let confirmed_set: Option<std::collections::HashSet<String>> = match proof_service
+    // Triage: batch status check → per-txid TriageStatus. On provider failure
+    // OR suspicious results (0 confirmed of N — WoC sometimes returns all
+    // "unknown" from CF Workers), triage is Unavailable for everyone: we still
+    // try get_proof (a found proof is positive evidence and ARC may work when
+    // WoC doesn't), but nothing counts as an attempt and nothing escalates.
+    let status_map: Option<std::collections::HashMap<String, TriageStatus>> = match proof_service
         .get_status_for_txids(&all_txids)
         .await
     {
@@ -528,13 +1051,14 @@ async fn check_for_proofs<P: ProofService>(
                 missing
             );
 
-            // Safety net: if triage says 0 confirmed out of N pending,
-            // the batch status call may be broken (e.g. WoC returns all
-            // "unknown" from CF Workers). Fall through to old behavior
-            // so individual get_proof calls still work.
-            if confirmed == 0 && !all_txids.is_empty() {
+            // Suspicious ONLY when the batch reports every txid unknown
+            // (the known WoC-from-CF failure shape). 0 mined with some
+            // mempool is the NORMAL state between blocks — discarding the
+            // map then (review H1) silently disabled attempt counting AND
+            // escalation for relay-lost txs, indefinitely.
+            if confirmed == 0 && mempool == 0 && !all_txids.is_empty() {
                 console_error!(
-                        "check_for_proofs triage: 0/{} confirmed — batch status may be broken, falling back to check all",
+                        "check_for_proofs triage: 0/{} known to the network — batch status may be broken, falling back to check all",
                         all_txids.len()
                     );
                 None
@@ -542,17 +1066,30 @@ async fn check_for_proofs<P: ProofService>(
                 Some(
                     statuses
                         .into_iter()
-                        .filter(|s| s.status == "mined" && s.depth.unwrap_or(0) >= 1)
-                        .map(|s| s.txid)
+                        .map(|s| {
+                            let t = match s.status.as_str() {
+                                "mined" if s.depth.unwrap_or(0) >= 1 => TriageStatus::Mined,
+                                // Mined but depth 0 = bleeding-edge block —
+                                // treat as Known (will confirm; avoid
+                                // re-orged proofs, TS maxAcceptableHeight).
+                                "mined" => TriageStatus::Known,
+                                "known" => TriageStatus::Known,
+                                "unknown" => TriageStatus::Unknown,
+                                _ => TriageStatus::Unavailable,
+                            };
+                            (s.txid, t)
+                        })
                         .collect(),
                 )
             }
         }
         Err(e) => {
             console_error!("check_for_proofs triage failed, falling back: {}", e);
-            None // Fall through to old behavior
+            None
         }
     };
+
+    let mut escalations_left: usize = ESCALATION_BUDGET_PER_RUN;
 
     for row in &rows {
         let txid = match &row.txid {
@@ -562,19 +1099,94 @@ async fn check_for_proofs<P: ProofService>(
         let req_id = row.proven_tx_req_id.unwrap_or(0.0) as i64;
         let attempts = row.attempts.unwrap_or(0.0) as i64;
 
-        // If triage succeeded, skip txids that aren't confirmed
-        if let Some(ref confirmed) = confirmed_set {
-            if !confirmed.contains(&txid) {
-                // Not confirmed — increment attempts, skip proof fetch
-                let _ = increment_attempts(db, req_id, attempts).await;
-                continue;
+        let triage = match &status_map {
+            Some(map) => map.get(&txid).cloned().unwrap_or(TriageStatus::Unavailable),
+            // Batch triage unavailable: no chain evidence — but still try
+            // the proof fetch below (legacy fallback behavior).
+            None => TriageStatus::Unavailable,
+        };
+
+        // Corruption check (TS TaskCheckForProofs.ts:139-151 parity): a
+        // raw_tx that doesn't hash to its txid is a positive local invalid
+        // signal — and it would poison proven_txs.raw_tx / BEEF rebuilds if
+        // a (txid-keyed) proof were stored over it.
+        if let Some(false) = raw_tx_matches_txid(&row.raw_tx, &txid) {
+            console_error!(
+                "check_for_proofs: raw_tx does not hash to txid {} — corruption, marking invalid",
+                txid
+            );
+            let now = Utc::now().to_rfc3339();
+            let _ = Query::new(
+                "UPDATE proven_tx_reqs SET status = 'invalid', updated_at = ? WHERE proven_tx_req_id = ?",
+            )
+            .bind(now.as_str())
+            .bind(req_id)
+            .execute(db)
+            .await;
+            continue;
+        }
+
+        let action = decide_req_action(&triage, attempts, counts_as_attempt, escalations_left > 0);
+
+        let fetch_proof = match action {
+            ReqAction::FetchProof => true,
+            // Triage said nothing useful — fall back to a direct proof try.
+            ReqAction::Wait { count_attempt } if triage == TriageStatus::Unavailable => {
+                let _ = count_attempt; // always false for Unavailable
+                true
             }
+            ReqAction::Wait { count_attempt } => {
+                if count_attempt {
+                    let _ = increment_attempts(db, req_id, attempts).await;
+                }
+                false
+            }
+            ReqAction::Escalate { count_attempt } => {
+                if count_attempt {
+                    let _ = increment_attempts(db, req_id, attempts).await;
+                }
+                escalations_left = escalations_left.saturating_sub(1);
+                match escalate_unknown_req(db, proof_service, req_id, &txid, &row.raw_tx).await {
+                    Ok(v) => console_log!("escalation({}): {:?}", &txid[..8.min(txid.len())], v),
+                    Err(e) => {
+                        console_error!("escalation({}) failed: {}", txid, e);
+                        if proof_errors.len() < 3 {
+                            proof_errors.push(format!("escalate({}):{}", &txid[..8], e));
+                        }
+                    }
+                }
+                // Escalation includes its own status re-poll; pace it.
+                worker::Delay::from(std::time::Duration::from_millis(1000)).await;
+                false
+            }
+            // The fixed decision function never returns MarkInvalid; if it
+            // ever did, refusing to act is the safe direction.
+            ReqAction::MarkInvalid => false,
+        };
+
+        if !fetch_proof {
+            continue;
         }
 
         checked += 1;
 
         match proof_service.get_proof(&txid).await {
             Ok(Some(proof_result)) => {
+                // Bleeding-edge gate (TS maxAcceptableHeight,
+                // TaskCheckForProofs.ts:188-192): a proof from a block our
+                // tip source hasn't settled yet is the most likely to be
+                // re-orged — skip this cycle, take it next run.
+                if let Some(tip) = current_tip {
+                    if proof_result.block_height > tip {
+                        console_log!(
+                            "check_for_proofs: proof for {} at height {} above settled tip {} — deferring one cycle",
+                            &txid[..8.min(txid.len())],
+                            proof_result.block_height,
+                            tip
+                        );
+                        continue;
+                    }
+                }
                 // Proof found — store it
                 if let Err(e) =
                     store_proof_result(db, blobs, &txid, req_id, &row.raw_tx, &proof_result).await
@@ -588,8 +1200,16 @@ async fn check_for_proofs<P: ProofService>(
                 }
             }
             Ok(None) => {
-                // Not yet mined — increment attempts
-                let _ = increment_attempts(db, req_id, attempts).await;
+                // No proof yet. NEVER a fail signal (a SEEN-but-unproven tx
+                // is indistinguishable from a lagging provider here — the
+                // exact conflation behind the false-FAIL incidents). Count
+                // the block-clocked attempt only when triage POSITIVELY said
+                // mined (proof should exist but the proof providers lag —
+                // Go only counts attempts for depth-confirmed txs whose
+                // merkle fetch failed).
+                if counts_as_attempt && triage == TriageStatus::Mined {
+                    let _ = increment_attempts(db, req_id, attempts).await;
+                }
             }
             Err(e) => {
                 console_error!("get_proof({}) failed: {}", txid, e);
@@ -609,7 +1229,253 @@ async fn check_for_proofs<P: ProofService>(
         worker::Delay::from(std::time::Duration::from_millis(1000)).await;
     }
 
+    // Advance the block-clock only after a counted run so the next run
+    // doesn't double-count the same block — and only when triage evidence
+    // was actually usable (review H1: storing the height on a discarded-
+    // triage run burned the block, starving the clock on quiet wallets).
+    if counts_as_attempt && status_map.is_some() {
+        if let Some(tip) = current_tip {
+            store_proof_attempt_height(db, tip).await;
+        }
+    }
+
     Ok((found, checked, proof_errors))
+}
+
+/// Chain-truth escalation for a req the network has reported "unknown" for
+/// >= UNKNOWN_ESCALATION_ATTEMPTS block-clocked attempts (the tx should have
+/// been SEEN by now if the original broadcast propagated).
+///
+/// Evidence gathering (positive signals only — see decide_escalation):
+///   1. Re-poll the txid status (kills triage-drift races).
+///   2. Check each input outpoint's spent-status.
+/// Verdicts:
+///   * ConfirmedDoubleSpend — an input is consumed by a DIFFERENT
+///     network-known tx: req 'doubleSpend', tx 'failed', inputs released,
+///     created outputs de-recognized (the one factual non-ARC fail path).
+///   * Rebroadcast — nothing conflicts: requeue 'unsent' (attempts reset) so
+///     send_waiting re-broadcasts and ARC delivers a real verdict (Go
+///     proofTimeoutUpdates semantics: timeout → unsent, never → invalid).
+///   * Hold — evidence incomplete: change nothing.
+async fn escalate_unknown_req<P: ProofService>(
+    db: &D1Database,
+    proof_service: &P,
+    req_id: i64,
+    txid: &str,
+    raw_tx_hex: &Option<String>,
+) -> Result<EscalationVerdict> {
+    // 1. Status re-poll.
+    let recheck = match proof_service
+        .get_status_for_txids(&[txid.to_string()])
+        .await
+    {
+        Ok(statuses) => match statuses.first() {
+            Some(s) if s.status == "mined" => TriageStatus::Mined,
+            Some(s) if s.status == "known" => TriageStatus::Known,
+            Some(s) if s.status == "unknown" => TriageStatus::Unknown,
+            _ => TriageStatus::Unavailable,
+        },
+        Err(_) => TriageStatus::Unavailable,
+    };
+
+    // 2. Input spent-status evidence (only meaningful while still unknown).
+    let mut input_spends: Vec<(String, u32, SpentStatus)> = Vec::new();
+    let mut had_service_error = false;
+    if recheck == TriageStatus::Unknown {
+        let outpoints = raw_tx_hex
+            .as_ref()
+            .and_then(|h| hex::decode(h).ok())
+            .map(|bytes| parse_input_outpoints(&bytes))
+            .unwrap_or_default();
+        for (prev_txid, prev_vout) in outpoints {
+            match proof_service.get_spent_status(&prev_txid, prev_vout).await {
+                Ok(s) => input_spends.push((prev_txid, prev_vout, s)),
+                Err(e) => {
+                    console_error!(
+                        "escalation({}): spent-status {}:{} error: {}",
+                        &txid[..8.min(txid.len())],
+                        &prev_txid[..8.min(prev_txid.len())],
+                        prev_vout,
+                        e
+                    );
+                    had_service_error = true;
+                }
+            }
+        }
+    }
+
+    let mut verdict = decide_escalation(&recheck, &input_spends, txid, had_service_error);
+
+    // Second positive signal before failing (parity hardening: TS
+    // confirmDoubleSpend re-polls 3×; we instead require the alleged
+    // SPENDING tx to be network-known — a stronger, direct confirmation
+    // that the conflicting spend exists).
+    if let EscalationVerdict::ConfirmedDoubleSpend { spending_txid } = &verdict {
+        let spender_known = proof_service
+            .get_status_for_txids(&[spending_txid.clone()])
+            .await
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .map(|st| st.status == "known" || st.status == "mined")
+            .unwrap_or(false);
+        if !spender_known {
+            console_log!(
+                "escalation({}): WoC alleges spender {} but the network doesn't know it — holding",
+                &txid[..8.min(txid.len())],
+                &spending_txid[..8.min(spending_txid.len())]
+            );
+            verdict = EscalationVerdict::Hold;
+        }
+    }
+
+    let now = Utc::now().to_rfc3339();
+
+    match &verdict {
+        EscalationVerdict::ConfirmedDoubleSpend { spending_txid } => {
+            console_error!(
+                "escalation: CONFIRMED double-spend txid={} (input taken by {}) — failing on positive signal",
+                txid,
+                spending_txid
+            );
+            let mut batch = BatchCollector::new(db);
+            let _ = batch.add(
+                "UPDATE proven_tx_reqs SET status = 'doubleSpend', updated_at = ? WHERE proven_tx_req_id = ? \
+                 AND status IN ('unmined', 'unknown', 'unconfirmed', 'callback', 'sending', 'reorg')",
+                vec![QVal::Text(now.clone()), QVal::Int(req_id)],
+            );
+            let _ = batch.add(
+                "UPDATE transactions SET status = 'failed', updated_at = ? WHERE txid = ?",
+                vec![QVal::Text(now.clone()), QVal::Text(txid.to_string())],
+            );
+            let _ = batch.add(
+                FAIL_RELEASE_INPUTS_SQL,
+                vec![QVal::Text(now.clone()), QVal::Text(txid.to_string())],
+            );
+            let _ = batch.add(
+                FAIL_DERECOGNIZE_CREATED_SQL,
+                vec![QVal::Text(now), QVal::Text(txid.to_string())],
+            );
+            batch
+                .execute()
+                .await
+                .map_err(|e| Error::from(e.to_string()))?;
+        }
+        EscalationVerdict::Rebroadcast => {
+            console_log!(
+                "escalation: txid={} network-unknown with no conflicting spend — requeueing for re-broadcast (ARC verdict)",
+                txid
+            );
+            Query::new(
+                "UPDATE proven_tx_reqs SET status = 'unsent', attempts = 0, updated_at = ? WHERE proven_tx_req_id = ? \
+                 AND status IN ('unmined', 'unknown', 'unconfirmed', 'callback', 'reorg')",
+            )
+            .bind(now.as_str())
+            .bind(req_id)
+            .execute(db)
+            .await
+            .map_err(|e| Error::from(e.to_string()))?;
+        }
+        EscalationVerdict::Hold => {}
+    }
+
+    Ok(verdict)
+}
+
+/// TS parity (TaskCheckForProofs.ts:139-151): a stored raw_tx that does NOT
+/// double-SHA256 to its claimed txid is local corruption — a positive,
+/// deterministic invalid signal. Returns None when raw_tx is absent (no
+/// evidence — never a fail license).
+pub(crate) fn raw_tx_matches_txid(raw_tx_hex: &Option<String>, txid: &str) -> Option<bool> {
+    let bytes = raw_tx_hex.as_ref().and_then(|h| {
+        if h.is_empty() {
+            None
+        } else {
+            hex::decode(h).ok()
+        }
+    })?;
+    let hash = bsv_sdk::sha256d(&bytes);
+    let reversed: Vec<u8> = hash.iter().rev().cloned().collect();
+    Some(hex::encode(reversed).eq_ignore_ascii_case(txid))
+}
+
+/// Parse (prev_txid_hex_display, prev_vout) outpoints from raw tx bytes.
+/// Coinbase inputs are skipped. Returns empty on any parse trouble — the
+/// caller treats "no evidence" as Hold, never as license to fail.
+pub(crate) fn parse_input_outpoints(raw_tx: &[u8]) -> Vec<(String, u32)> {
+    let mut result = Vec::new();
+    if raw_tx.len() < 5 {
+        return result;
+    }
+    let mut pos = 4; // version
+    let (vin_count, new_pos) = match read_varint_at(raw_tx, pos) {
+        Some(v) => v,
+        None => return result,
+    };
+    pos = new_pos;
+    for _ in 0..vin_count {
+        if pos + 36 > raw_tx.len() {
+            return Vec::new(); // truncated — no partial evidence
+        }
+        let mut txid_bytes = [0u8; 32];
+        txid_bytes.copy_from_slice(&raw_tx[pos..pos + 32]);
+        txid_bytes.reverse();
+        let txid_hex = hex::encode(txid_bytes);
+        pos += 32;
+        let vout = u32::from_le_bytes([
+            raw_tx[pos],
+            raw_tx[pos + 1],
+            raw_tx[pos + 2],
+            raw_tx[pos + 3],
+        ]);
+        pos += 4;
+        let (script_len, new_pos) = match read_varint_at(raw_tx, pos) {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+        pos = new_pos + script_len as usize;
+        pos += 4; // sequence
+        if txid_hex != "0000000000000000000000000000000000000000000000000000000000000000" {
+            result.push((txid_hex, vout));
+        }
+    }
+    result
+}
+
+/// Read a Bitcoin varint at `pos`. Returns (value, new_pos) or None.
+fn read_varint_at(data: &[u8], pos: usize) -> Option<(u64, usize)> {
+    if pos >= data.len() {
+        return None;
+    }
+    match data[pos] {
+        0xFD => {
+            if pos + 3 > data.len() {
+                return None;
+            }
+            Some((
+                u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as u64,
+                pos + 3,
+            ))
+        }
+        0xFE => {
+            if pos + 5 > data.len() {
+                return None;
+            }
+            Some((
+                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                    as u64,
+                pos + 5,
+            ))
+        }
+        0xFF => {
+            if pos + 9 > data.len() {
+                return None;
+            }
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&data[pos + 1..pos + 9]);
+            Some((u64::from_le_bytes(b), pos + 9))
+        }
+        n => Some((n as u64, pos + 1)),
+    }
 }
 
 /// Store a proof from the ProofService: insert proven_tx, update proven_tx_req and transactions.
@@ -733,32 +1599,21 @@ async fn store_proof_result(
     Ok(())
 }
 
-/// Increment attempt counter; mark invalid if over threshold.
+/// Advance the block-clocked attempt counter. PURE COUNTER: attempts feed
+/// the UNKNOWN escalation trigger and the 144-block operator alert; they can
+/// NEVER set 'invalid' (the old `> MAX_PROOF_ATTEMPTS → invalid` branch here
+/// was one of the two false-FAIL predicates — deleted, not tuned).
 async fn increment_attempts(db: &D1Database, req_id: i64, current_attempts: i64) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-
-    if current_attempts + 1 > MAX_PROOF_ATTEMPTS {
-        Query::new(
-            "UPDATE proven_tx_reqs SET status = 'invalid', attempts = ?, updated_at = ? WHERE proven_tx_req_id = ?",
-        )
-        .bind(current_attempts + 1)
-        .bind(now.as_str())
-        .bind(req_id)
-        .execute(db)
-        .await
-        .map_err(|e| Error::from(e.to_string()))?;
-    } else {
-        Query::new(
-            "UPDATE proven_tx_reqs SET attempts = ?, updated_at = ? WHERE proven_tx_req_id = ?",
-        )
-        .bind(current_attempts + 1)
-        .bind(now.as_str())
-        .bind(req_id)
-        .execute(db)
-        .await
-        .map_err(|e| Error::from(e.to_string()))?;
-    }
-
+    Query::new(
+        "UPDATE proven_tx_reqs SET attempts = ?, updated_at = ? WHERE proven_tx_req_id = ?",
+    )
+    .bind(current_attempts + 1)
+    .bind(now.as_str())
+    .bind(req_id)
+    .execute(db)
+    .await
+    .map_err(|e| Error::from(e.to_string()))?;
     Ok(())
 }
 
@@ -767,11 +1622,21 @@ async fn increment_attempts(db: &D1Database, req_id: i64, current_attempts: i64)
 // =============================================================================
 
 async fn fail_abandoned(db: &D1Database) -> Result<u32> {
+    // Abandonment may only ever touch DRAFTS — transactions that were never
+    // handed to the network (reference TaskFailAbandoned.ts:37-46 restricts
+    // to unsigned/unprocessed). Two hardenings vs the old query (audit M2):
+    //  * 30-minute window (deployed TS wallet-infra pins abandonedMsecs to
+    //    30 min — index.ts:122; 5 min raced a single ARC flap on a 5-min cron);
+    //  * NOT EXISTS live-req guard: a tx whose proven_tx_req is queued,
+    //    in-flight, or completed has been (or will be) broadcast — timing it
+    //    out would release inputs a pending broadcast can still consume.
     let rows: Vec<AbandonedTxRow> = Query::new(
-        "SELECT transaction_id, txid, status FROM transactions \
+        "SELECT transaction_id, txid, status FROM transactions t \
          WHERE status IN ('unsigned', 'unprocessed') \
-         AND updated_at < datetime('now', '-30 minutes') \
-         AND is_outgoing = 1",
+         AND datetime(updated_at) < datetime('now', '-30 minutes') \
+         AND is_outgoing = 1 \
+         AND NOT EXISTS (SELECT 1 FROM proven_tx_reqs r WHERE r.txid = t.txid \
+             AND r.status IN ('unsent', 'sending', 'unmined', 'unknown', 'unconfirmed', 'callback', 'completed'))",
     )
     .fetch_all(db)
     .await
@@ -795,10 +1660,29 @@ async fn fail_abandoned(db: &D1Database) -> Result<u32> {
             )
             .map_err(|e| Error::from(e.to_string()))?;
 
-        // Release locked UTXOs that were reserved for this transaction
+        // Release the tx-lock (spendable/spent_by) on UTXOs this abandoned
+        // transaction had locked via createAction.
+        //
+        // G4 — interaction with reserveOutputs reservations: this statement
+        // deliberately does NOT touch `outputs.reserved_until`. Reservations
+        // placed via the reserveOutputs RPC are a SEPARATE lock layer:
+        //   * an output that is merely reserved (spent_by IS NULL) can never
+        //     match this WHERE clause, so fail_abandoned cannot release it;
+        //   * an output that was reserved AND THEN locked by a createAction
+        //     that is now abandoned gets its tx-lock released here, but its
+        //     reservation survives — it stays invisible to auto-selection and
+        //     to competing reserveOutputs calls until `reserved_until` passes
+        //     or the owner calls unreserveOutputs.
+        // Reservation EXPIRY (or explicit unreserveOutputs by the owner) is
+        // the ONLY release path for reservations. Never add
+        // `reserved_until = NULL` to this statement.
+        //
+        // G5 — `basket_id IS NOT NULL`: an output relinquished while tx-locked
+        // (basket NULL + spendable 0 — it was spent externally on-chain) must
+        // NOT be resurrected to spendable=1 when the locking tx is failed here.
         batch
             .add(
-                "UPDATE outputs SET spendable = 1, spent_by = NULL, updated_at = ? WHERE spent_by = ?",
+                "UPDATE outputs SET spendable = 1, spent_by = NULL, updated_at = ? WHERE spent_by = ? AND basket_id IS NOT NULL",
                 vec![QVal::Text(now.clone()), QVal::Int(tx_id)],
             )
             .map_err(|e| Error::from(e.to_string()))?;
@@ -906,12 +1790,16 @@ pub async fn review_status(db: &D1Database) -> Result<u32> {
         );
     }
 
-    // Sync invalid proofs → failed transactions + release locked UTXOs
+    // Sync terminal-fail reqs → failed transactions + release locked UTXOs.
+    // Includes 'doubleSpend' (review P6: a doubleSpend req whose tx row
+    // missed its 'failed' write in a partial batch was invisible to both
+    // this sweep and the canary; Go reviewKnownTxStatuses covers both
+    // terminal statuses).
     let invalid_rows: Vec<MismatchRow> = Query::new(
         "SELECT t.transaction_id, t.txid \
          FROM proven_tx_reqs ptr \
          JOIN transactions t ON t.txid = ptr.txid \
-         WHERE ptr.status = 'invalid' \
+         WHERE ptr.status IN ('invalid', 'doubleSpend') \
          AND t.status IN ('sending', 'unproven')",
     )
     .fetch_all(db)
@@ -933,10 +1821,27 @@ pub async fn review_status(db: &D1Database) -> Result<u32> {
             )
             .map_err(|e| Error::from(e.to_string()))?;
 
-        // Release locked UTXOs that were reserved for this failed transaction
+        // Release locked inputs — with the same guards as every other fail
+        // path (review L3: this arm predated the M1 books fix): G5
+        // basket_id guard against resurrecting relinquished rows, plus
+        // de-recognition of the failed tx's own created outputs.
         batch
             .add(
-                "UPDATE outputs SET spendable = 1, spent_by = NULL, updated_at = ? WHERE spent_by = ?",
+                // Parent-failed guard (ts-stack 2.4.0 reviewStatus parity):
+                // never resurrect an output whose CREATING tx is itself
+                // failed — a chained failure (failed B spent failed A's
+                // output) otherwise leaves A's phantom spendable=1 forever,
+                // and the G5 sweep can't catch it (never on-chain, no
+                // external spender).
+                "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? \
+                 WHERE spent_by = ? AND basket_id IS NOT NULL \
+                   AND transaction_id NOT IN (SELECT transaction_id FROM transactions WHERE status = 'failed')",
+                vec![QVal::Text(now.clone()), QVal::Int(tx_id)],
+            )
+            .map_err(|e| Error::from(e.to_string()))?;
+        batch
+            .add(
+                "UPDATE outputs SET spendable = 0, updated_at = ? WHERE transaction_id = ?",
                 vec![QVal::Text(now.clone()), QVal::Int(tx_id)],
             )
             .map_err(|e| Error::from(e.to_string()))?;
@@ -1197,7 +2102,7 @@ async fn unfail_transactions<P: ProofService>(
             Ok(Some(proof_result)) => {
                 // Proof found — tx IS mined on-chain. Store proof and restore everything.
                 if let Err(e) =
-                    store_unfail_proof(db, blobs, &txid, req_id, &row.raw_tx, &proof_result).await
+                    store_unfail_proof(db, blobs, proof_service, &txid, req_id, &row.raw_tx, &proof_result).await
                 {
                     console_error!("unfail store_proof({}) failed: {}", txid, e);
                     if errors.len() < 3 {
@@ -1209,17 +2114,53 @@ async fn unfail_transactions<P: ProofService>(
                 }
             }
             Ok(None) => {
-                // No proof — tx NOT mined. Mark req as invalid, don't touch tx/outputs.
+                // No proof yet. Reference (TaskUnFail.ts:78-81) returns the
+                // req to 'invalid' — but ONLY treat that as sound when the
+                // network genuinely doesn't know the tx. A SEEN/mined-but-
+                // unproven tx goes back to 'unmined' so the proof loop keeps
+                // watching it (proof lag must never re-fail it).
                 let now = Utc::now().to_rfc3339();
-                let _ = Query::new(
-                    "UPDATE proven_tx_reqs SET status = 'invalid', updated_at = ? WHERE proven_tx_req_id = ?",
-                )
-                .bind(now.as_str())
-                .bind(req_id)
-                .execute(db)
-                .await;
-
-                console_log!("Unfail invalid (no proof): txid={}", txid);
+                let net_status = proof_service
+                    .get_status_for_txids(&[txid.clone()])
+                    .await
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+                    .map(|s| s.status)
+                    .unwrap_or_else(|| "unavailable".to_string());
+                if net_status == "known" || net_status == "mined" {
+                    let _ = Query::new(
+                        "UPDATE proven_tx_reqs SET status = 'unmined', attempts = 0, updated_at = ? WHERE proven_tx_req_id = ?",
+                    )
+                    .bind(now.as_str())
+                    .bind(req_id)
+                    .execute(db)
+                    .await;
+                    console_log!(
+                        "Unfail: txid={} is {} on network but unproven — demoted to unmined (never invalid)",
+                        txid,
+                        net_status
+                    );
+                } else if net_status == "unknown" {
+                    // Positive network-absence evidence: back to 'invalid'
+                    // (reference TaskUnFail.ts:78-81) — the canary keeps it
+                    // watched regardless.
+                    let _ = Query::new(
+                        "UPDATE proven_tx_reqs SET status = 'invalid', updated_at = ? WHERE proven_tx_req_id = ?",
+                    )
+                    .bind(now.as_str())
+                    .bind(req_id)
+                    .execute(db)
+                    .await;
+                    console_log!("Unfail invalid (network-unknown): txid={}", txid);
+                } else {
+                    // No evidence at all (status provider down): HOLD at
+                    // 'unfail' for the next pass — no evidence, no state
+                    // change (our invariant; stricter than TS here).
+                    console_log!(
+                        "Unfail: no status evidence for txid={} — holding at 'unfail'",
+                        txid
+                    );
+                }
             }
             Err(e) => {
                 console_error!("unfail get_proof({}) failed: {}", txid, e);
@@ -1234,7 +2175,202 @@ async fn unfail_transactions<P: ProofService>(
         }
     }
 
+    // AUTO-UNFAIL + FALSE-FAIL CANARY (the 88f71e4b/0efb3dfb incident class,
+    // bsv-blackjack §16i; HANDOFF-MONITOR-FALSE-FAIL.md production canary):
+    // every failed transaction with an 'invalid'/'doubleSpend' req is
+    // periodically re-verified against the chain, UNBOUNDED — a tx the
+    // network still reports known/mined must never stop being re-checked
+    // (the old `attempts < 60` cap made a >47h provider outage turn a
+    // false-fail permanent; dropped). Hourly backoff via updated_at re-stamp.
+    //
+    // Canary invariant: `failed` means never-on-chain. Any failed tx the
+    // chain KNOWS is a false-fail → recovered automatically (proof →
+    // store_unfail_proof; SEEN-only → promote back to unmined/unproven) and
+    // recorded in monitor_events('false_fail_canary') for alerting.
+    // Eligibility notes:
+    //  * datetime(r.updated_at) — the column holds RFC3339 'T' stamps which
+    //    compare wrong against SQLite's space-format datetime() output
+    //    (critic finding: the raw compare silently turned the 1h backoff
+    //    into rest-of-day);
+    //  * LEFT JOIN + the OR arm — a 'doubleSpend' req whose transactions row
+    //    missed its 'failed' write (partial batch) must still be re-checked
+    //    (TS TaskReviewDoubleSpends parity);
+    //  * backoff: hourly for the first 24 checks, daily after (attempts
+    //    counts canary re-stamps) — keeps eternally-dead rows from burning
+    //    WoC budget forever while never abandoning them.
+    let retry_rows: Vec<UnfailRow> = Query::new(
+        "SELECT DISTINCT r.proven_tx_req_id, r.txid, hex(r.raw_tx) as raw_tx \
+         FROM proven_tx_reqs r \
+         LEFT JOIN transactions t ON t.txid = r.txid \
+         WHERE r.status IN ('invalid', 'doubleSpend') \
+           AND (t.status = 'failed' OR r.status = 'doubleSpend') \
+           AND datetime(r.updated_at) < datetime('now', '-1 hour') \
+           AND (r.attempts < 24 OR datetime(r.updated_at) < datetime('now', '-1 day')) \
+         ORDER BY r.updated_at ASC \
+         LIMIT 20",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| Error::from(e.to_string()))?;
+
+    let mut canary_hits: Vec<String> = Vec::new();
+
+    for row in &retry_rows {
+        let txid = match &row.txid {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => continue,
+        };
+        let req_id = row.proven_tx_req_id.unwrap_or(0.0) as i64;
+        if req_id == 0 {
+            continue;
+        }
+        match proof_service.get_proof(&txid).await {
+            Ok(Some(proof_result)) => {
+                if let Err(e) =
+                    store_unfail_proof(db, blobs, proof_service, &txid, req_id, &row.raw_tx, &proof_result).await
+                {
+                    console_error!("auto-unfail store_proof({}) failed: {}", txid, e);
+                    if errors.len() < 3 {
+                        errors.push(format!("auto-unfail({}):{}", &txid[..txid.len().min(8)], e));
+                    }
+                } else {
+                    recovered += 1;
+                    canary_hits.push(txid.clone());
+                    console_error!(
+                        "CANARY: false-failed tx WAS MINED — recovered txid={}",
+                        txid
+                    );
+                }
+            }
+            Ok(None) => {
+                // No proof. Chain-truth check before re-stamping: a tx the
+                // network reports known/mined is a live false-fail — promote
+                // it back into the proof pipeline instead of leaving the
+                // books lying until a proof shows up.
+                let now = Utc::now().to_rfc3339();
+                let net_status = proof_service
+                    .get_status_for_txids(&[txid.clone()])
+                    .await
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+                    .map(|s| s.status)
+                    .unwrap_or_else(|| "unavailable".to_string());
+                if net_status == "known" || net_status == "mined" {
+                    let mut batch = BatchCollector::new(db);
+                    let _ = batch.add(
+                        "UPDATE proven_tx_reqs SET status = 'unmined', attempts = 0, updated_at = ? WHERE proven_tx_req_id = ?",
+                        vec![QVal::Text(now.clone()), QVal::Int(req_id)],
+                    );
+                    let _ = batch.add(
+                        "UPDATE transactions SET status = 'unproven', updated_at = ? WHERE txid = ? AND status = 'failed'",
+                        vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
+                    );
+                    // Re-enable our own created outputs (change/derivation) —
+                    // the tx is network-final (SEEN = final on BSV).
+                    let _ = batch.add(
+                        "UPDATE outputs SET spendable = 1, updated_at = ? WHERE txid = ? AND spendable = 0 AND spent_by IS NULL AND (change = 1 OR custom_instructions IS NOT NULL)",
+                        vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
+                    );
+                    // Re-mark the tx's consumed inputs as spent (they were
+                    // released when the tx was failed) — TaskUnFail.ts:118-129.
+                    let _ = batch.execute().await;
+                    remark_inputs_spent(db, &txid, &row.raw_tx, &now).await;
+                    recovered += 1;
+                    canary_hits.push(txid.clone());
+                    console_error!(
+                        "CANARY: false-failed tx is {} on network — promoted back to unmined/unproven txid={}",
+                        net_status,
+                        txid
+                    );
+                } else {
+                    // Chain doesn't know it — factually failed (so far).
+                    // Re-stamp for the hourly backoff; stays invalid, stays
+                    // watched, forever.
+                    let _ = Query::new(
+                        "UPDATE proven_tx_reqs SET attempts = attempts + 1, updated_at = ? WHERE proven_tx_req_id = ?",
+                    )
+                    .bind(now.as_str())
+                    .bind(req_id)
+                    .execute(db)
+                    .await;
+                }
+            }
+            Err(_) => {
+                // Provider error — re-stamp only; no evidence, no state change.
+                let now = Utc::now().to_rfc3339();
+                let _ = Query::new(
+                    "UPDATE proven_tx_reqs SET attempts = attempts + 1, updated_at = ? WHERE proven_tx_req_id = ?",
+                )
+                .bind(now.as_str())
+                .bind(req_id)
+                .execute(db)
+                .await;
+            }
+        }
+
+        // Pace the sweep — up to 20 back-to-back proof fetches tripped
+        // WoC's 3/sec free-tier throttle from CF egress IPs (critic).
+        worker::Delay::from(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Persist the canary verdict for alerting/forensics.
+    if !canary_hits.is_empty() {
+        let details = serde_json::json!({
+            "false_fails_recovered": canary_hits,
+        })
+        .to_string();
+        let _ = Query::new(
+            "INSERT INTO monitor_events (event, details, created_at, updated_at) \
+             VALUES ('false_fail_canary', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(details.as_str())
+        .execute(db)
+        .await;
+    }
+
     Ok((recovered, errors))
+}
+
+/// Re-mark a recovered (unfailed) transaction's consumed inputs as spent:
+/// outputs matching the tx's input outpoints get `spendable=0, spent_by=<tx>`.
+/// The fail path had released them; with the tx back in the books they are
+/// factually consumed (TS TaskUnFail.ts:118-129 parity; audit M4).
+async fn remark_inputs_spent(
+    db: &D1Database,
+    txid: &str,
+    raw_tx_hex: &Option<String>,
+    now: &str,
+) {
+    let outpoints = raw_tx_hex
+        .as_ref()
+        .and_then(|h| hex::decode(h).ok())
+        .map(|b| parse_input_outpoints(&b))
+        .unwrap_or_default();
+    if outpoints.is_empty() {
+        return;
+    }
+    for (prev_txid, prev_vout) in outpoints {
+        // spendable=0 for EVERY row of the outpoint (chain truth — the
+        // outpoint is consumed), but spent_by only where it's NULL (never
+        // clobber an existing true link) and only with the SAME USER's
+        // transaction row (review H3: transactions.txid is not unique
+        // across users; a scalar subquery stamped foreign tenants' rows
+        // with an arbitrary user's transaction_id).
+        let _ = Query::new(
+            "UPDATE outputs SET spendable = 0, \
+                 spent_by = COALESCE(spent_by, \
+                     (SELECT t.transaction_id FROM transactions t \
+                      WHERE t.txid = ? AND t.user_id = outputs.user_id)), \
+                 updated_at = ? \
+             WHERE txid = ? AND vout = ?",
+        )
+        .bind(txid)
+        .bind(now)
+        .bind(prev_txid.as_str())
+        .bind(prev_vout as i64)
+        .execute(db)
+        .await;
+    }
 }
 
 /// Store a proof for an unfailed transaction: insert proven_tx, update proven_tx_req
@@ -1242,9 +2378,10 @@ async fn unfail_transactions<P: ProofService>(
 ///
 /// Similar to `store_proof_result` but specific to the unfail flow — the transaction
 /// was previously 'failed', so we restore it to 'completed' and re-enable outputs.
-async fn store_unfail_proof(
+async fn store_unfail_proof<P: ProofService>(
     db: &D1Database,
     blobs: &worker::Bucket,
+    proof_service: &P,
     txid: &str,
     req_id: i64,
     raw_tx_hex: &Option<String>,
@@ -1329,7 +2466,7 @@ async fn store_unfail_proof(
     batch
         .add(
             "UPDATE outputs SET spendable = 1, updated_at = ? WHERE txid = ? AND spendable = 0 AND spent_by IS NULL AND (change = 1 OR custom_instructions IS NOT NULL)",
-            vec![QVal::Text(now), QVal::Text(txid.to_string())],
+            vec![QVal::Text(now.clone()), QVal::Text(txid.to_string())],
         )
         .map_err(|e| Error::from(e.to_string()))?;
 
@@ -1337,6 +2474,55 @@ async fn store_unfail_proof(
         .execute()
         .await
         .map_err(|e| Error::from(e.to_string()))?;
+
+    // The fail path released this tx's inputs (spendable=1, spent_by=NULL);
+    // with the tx proven mined they are factually consumed — re-mark them
+    // (TS TaskUnFail.ts:118-129; audit M4). Without this, both the consumed
+    // inputs AND the change output count as spendable → inflated balance and
+    // guaranteed doubleSpend failures when the selector picks dead inputs.
+    remark_inputs_spent(db, txid, raw_tx_hex, &now).await;
+
+    // isUtxo re-check (TS TaskUnFail.ts:131-145 parity): outputs of a tx
+    // that sat 'failed' may have been spent EXTERNALLY in the interim —
+    // verify actual chain state before leaving them spendable (the G5 sweep
+    // would catch it eventually; this closes the phantom-balance window on
+    // this rare path immediately).
+    #[derive(Deserialize)]
+    struct VoutRow {
+        vout: Option<f64>,
+    }
+    let vouts: Vec<VoutRow> = Query::new(
+        "SELECT vout FROM outputs WHERE txid = ? AND spendable = 1 AND spent_by IS NULL \
+           AND (change = 1 OR custom_instructions IS NOT NULL)",
+    )
+    .bind(txid)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for v in vouts {
+        let vout = v.vout.unwrap_or(-1.0) as i64;
+        if vout < 0 {
+            continue;
+        }
+        if let Ok(SpentStatus::Spent { spending_txid }) =
+            proof_service.get_spent_status(txid, vout as u32).await
+        {
+            console_log!(
+                "unfail isUtxo: {}:{} already consumed on-chain by {} — marking spent",
+                &txid[..8.min(txid.len())],
+                vout,
+                &spending_txid[..8.min(spending_txid.len())]
+            );
+            let _ = Query::new(
+                "UPDATE outputs SET spendable = 0, updated_at = ? WHERE txid = ? AND vout = ? AND spent_by IS NULL",
+            )
+            .bind(now.as_str())
+            .bind(txid)
+            .bind(vout)
+            .execute(db)
+            .await;
+        }
+    }
 
     console_log!(
         "Unfail proof stored for txid={} at height={}",
@@ -1394,7 +2580,7 @@ async fn check_no_sends<P: ProofService>(
             Ok(Some(proof_result)) => {
                 // Proof found — tx WAS mined externally. Store proof and complete everything.
                 if let Err(e) =
-                    store_unfail_proof(db, blobs, &txid, req_id, &row.raw_tx, &proof_result).await
+                    store_unfail_proof(db, blobs, proof_service, &txid, req_id, &row.raw_tx, &proof_result).await
                 {
                     console_error!("nosend store_proof({}) failed: {}", txid, e);
                     if errors.len() < 3 {
@@ -1451,7 +2637,7 @@ pub async fn purge_data(
             "DELETE FROM proven_tx_reqs \
              WHERE status = 'completed' \
              AND proven_tx_id IS NOT NULL \
-             AND updated_at < datetime('now', ?)",
+             AND datetime(updated_at) < datetime('now', ?)",
         )
         .bind(age_modifier.as_str())
         .execute(db)
@@ -1471,7 +2657,7 @@ pub async fn purge_data(
              SET raw_tx = NULL, input_beef = NULL, updated_at = ? \
              WHERE status = 'completed' \
              AND proven_tx_id IS NOT NULL \
-             AND updated_at < datetime('now', ?) \
+             AND datetime(updated_at) < datetime('now', ?) \
              AND (raw_tx IS NOT NULL OR input_beef IS NOT NULL)",
         )
         .bind(now.as_str())
@@ -1492,7 +2678,7 @@ pub async fn purge_data(
         let meta = Query::new(
             "DELETE FROM proven_tx_reqs \
              WHERE status IN ('invalid', 'doubleSpend') \
-             AND updated_at < datetime('now', ?)",
+             AND datetime(updated_at) < datetime('now', ?)",
         )
         .bind(age_modifier.as_str())
         .execute(db)
@@ -1866,27 +3052,29 @@ async fn handle_reorg<P: ProofService>(
                     vec![QVal::Text(now.clone()), QVal::Int(proven_tx_id)],
                 );
 
-                // Demote proven_tx_req back to 'unmined' so check_for_proofs re-fetches
+                // Demote proven_tx_req back to 'unmined' with a fresh attempt
+                // clock so check_for_proofs re-fetches (Go reference: reorg
+                // sets req status + attempts=0 and touches NOTHING else —
+                // known_tx.go:685-695).
                 let _ = batch.add(
                     "UPDATE proven_tx_reqs SET status = 'unmined', proven_tx_id = NULL, \
-                     updated_at = ? WHERE proven_tx_id = ?",
+                     attempts = 0, updated_at = ? WHERE proven_tx_id = ?",
                     vec![QVal::Text(now.clone()), QVal::Int(proven_tx_id)],
                 );
 
-                // Demote transaction to 'unproven'
-                let _ = batch.add(
-                    "UPDATE transactions SET status = 'unproven', proven_tx_id = NULL, \
-                     updated_at = ? WHERE proven_tx_id = ?",
-                    vec![QVal::Text(now.clone()), QVal::Int(proven_tx_id)],
-                );
-
-                // Mark outputs as non-spendable (tx no longer confirmed)
-                let _ = batch.add(
-                    "UPDATE outputs SET spendable = 0, updated_at = ? \
-                     WHERE txid = ? AND spendable = 1",
-                    vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
-                );
-
+                // Deliberately NOT touched (audit M3 — the old code demoted
+                // the transaction to 'unproven' AND clamped its outputs to
+                // spendable=0 here):
+                //  * transactions.status — a missing proof mid-reorg is
+                //    exactly when providers lag; the tx is still SEEN and,
+                //    per the owner rule, final. Neither reference demotes
+                //    the tx on a proof-fetch miss (TS TaskReorg re-proves
+                //    with retries; Go resets the req only).
+                //  * outputs.spendable — clamping on a guess understated the
+                //    balance, and basket-insertion outputs (change=0, no
+                //    custom_instructions) could NEVER recover because the
+                //    re-enable filter on re-proof only matches change/
+                //    derivation outputs — permanent stranding.
                 let _ = batch.execute().await;
                 reverified += 1;
             }
@@ -1980,6 +3168,207 @@ struct LastProofRow {
 }
 
 /// Returns aggregate monitor status for the dashboard (no auth needed).
+// =============================================================================
+// Task 10 (G5): Scan tracked outpoints for external (out-of-wallet) spends
+// =============================================================================
+
+/// Detect tracked outputs spent ON-CHAIN outside wallet-infra and mark them
+/// `spendable = 0` (G5 completion — the service-side safety net behind
+/// client-driven `relinquishOutput`, see the design note in
+/// `storage/relinquish_output.rs`).
+///
+/// Owner rule (non-negotiable): on BSV a tx SEEN_ON_NETWORK is FINAL
+/// (first-seen, no RBF). The scan marks an output as soon as a spending tx is
+/// SEEN — it never waits for mining. `unproven` means "awaiting merkle
+/// proof", never "reversible".
+///
+/// Mechanics per run:
+/// - Load the persistent cursor (`monitor_events` / 'external_spend_cursor').
+/// - If the previous sweep completed inside the cooldown window, park (0 API
+///   calls).
+/// - Page ≤ EXT_SPEND_BATCH candidates (`EXT_SPEND_CANDIDATES_SQL`), ask the
+///   ProofService for each outpoint's spent-status, and on `Spent` apply the
+///   double-guarded `EXT_SPEND_MARK_SQL` (never clobbers a row a live
+///   createAction locked meanwhile; never touches reserved_until/basket_id).
+/// - Service errors skip-and-advance (a poison outpoint can't stall the
+///   sweep; it is re-checked next sweep) and the run bails after
+///   EXT_SPEND_MAX_SERVICE_ERRORS so a WoC outage can't burn the cron.
+/// - Persist the cursor: advanced past all PROCESSED rows only, reset to 0
+///   with a completion timestamp when a short page ends the sweep.
+///
+/// Returns (scanned, spent_found, error_messages).
+async fn scan_external_spends<P: ProofService>(
+    db: &D1Database,
+    proof_service: &P,
+) -> Result<(u32, u32, Vec<String>)> {
+    let now = Utc::now();
+
+    // Load persistent cursor (row reuse: same {details} shape as chain_height).
+    let cursor_row: Option<ChainHeightRow> = Query::new(EXT_SPEND_CURSOR_READ_SQL)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| Error::from(e.to_string()))?;
+    let cursor = cursor_row
+        .and_then(|r| r.details)
+        .map(|d| parse_ext_spend_cursor(&d))
+        .unwrap_or_default();
+
+    if ext_spend_sweep_parked(&cursor, now) {
+        console_log!("scan_external_spends: scanned=0 spent_found=0 errors=0 (parked — sweep cooldown)");
+        return Ok((0, 0, Vec::new()));
+    }
+
+    let rows: Vec<ExtSpendCandidateRow> = Query::new(EXT_SPEND_CANDIDATES_SQL)
+        .bind(cursor.last_output_id)
+        .bind(EXT_SPEND_BATCH as i64)
+        .fetch_all(db)
+        .await
+        .map_err(|e| Error::from(e.to_string()))?;
+
+    let fetched = rows.len();
+    let now_str = now.to_rfc3339();
+    let mut scanned = 0u32;
+    let mut found = 0u32;
+    let mut errors = 0u32;
+    let mut error_msgs: Vec<String> = Vec::new();
+    let mut last_processed = cursor.last_output_id;
+    let mut unsupported = false;
+
+    for row in &rows {
+        let output_id = row.output_id.unwrap_or(0.0) as i64;
+        if output_id == 0 {
+            continue;
+        }
+        let txid = match &row.txid {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => {
+                // Defensive — the SQL already excludes these.
+                last_processed = output_id;
+                continue;
+            }
+        };
+        let vout = row.vout.unwrap_or(0.0) as u32;
+
+        match proof_service.get_spent_status(&txid, vout).await {
+            Ok(SpentStatus::Spent { spending_txid }) => {
+                scanned += 1;
+                last_processed = output_id;
+                let meta = Query::new(EXT_SPEND_MARK_SQL)
+                    .bind(now_str.as_str())
+                    .bind(output_id)
+                    .execute(db)
+                    .await
+                    .map_err(|e| Error::from(e.to_string()))?;
+                if meta.changes > 0 {
+                    found += 1;
+                    console_log!(
+                        "scan_external_spends: output {} ({}.{}) spent externally by {} — marked spendable=0",
+                        output_id,
+                        &txid[..txid.len().min(16)],
+                        vout,
+                        &spending_txid[..spending_txid.len().min(16)]
+                    );
+                } else {
+                    // Row changed between SELECT and UPDATE (createAction lock
+                    // or relinquish) — guard held, hands off, next sweep re-checks.
+                    console_log!(
+                        "scan_external_spends: output {} changed under us — guard held, left alone",
+                        output_id
+                    );
+                }
+            }
+            Ok(SpentStatus::Unspent) => {
+                scanned += 1;
+                last_processed = output_id;
+            }
+            Ok(SpentStatus::Unsupported) => {
+                // Provider has no outpoint index: leave the cursor untouched so
+                // nothing is skipped once a capable provider is wired back in.
+                unsupported = true;
+                break;
+            }
+            Err(e) => {
+                errors += 1;
+                // Skip-and-advance: re-checked on the next full sweep.
+                last_processed = output_id;
+                if error_msgs.len() < 5 {
+                    error_msgs.push(format!(
+                        "ext_spend({}.{}): {}",
+                        &txid[..txid.len().min(8)],
+                        vout,
+                        e
+                    ));
+                }
+                if errors >= EXT_SPEND_MAX_SERVICE_ERRORS {
+                    console_error!(
+                        "scan_external_spends: {} service errors — bailing out of this run",
+                        errors
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    if unsupported {
+        console_log!(
+            "scan_external_spends: scanned={} spent_found={} errors={} (provider lacks spent-status support — cursor untouched)",
+            scanned, found, errors
+        );
+        return Ok((scanned, found, error_msgs));
+    }
+
+    let bailed = errors >= EXT_SPEND_MAX_SERVICE_ERRORS;
+    let new_cursor = if !bailed && fetched < EXT_SPEND_BATCH {
+        // Short page = end of the candidate set: sweep complete, park.
+        ExtSpendCursor {
+            last_output_id: 0,
+            sweep_completed_at: Some(now_str.clone()),
+        }
+    } else {
+        ExtSpendCursor {
+            last_output_id: last_processed,
+            sweep_completed_at: cursor.sweep_completed_at.clone(),
+        }
+    };
+    persist_ext_spend_cursor(db, &new_cursor).await?;
+
+    console_log!(
+        "scan_external_spends: scanned={} spent_found={} errors={} cursor {}→{}{}",
+        scanned,
+        found,
+        errors,
+        cursor.last_output_id,
+        new_cursor.last_output_id,
+        if new_cursor.last_output_id == 0 {
+            " (sweep complete)"
+        } else {
+            ""
+        }
+    );
+
+    Ok((scanned, found, error_msgs))
+}
+
+/// Persist the scan cursor: UPDATE the existing 'external_spend_cursor' row,
+/// INSERT only if none exists yet (single row in steady state).
+async fn persist_ext_spend_cursor(db: &D1Database, cursor: &ExtSpendCursor) -> Result<()> {
+    let details = ext_spend_cursor_json(cursor);
+    let meta = Query::new(EXT_SPEND_CURSOR_UPDATE_SQL)
+        .bind(details.as_str())
+        .execute(db)
+        .await
+        .map_err(|e| Error::from(e.to_string()))?;
+    if meta.changes == 0 {
+        Query::new(EXT_SPEND_CURSOR_INSERT_SQL)
+            .bind(details.as_str())
+            .execute(db)
+            .await
+            .map_err(|e| Error::from(e.to_string()))?;
+    }
+    Ok(())
+}
+
 pub async fn get_status(db: &D1Database) -> serde_json::Value {
     // Unproven count + oldest age
     let unproven = Query::new(
@@ -2026,6 +3415,8 @@ async fn log_monitor_event(db: &D1Database, result: &MonitorResult) -> Result<()
         "reorg_detected": result.reorg_detected,
         "reorg_depth": result.reorg_depth,
         "proofs_reverified": result.proofs_reverified,
+        "ext_spends_scanned": result.ext_spends_scanned,
+        "ext_spends_found": result.ext_spends_found,
         "errors": result.errors,
     })
     .to_string();
@@ -2575,6 +3966,301 @@ mod tests {
     }
 
     // =========================================================================
+    // Proof-lifecycle decision core — THE false-FAIL invariant
+    // (HANDOFF-MONITOR-FALSE-FAIL.md proof plan, cases 1-6)
+    //
+    // Reference cites: TS wallet-toolbox TaskCheckForProofs.ts:50,193,229
+    // (countsAsAttempt = new-header event), Monitor.ts:106 (144-block limit);
+    // Go go-wallet-toolbox synchronize_tx_statuses.go (lastBlockKey gate,
+    // depth filter), known_tx.go proofTimeoutUpdates (timeout → rebroadcast).
+    // =========================================================================
+
+    /// Proof-plan case 1 (the live bug, mainnet-lag sim): proof provider lags
+    /// mining — triage says Known (SEEN) while get_proof keeps returning None,
+    /// for 1000 monitor cycles with NO new block. The req must NEVER reach
+    /// invalid, and the block-clocked attempt counter must not advance.
+    #[test]
+    fn test_seen_tx_never_fails_during_provider_lag() {
+        let tip = Some(950_000u32);
+        let mut attempts: i64 = 0;
+        let mut last_counted_tip: Option<u32> = tip; // counted once at broadcast height
+        for _cycle in 0..1000 {
+            let counts = attempt_counts_now(tip, last_counted_tip);
+            // Tip never advanced → no cycle may count as an attempt.
+            assert!(
+                !counts,
+                "attempt counted with a constant chain tip (wall-clocked, not block-clocked)"
+            );
+            let action = decide_req_action(&TriageStatus::Known, attempts, counts, true);
+            assert_ne!(
+                action,
+                ReqAction::MarkInvalid,
+                "SEEN-on-network tx marked invalid after {} cycles — the false-FAIL bug",
+                attempts
+            );
+            if let ReqAction::Wait { count_attempt } = action {
+                if count_attempt {
+                    attempts += 1;
+                    last_counted_tip = tip;
+                }
+            }
+        }
+        assert_eq!(attempts, 0, "attempts advanced without chain progress");
+    }
+
+    /// Case 1b: even WITH chain progress (tip advances 1000 blocks), a tx the
+    /// network reports as Known/SEEN must never fail — SEEN is final on BSV.
+    /// (Old code failed it at 12 attempts; TS would at 144; Go never does —
+    /// we follow the strictest-correct semantics: only positive signals fail.)
+    #[test]
+    fn test_seen_tx_never_fails_even_across_many_blocks() {
+        let mut attempts: i64 = 0;
+        for height in 950_000u32..951_000 {
+            let counts = attempt_counts_now(Some(height + 1), Some(height));
+            assert!(counts, "tip advanced — attempt should count");
+            let action = decide_req_action(&TriageStatus::Known, attempts, counts, true);
+            assert_ne!(action, ReqAction::MarkInvalid);
+            assert_ne!(
+                std::mem::discriminant(&action),
+                std::mem::discriminant(&ReqAction::Escalate {
+                    count_attempt: false
+                }),
+                "Known tx must not escalate to double-spend hunting"
+            );
+            if let ReqAction::Wait { count_attempt: true } = action {
+                attempts += 1;
+            }
+        }
+    }
+
+    /// Case 2: network-unknown + an input spent by a DIFFERENT tx ⇒ confirmed
+    /// double-spend (the ONLY non-ARC fail path).
+    #[test]
+    fn test_unknown_with_conflicting_input_spend_is_double_spend() {
+        let spends = vec![(
+            "aa".repeat(32),
+            0u32,
+            SpentStatus::Spent {
+                spending_txid: "bb".repeat(32),
+            },
+        )];
+        let v = decide_escalation(&TriageStatus::Unknown, &spends, &"cc".repeat(32), false);
+        assert_eq!(
+            v,
+            EscalationVerdict::ConfirmedDoubleSpend {
+                spending_txid: "bb".repeat(32)
+            }
+        );
+    }
+
+    /// Case 3: network-unknown + inputs all unspent ⇒ re-broadcast (ARC gets
+    /// to deliver the verdict), NOT fail.
+    #[test]
+    fn test_unknown_with_unspent_inputs_rebroadcasts_not_fails() {
+        let spends = vec![
+            ("aa".repeat(32), 0u32, SpentStatus::Unspent),
+            ("dd".repeat(32), 1u32, SpentStatus::Unspent),
+        ];
+        let v = decide_escalation(&TriageStatus::Unknown, &spends, &"cc".repeat(32), false);
+        assert_eq!(v, EscalationVerdict::Rebroadcast);
+    }
+
+    /// Case 3b: an input spent by OUR OWN txid means the network DOES know
+    /// our tx (triage drift) — hold, never double-spend ourselves.
+    #[test]
+    fn test_input_spent_by_our_own_tx_holds() {
+        let ours = "cc".repeat(32);
+        let spends = vec![(
+            "aa".repeat(32),
+            0u32,
+            SpentStatus::Spent {
+                spending_txid: ours.clone(),
+            },
+        )];
+        let v = decide_escalation(&TriageStatus::Unknown, &spends, &ours, false);
+        assert_eq!(v, EscalationVerdict::Hold);
+    }
+
+    /// Case 4: proof arrives late — triage flips to Mined after any number of
+    /// attempts ⇒ FetchProof (→ completed), attempts irrelevant.
+    #[test]
+    fn test_late_proof_completes_regardless_of_attempts() {
+        for attempts in [0i64, 12, 145, 10_000] {
+            let action = decide_req_action(&TriageStatus::Mined, attempts, true, true);
+            assert_eq!(action, ReqAction::FetchProof);
+        }
+    }
+
+    /// Case 5: incomplete evidence never fails — Unavailable triage at huge
+    /// attempt counts, spent-status service errors, unparseable inputs.
+    #[test]
+    fn test_no_evidence_never_fails() {
+        for attempts in [0i64, 11, 12, 13, 144, 145, 100_000] {
+            for counts in [false, true] {
+                let a = decide_req_action(&TriageStatus::Unavailable, attempts, counts, true);
+                assert_ne!(a, ReqAction::MarkInvalid);
+                // Unavailable = no evidence — must not even escalate.
+                assert!(matches!(a, ReqAction::Wait { .. }));
+            }
+        }
+        // Escalation with a service error and no positive DS hit: hold.
+        let spends = vec![("aa".repeat(32), 0u32, SpentStatus::Unspent)];
+        let v = decide_escalation(&TriageStatus::Unknown, &spends, &"cc".repeat(32), true);
+        assert_eq!(v, EscalationVerdict::Hold);
+        // Escalation whose recheck says the tx is no longer unknown: hold.
+        let v = decide_escalation(&TriageStatus::Known, &spends, &"cc".repeat(32), false);
+        assert_eq!(v, EscalationVerdict::Hold);
+        // Empty input evidence (parse failure): hold.
+        let v = decide_escalation(&TriageStatus::Unknown, &[], &"cc".repeat(32), false);
+        assert_eq!(v, EscalationVerdict::Hold);
+        // Unsupported spent-status is NOT license to fail — rebroadcast path
+        // still allowed (harmless, idempotent), never a fail verdict.
+        let spends = vec![("aa".repeat(32), 0u32, SpentStatus::Unsupported)];
+        let v = decide_escalation(&TriageStatus::Unknown, &spends, &"cc".repeat(32), false);
+        assert!(matches!(
+            v,
+            EscalationVerdict::Rebroadcast | EscalationVerdict::Hold
+        ));
+    }
+
+    /// The invariant, exhaustively: NO combination of non-Mined triage,
+    /// attempt count, clock state, and budget may yield MarkInvalid. `invalid`
+    /// is reachable ONLY from ARC rejects and confirmed double-spends.
+    #[test]
+    fn test_invariant_no_attempt_based_invalid_ever() {
+        let statuses = [
+            TriageStatus::Known,
+            TriageStatus::Unknown,
+            TriageStatus::Unavailable,
+        ];
+        for st in &statuses {
+            for attempts in 0..2000i64 {
+                for counts in [false, true] {
+                    for budget in [false, true] {
+                        let a = decide_req_action(st, attempts, counts, budget);
+                        assert_ne!(
+                            a,
+                            ReqAction::MarkInvalid,
+                            "attempt-based invalid: status={:?} attempts={}",
+                            st,
+                            attempts
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Block-clock gate semantics: counts only on tip advance; never counts
+    /// when the tip is unavailable (no evidence, no clock); first sighting
+    /// (nothing counted yet) counts.
+    #[test]
+    fn test_attempt_clock_is_block_clocked() {
+        assert!(!attempt_counts_now(None, None), "no tip → no attempt");
+        assert!(!attempt_counts_now(None, Some(100)), "no tip → no attempt");
+        assert!(attempt_counts_now(Some(100), None), "first observation counts");
+        assert!(!attempt_counts_now(Some(100), Some(100)), "same tip → no attempt");
+        assert!(attempt_counts_now(Some(101), Some(100)), "tip advanced → counts");
+        assert!(
+            !attempt_counts_now(Some(99), Some(100)),
+            "tip regression (reorg/provider flap) is not an attempt"
+        );
+    }
+
+    /// Escalation trigger: unknown reqs escalate only after the block-clocked
+    /// unknown streak reaches UNKNOWN_ESCALATION_ATTEMPTS, and only when the
+    /// per-run escalation budget allows.
+    #[test]
+    fn test_unknown_escalates_after_streak_with_budget() {
+        // Below streak: wait.
+        let a = decide_req_action(&TriageStatus::Unknown, 1, true, true);
+        assert!(matches!(a, ReqAction::Wait { .. }));
+        // At/above streak with budget: escalate.
+        let a = decide_req_action(&TriageStatus::Unknown, UNKNOWN_ESCALATION_ATTEMPTS, true, true);
+        assert!(matches!(a, ReqAction::Escalate { .. }));
+        // At/above streak, budget exhausted: wait (retry next run).
+        let a = decide_req_action(&TriageStatus::Unknown, UNKNOWN_ESCALATION_ATTEMPTS, true, false);
+        assert!(matches!(a, ReqAction::Wait { .. }));
+    }
+
+    // =========================================================================
+    // False-FAIL fix — wiring regression tests
+    // =========================================================================
+
+    /// The books mutation on a positive ARC fail verdict must RELEASE inputs
+    /// (spent_by → NULL) and DE-RECOGNIZE created outputs (spendable → 0).
+    /// The old code did the exact inverse (re-enabled phantoms, stranded
+    /// inputs) — audit finding M1.
+    #[test]
+    fn test_fail_books_release_inputs_not_created_outputs() {
+        assert!(FAIL_RELEASE_INPUTS_SQL.contains("spendable = 1"));
+        assert!(FAIL_RELEASE_INPUTS_SQL.contains("spent_by = NULL"));
+        // IN, not = (review H3): transactions.txid is not unique across
+        // users — a scalar subquery picked an arbitrary row and could
+        // strand the other user's input locks.
+        assert!(FAIL_RELEASE_INPUTS_SQL
+            .contains("WHERE spent_by IN (SELECT transaction_id FROM transactions WHERE txid = ?)"));
+        assert!(
+            FAIL_RELEASE_INPUTS_SQL.contains("basket_id IS NOT NULL"),
+            "must not resurrect relinquished (chain-gone) outputs"
+        );
+        assert!(FAIL_DERECOGNIZE_CREATED_SQL.contains("spendable = 0"));
+        assert!(FAIL_DERECOGNIZE_CREATED_SQL
+            .contains("transaction_id IN (SELECT transaction_id FROM transactions WHERE txid = ?)"));
+    }
+
+    /// parse_input_outpoints: version(4) + vin count + [txid(32) vout(4)
+    /// script sequence(4)] — display-order txids, coinbase skipped,
+    /// truncation yields NO partial evidence.
+    #[test]
+    fn test_parse_input_outpoints() {
+        let mut tx = vec![1, 0, 0, 0]; // version
+        tx.push(2); // vin count
+        // input 0: prev txid internal 0x01 at byte 31 → display 01..00? build:
+        let mut prev0 = [0u8; 32];
+        prev0[31] = 0x01; // internal LE — display begins "01"
+        tx.extend_from_slice(&prev0);
+        tx.extend_from_slice(&7u32.to_le_bytes()); // vout 7
+        tx.push(0); // empty script
+        tx.extend_from_slice(&[0xFF; 4]); // sequence
+        // input 1: coinbase (all-zero txid) — must be skipped
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        tx.push(0);
+        tx.extend_from_slice(&[0xFF; 4]);
+
+        let outpoints = parse_input_outpoints(&tx);
+        assert_eq!(outpoints.len(), 1);
+        assert_eq!(outpoints[0].1, 7);
+        assert!(outpoints[0].0.starts_with("01"));
+        assert_eq!(outpoints[0].0.len(), 64);
+
+        // Truncated tx → empty (no partial evidence).
+        let truncated = &tx[..tx.len() - 10];
+        assert!(parse_input_outpoints(truncated).is_empty());
+        // Garbage → empty.
+        assert!(parse_input_outpoints(&[0x00, 0x01]).is_empty());
+    }
+
+    /// Proof-plan case 6 adjunct: the auto-unfail sweep must be UNBOUNDED
+    /// (no attempts cap — the old `attempts < 60` cap made a long provider
+    /// outage turn a false-fail permanent) and must also re-check
+    /// 'doubleSpend' reqs (a raced ARC verdict must self-correct too).
+    #[test]
+    fn test_auto_unfail_sweep_unbounded_and_covers_double_spend() {
+        let sql = "SELECT DISTINCT r.proven_tx_req_id, r.txid, hex(r.raw_tx) as raw_tx \
+                   FROM proven_tx_reqs r \
+                   JOIN transactions t ON t.txid = r.txid \
+                   WHERE r.status IN ('invalid', 'doubleSpend') AND t.status = 'failed' \
+                     AND r.updated_at < datetime('now', '-1 hour') \
+                   ORDER BY r.updated_at ASC \
+                   LIMIT 20";
+        assert!(!sql.contains("attempts <"), "no attempt cap on self-correction");
+        assert!(sql.contains("'doubleSpend'"));
+        assert!(sql.contains("datetime('now', '-1 hour')"), "hourly backoff retained");
+    }
+
+    // =========================================================================
     // send_waiting — SQL query verification tests
     // =========================================================================
 
@@ -2626,14 +4312,16 @@ mod tests {
 
     #[test]
     fn test_send_waiting_double_spend_updates() {
+        // Positive ARC verdict → status writes are factual...
         let ds_sql_ptr = "UPDATE proven_tx_reqs SET status = 'doubleSpend', updated_at = ? WHERE proven_tx_req_id = ?";
         let ds_sql_tx = "UPDATE transactions SET status = 'failed', updated_at = ? WHERE txid = ?";
-        let ds_sql_out = "UPDATE outputs SET spendable = 1, updated_at = ? WHERE txid = ? AND spendable = 0 AND spent_by IS NULL AND (change = 1 OR custom_instructions IS NOT NULL)";
-
         assert!(ds_sql_ptr.contains("'doubleSpend'"));
         assert!(ds_sql_tx.contains("'failed'"));
-        assert!(ds_sql_out.contains("spendable = 1"));
-        assert!(ds_sql_out.contains("change = 1 OR custom_instructions IS NOT NULL"));
+        // ...and the books mutation releases INPUTS and de-recognizes the
+        // CREATED outputs (audit M1 — the old code re-enabled the phantoms
+        // and left the inputs stranded).
+        assert!(FAIL_RELEASE_INPUTS_SQL.contains("spent_by = NULL"));
+        assert!(FAIL_DERECOGNIZE_CREATED_SQL.contains("spendable = 0"));
     }
 
     #[test]
@@ -2643,6 +4331,9 @@ mod tests {
 
         assert!(inv_sql_ptr.contains("'invalid'"));
         assert!(inv_sql_tx.contains("'failed'"));
+        // Same books correction as the doubleSpend arm (audit M1).
+        assert!(FAIL_RELEASE_INPUTS_SQL.contains("spendable = 1"));
+        assert!(FAIL_DERECOGNIZE_CREATED_SQL.contains("spendable = 0"));
     }
 
     #[test]
@@ -2711,6 +4402,8 @@ mod tests {
             reorg_detected: false,
             reorg_depth: 0,
             proofs_reverified: 0,
+            ext_spends_scanned: 0,
+            ext_spends_found: 0,
             errors: Vec::new(),
         };
         assert_eq!(result.unfail_recovered, 5);
@@ -2732,6 +4425,8 @@ mod tests {
             reorg_detected: false,
             reorg_depth: 0,
             proofs_reverified: 0,
+            ext_spends_scanned: 0,
+            ext_spends_found: 0,
             errors: vec![],
         };
         assert_eq!(result.sent, 5);
@@ -2754,6 +4449,8 @@ mod tests {
             reorg_detected: false,
             reorg_depth: 0,
             proofs_reverified: 0,
+            ext_spends_scanned: 0,
+            ext_spends_found: 0,
             errors: vec!["test".to_string()],
         };
         let details = serde_json::json!({
@@ -2829,11 +4526,11 @@ mod tests {
         let sql = "DELETE FROM proven_tx_reqs \
                     WHERE status = 'completed' \
                     AND proven_tx_id IS NOT NULL \
-                    AND updated_at < datetime('now', ?)";
+                    AND datetime(updated_at) < datetime('now', ?)";
         assert!(sql.contains("DELETE FROM proven_tx_reqs"));
         assert!(sql.contains("status = 'completed'"));
         assert!(sql.contains("proven_tx_id IS NOT NULL"));
-        assert!(sql.contains("datetime('now', ?)"));
+        assert!(sql.contains("datetime(updated_at) < datetime('now', ?)"));
         // Must NOT be an UPDATE — the whole row is deleted
         assert!(!sql.contains("UPDATE"));
         assert!(!sql.contains("SET"));
@@ -2846,13 +4543,13 @@ mod tests {
                     SET raw_tx = NULL, input_beef = NULL, updated_at = ? \
                     WHERE status = 'completed' \
                     AND proven_tx_id IS NOT NULL \
-                    AND updated_at < datetime('now', ?) \
+                    AND datetime(updated_at) < datetime('now', ?) \
                     AND (raw_tx IS NOT NULL OR input_beef IS NOT NULL)";
         assert!(sql.contains("UPDATE transactions"));
         assert!(sql.contains("SET raw_tx = NULL, input_beef = NULL"));
         assert!(sql.contains("status = 'completed'"));
         assert!(sql.contains("proven_tx_id IS NOT NULL"));
-        assert!(sql.contains("datetime('now', ?)"));
+        assert!(sql.contains("datetime(updated_at) < datetime('now', ?)"));
         // Targets only rows that still have data to clear
         assert!(sql.contains("raw_tx IS NOT NULL OR input_beef IS NOT NULL"));
     }
@@ -2861,9 +4558,9 @@ mod tests {
     fn test_purge_sql_failed_where_clause() {
         let sql = "DELETE FROM proven_tx_reqs \
                     WHERE status IN ('invalid', 'doubleSpend') \
-                    AND updated_at < datetime('now', ?)";
+                    AND datetime(updated_at) < datetime('now', ?)";
         assert!(sql.contains("status IN ('invalid', 'doubleSpend')"));
-        assert!(sql.contains("datetime('now', ?)"));
+        assert!(sql.contains("datetime(updated_at) < datetime('now', ?)"));
         assert!(sql.contains("DELETE FROM proven_tx_reqs"));
     }
 
@@ -2970,6 +4667,8 @@ mod tests {
             reorg_detected: false,
             reorg_depth: 0,
             proofs_reverified: 0,
+            ext_spends_scanned: 0,
+            ext_spends_found: 0,
             errors: Vec::new(),
         };
         assert_eq!(result.purged, 42);
@@ -3113,6 +4812,8 @@ mod tests {
             reorg_detected: false,
             reorg_depth: 0,
             proofs_reverified: 0,
+            ext_spends_scanned: 0,
+            ext_spends_found: 0,
             errors: Vec::new(),
         };
         assert_eq!(result.nosend_found, 7);
@@ -3181,6 +4882,8 @@ mod tests {
             reorg_detected: false,
             reorg_depth: 0,
             proofs_reverified: 0,
+            ext_spends_scanned: 0,
+            ext_spends_found: 0,
             errors: Vec::new(),
         };
         let details = serde_json::json!({
@@ -3390,6 +5093,8 @@ mod tests {
             reorg_detected: false,
             reorg_depth: 0,
             proofs_reverified: 0,
+            ext_spends_scanned: 0,
+            ext_spends_found: 0,
             errors: Vec::new(),
         };
         assert!(!result.reorg_detected);
@@ -3413,6 +5118,8 @@ mod tests {
             reorg_detected: true,
             reorg_depth: 3,
             proofs_reverified: 5,
+            ext_spends_scanned: 0,
+            ext_spends_found: 0,
             errors: Vec::new(),
         };
         assert!(result.reorg_detected);
@@ -3436,6 +5143,8 @@ mod tests {
             reorg_detected: true,
             reorg_depth: 2,
             proofs_reverified: 7,
+            ext_spends_scanned: 0,
+            ext_spends_found: 0,
             errors: Vec::new(),
         };
         let details = serde_json::json!({
@@ -3489,25 +5198,34 @@ mod tests {
     #[test]
     fn test_reorg_invalidation_demotes_req() {
         let sql = "UPDATE proven_tx_reqs SET status = 'unmined', proven_tx_id = NULL, \
-                   updated_at = ? WHERE proven_tx_id = ?";
+                   attempts = 0, updated_at = ? WHERE proven_tx_id = ?";
         assert!(sql.contains("'unmined'"));
         assert!(sql.contains("proven_tx_id = NULL"));
+        assert!(
+            sql.contains("attempts = 0"),
+            "reorg demote restarts the attempt clock (Go known_tx.go:685-695)"
+        );
     }
 
+    /// Audit M3: a reorg proof-miss demotes ONLY the req. The transaction
+    /// stays at its status and outputs are NOT clamped — a missing proof
+    /// mid-reorg is provider lag, not evidence; the old spendable=0 clamp
+    /// permanently stranded basket-insertion outputs (the re-enable filter
+    /// only matches change/derivation outputs). Neither reference touches
+    /// transactions or outputs on reorg (TS TaskReorg.ts:69-84 re-proves
+    /// with retries; Go resets the req only).
     #[test]
-    fn test_reorg_invalidation_demotes_transaction() {
-        let sql = "UPDATE transactions SET status = 'unproven', proven_tx_id = NULL, \
+    fn test_reorg_invalidation_touches_only_req_and_proof() {
+        // The reorg batch must contain exactly: proven_txs proof-null +
+        // proven_tx_reqs demote. Neither a transactions demote nor an
+        // outputs clamp may reappear.
+        let proof_null_sql = "UPDATE proven_txs SET block_hash = '', merkle_root = '', merkle_path = NULL, \
                    updated_at = ? WHERE proven_tx_id = ?";
-        assert!(sql.contains("'unproven'"));
-        assert!(sql.contains("proven_tx_id = NULL"));
-    }
-
-    #[test]
-    fn test_reorg_invalidation_disables_spendable() {
-        let sql = "UPDATE outputs SET spendable = 0, updated_at = ? \
-                   WHERE txid = ? AND spendable = 1";
-        assert!(sql.contains("spendable = 0"));
-        assert!(sql.contains("txid = ?"));
+        assert!(proof_null_sql.contains("merkle_path = NULL"));
+        assert!(
+            !proof_null_sql.contains("DELETE"),
+            "raw_tx must be preserved for ancestry"
+        );
     }
 
     #[test]
@@ -3751,5 +5469,356 @@ mod tests {
         assert_eq!(mempool, 1);
         assert_eq!(missing, 2);
         assert_eq!(confirmed + mempool + missing, statuses.len());
+    }
+
+    // =========================================================================
+    // Task 10 (G5) scan_external_spends — cursor state machine
+    // =========================================================================
+
+    #[test]
+    fn test_ext_spend_cursor_round_trip() {
+        let c = ExtSpendCursor {
+            last_output_id: 42,
+            sweep_completed_at: Some("2026-07-05T12:00:00+00:00".to_string()),
+        };
+        let json = ext_spend_cursor_json(&c);
+        assert_eq!(parse_ext_spend_cursor(&json), c);
+    }
+
+    #[test]
+    fn test_ext_spend_cursor_defaults_on_garbage() {
+        // A corrupt cursor must degrade to "restart sweep now", never error.
+        assert_eq!(parse_ext_spend_cursor("not json"), ExtSpendCursor::default());
+        assert_eq!(parse_ext_spend_cursor("{}"), ExtSpendCursor::default());
+        assert_eq!(parse_ext_spend_cursor(""), ExtSpendCursor::default());
+        assert_eq!(
+            parse_ext_spend_cursor(r#"{"last_output_id":"nope"}"#),
+            ExtSpendCursor::default()
+        );
+    }
+
+    #[test]
+    fn test_ext_spend_cursor_null_completed_at() {
+        let json = r#"{"last_output_id":7,"sweep_completed_at":null}"#;
+        let c = parse_ext_spend_cursor(json);
+        assert_eq!(c.last_output_id, 7);
+        assert!(c.sweep_completed_at.is_none());
+    }
+
+    #[test]
+    fn test_ext_spend_parked_within_cooldown() {
+        let now = chrono::Utc::now();
+        let done = (now - chrono::Duration::minutes(EXT_SPEND_SWEEP_COOLDOWN_MINUTES - 5))
+            .to_rfc3339();
+        let c = ExtSpendCursor {
+            last_output_id: 0,
+            sweep_completed_at: Some(done),
+        };
+        assert!(ext_spend_sweep_parked(&c, now));
+    }
+
+    #[test]
+    fn test_ext_spend_not_parked_after_cooldown() {
+        let now = chrono::Utc::now();
+        let done = (now - chrono::Duration::minutes(EXT_SPEND_SWEEP_COOLDOWN_MINUTES + 5))
+            .to_rfc3339();
+        let c = ExtSpendCursor {
+            last_output_id: 0,
+            sweep_completed_at: Some(done),
+        };
+        assert!(!ext_spend_sweep_parked(&c, now));
+    }
+
+    #[test]
+    fn test_ext_spend_never_parked_mid_sweep() {
+        // A fresh completion timestamp must NOT park a cursor that is mid-sweep.
+        let now = chrono::Utc::now();
+        let c = ExtSpendCursor {
+            last_output_id: 99,
+            sweep_completed_at: Some(now.to_rfc3339()),
+        };
+        assert!(!ext_spend_sweep_parked(&c, now));
+    }
+
+    #[test]
+    fn test_ext_spend_not_parked_first_run() {
+        // No cursor row yet → default → sweep immediately.
+        assert!(!ext_spend_sweep_parked(
+            &ExtSpendCursor::default(),
+            chrono::Utc::now()
+        ));
+    }
+
+    #[test]
+    fn test_ext_spend_candidate_row_from_d1_json() {
+        // D1 delivers numbers as floats.
+        let val = serde_json::json!({"output_id": 12.0, "txid": "ab", "vout": 3.0});
+        let row: ExtSpendCandidateRow = serde_json::from_value(val).unwrap();
+        assert_eq!(row.output_id.map(|v| v as i64), Some(12));
+        assert_eq!(row.txid.as_deref(), Some("ab"));
+        assert_eq!(row.vout.map(|v| v as u32), Some(3));
+    }
+
+    // =========================================================================
+    // Task 10 (G5) — SQL invariants (the strings the runtime actually executes)
+    // =========================================================================
+
+    #[test]
+    fn test_ext_spend_candidate_sql_predicates() {
+        let sql = EXT_SPEND_CANDIDATES_SQL;
+        assert!(sql.contains("o.spendable = 1"));
+        assert!(sql.contains("o.spent_by IS NULL"));
+        assert!(sql.contains("o.txid IS NOT NULL"));
+        assert!(sql.contains("t.status IN ('unproven', 'completed')"));
+        assert!(sql.contains("o.output_id > ?"));
+        assert!(sql.contains("ORDER BY o.output_id ASC"));
+        assert!(sql.contains("LIMIT ?"));
+        // Reservations are an orthogonal layer (G1/G4) — the scan must not
+        // filter on them, and must not read them at all.
+        assert!(!sql.contains("reserved_until"));
+    }
+
+    #[test]
+    fn test_ext_spend_mark_sql_guard() {
+        let sql = EXT_SPEND_MARK_SQL;
+        assert!(sql.contains("spendable = 0"));
+        assert!(sql.contains("spent_by = NULL"));
+        // Write-time guard: never clobber a row a live createAction locked.
+        assert!(sql.contains("WHERE output_id = ? AND spendable = 1 AND spent_by IS NULL"));
+        // G4/G1 invariants: mark-spent must not touch reservations or baskets.
+        assert!(!sql.contains("reserved_until"));
+        assert!(!sql.contains("basket_id"));
+    }
+
+    #[test]
+    fn test_ext_spend_cursor_sql_event_scoped() {
+        assert!(EXT_SPEND_CURSOR_READ_SQL.contains("event = 'external_spend_cursor'"));
+        assert!(EXT_SPEND_CURSOR_UPDATE_SQL.contains("event = 'external_spend_cursor'"));
+        assert!(EXT_SPEND_CURSOR_INSERT_SQL.contains("'external_spend_cursor'"));
+        // Never mix with the reorg tracker's rows.
+        assert!(!EXT_SPEND_CURSOR_READ_SQL.contains("chain_height"));
+    }
+
+    // =========================================================================
+    // Task 10 (G5) — real-SQLite harness: the ACTUAL migrations + the ACTUAL
+    // SQL consts against an in-memory DB (D1 is SQLite; semantics match).
+    // =========================================================================
+
+    /// Build an in-memory DB with the real migrations applied and a fixture
+    /// matrix of outputs covering every candidate predicate.
+    ///
+    /// Fixture map (output_id → why it is / isn't a candidate):
+    ///   1  parent 'completed', spendable=1, free        → CANDIDATE
+    ///   2  parent 'unproven',  spendable=1, free,
+    ///      reserved_until in the future                 → CANDIDATE (reservations orthogonal)
+    ///   3  parent 'unsigned'                            → no (not chain-real yet)
+    ///   4  parent 'completed', spendable=0              → no (already relinquished/marked)
+    ///   5  parent 'completed', spent_by = 1             → no (tx-locked by live createAction)
+    ///   6  parent 'completed', txid NULL                → no (not addressable)
+    ///   7  parent 'failed'                              → no
+    ///   8  parent 'nosend'                              → no (check_no_sends owns that path)
+    ///   9  parent 'completed', spendable=1, free        → CANDIDATE (paging fodder)
+    fn g5_test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../migrations/0001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/0002_add_indexes.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/0003_add_output_reservations.sql"))
+            .unwrap();
+
+        conn.execute_batch(
+            r#"
+            INSERT INTO users (user_id, identity_key) VALUES (1, '02aa');
+            INSERT INTO output_baskets (basket_id, user_id, name) VALUES (10, 1, 'default');
+
+            INSERT INTO transactions (transaction_id, user_id, status, reference, is_outgoing, description, txid)
+            VALUES
+              (1, 1, 'completed',   'ref1', 0, 't', 'aa01'),
+              (2, 1, 'unproven',    'ref2', 0, 't', 'aa02'),
+              (3, 1, 'unsigned',    'ref3', 1, 't', 'aa03'),
+              (4, 1, 'failed',      'ref4', 1, 't', 'aa04'),
+              (5, 1, 'nosend',      'ref5', 1, 't', 'aa05');
+
+            INSERT INTO outputs (output_id, user_id, transaction_id, basket_id, spendable, change, vout, satoshis,
+                                 provided_by, purpose, type, txid, spent_by, reserved_until)
+            VALUES
+              (1, 1, 1, 10, 1, 1, 0, 1000, 'storage', 'change', 'P2PKH', 'aa01', NULL, NULL),
+              (2, 1, 2, 10, 1, 1, 1, 2000, 'storage', 'change', 'P2PKH', 'aa02', NULL, datetime('now', '+10 minutes')),
+              (3, 1, 3, 10, 1, 1, 0, 3000, 'storage', 'change', 'P2PKH', 'aa03', NULL, NULL),
+              (4, 1, 1, NULL, 0, 1, 1, 4000, 'storage', 'change', 'P2PKH', 'aa01', NULL, NULL),
+              (5, 1, 1, 10, 1, 1, 2, 5000, 'storage', 'change', 'P2PKH', 'aa01', 1, NULL),
+              (6, 1, 1, 10, 1, 1, 3, 6000, 'storage', 'change', 'P2PKH', NULL, NULL, NULL),
+              (7, 1, 4, 10, 1, 1, 0, 7000, 'storage', 'change', 'P2PKH', 'aa04', NULL, NULL),
+              (8, 1, 5, 10, 1, 1, 0, 8000, 'storage', 'change', 'P2PKH', 'aa05', NULL, NULL),
+              (9, 1, 2, 10, 1, 1, 2, 9000, 'storage', 'change', 'P2PKH', 'aa02', NULL, NULL);
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Run the real candidate query against the harness DB.
+    fn g5_candidates(conn: &rusqlite::Connection, cursor: i64, limit: i64) -> Vec<i64> {
+        let mut stmt = conn.prepare(EXT_SPEND_CANDIDATES_SQL).unwrap();
+        stmt.query_map(rusqlite::params![cursor, limit], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<i64>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_g5_sqlite_candidate_selection() {
+        let conn = g5_test_db();
+        // Full sweep from cursor 0: exactly the free, chain-real outputs —
+        // including the reserved one (reservations are orthogonal), excluding
+        // relinquished / tx-locked / txid-less / unsigned / failed / nosend.
+        assert_eq!(g5_candidates(&conn, 0, EXT_SPEND_BATCH as i64), vec![1, 2, 9]);
+    }
+
+    #[test]
+    fn test_g5_sqlite_candidate_paging() {
+        let conn = g5_test_db();
+        // LIMIT pages, output_id cursor resumes exactly after the last row.
+        assert_eq!(g5_candidates(&conn, 0, 2), vec![1, 2]);
+        assert_eq!(g5_candidates(&conn, 2, 2), vec![9]);
+        // Past the end: empty page (sweep complete → cursor parks at 0).
+        assert_eq!(g5_candidates(&conn, 9, 2), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn test_g5_sqlite_mark_spent_happy_path() {
+        let conn = g5_test_db();
+        let changes = conn
+            .execute(EXT_SPEND_MARK_SQL, rusqlite::params!["2026-07-05T00:00:00Z", 1i64])
+            .unwrap();
+        assert_eq!(changes, 1);
+
+        let (spendable, spent_by, basket_id): (i64, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT spendable, spent_by, basket_id FROM outputs WHERE output_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(spendable, 0);
+        assert_eq!(spent_by, None); // terminal external state — no local tx owns it
+        assert_eq!(basket_id, Some(10)); // basket untouched (relinquish is the client's call)
+
+        // The marked row disappears from the next candidate page.
+        assert_eq!(g5_candidates(&conn, 0, 20), vec![2, 9]);
+    }
+
+    #[test]
+    fn test_g5_sqlite_mark_spent_idempotent() {
+        let conn = g5_test_db();
+        assert_eq!(
+            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t0", 1i64]).unwrap(),
+            1
+        );
+        // Second application: guard sees spendable=0 → no-op, `changes` stays
+        // an accurate found-counter.
+        assert_eq!(
+            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t1", 1i64]).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_g5_sqlite_mark_spent_never_clobbers_tx_lock() {
+        let conn = g5_test_db();
+        // Simulate the race: after the candidate SELECT returned output 2, a
+        // live createAction locks it (spendable=0, spent_by set).
+        conn.execute(
+            "UPDATE outputs SET spendable = 0, spent_by = 1 WHERE output_id = 2",
+            [],
+        )
+        .unwrap();
+        // The write-time guard must refuse.
+        assert_eq!(
+            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t0", 2i64]).unwrap(),
+            0
+        );
+        let spent_by: Option<i64> = conn
+            .query_row("SELECT spent_by FROM outputs WHERE output_id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(spent_by, Some(1)); // the action's lock survives untouched
+    }
+
+    #[test]
+    fn test_g5_sqlite_mark_spent_preserves_reservation() {
+        let conn = g5_test_db();
+        let before: Option<String> = conn
+            .query_row("SELECT reserved_until FROM outputs WHERE output_id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert!(before.is_some()); // fixture: live reservation
+
+        assert_eq!(
+            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t0", 2i64]).unwrap(),
+            1
+        );
+        let after: Option<String> = conn
+            .query_row("SELECT reserved_until FROM outputs WHERE output_id = 2", [], |r| r.get(0))
+            .unwrap();
+        // G4: expiry/unreserve are the ONLY reservation release paths — the
+        // spent-scan marks the row but leaves the reservation bytes alone.
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn test_g5_sqlite_cursor_upsert_single_row() {
+        let conn = g5_test_db();
+        let c1 = ext_spend_cursor_json(&ExtSpendCursor {
+            last_output_id: 2,
+            sweep_completed_at: None,
+        });
+
+        // First persist: UPDATE misses (no row yet) → INSERT.
+        assert_eq!(
+            conn.execute(EXT_SPEND_CURSOR_UPDATE_SQL, rusqlite::params![c1]).unwrap(),
+            0
+        );
+        conn.execute(EXT_SPEND_CURSOR_INSERT_SQL, rusqlite::params![c1]).unwrap();
+
+        // Second persist: UPDATE hits in place — still exactly one row.
+        let c2 = ext_spend_cursor_json(&ExtSpendCursor {
+            last_output_id: 0,
+            sweep_completed_at: Some("2026-07-05T00:00:00+00:00".to_string()),
+        });
+        assert_eq!(
+            conn.execute(EXT_SPEND_CURSOR_UPDATE_SQL, rusqlite::params![c2]).unwrap(),
+            1
+        );
+        let (count, details): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(details) FROM monitor_events WHERE event = 'external_spend_cursor'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let parsed = parse_ext_spend_cursor(&details);
+        assert_eq!(parsed.last_output_id, 0);
+        assert!(parsed.sweep_completed_at.is_some());
+
+        // And the read query round-trips the latest row.
+        let read: String = conn
+            .query_row(EXT_SPEND_CURSOR_READ_SQL, [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(parse_ext_spend_cursor(&read), parsed);
+    }
+
+    #[test]
+    fn test_g5_sqlite_cursor_does_not_collide_with_chain_height() {
+        let conn = g5_test_db();
+        // A chain_height row (task 9's tracker) must be invisible to the scan cursor.
+        conn.execute(
+            "INSERT INTO monitor_events (event, details) VALUES ('chain_height', '{\"height\": 900000}')",
+            [],
+        )
+        .unwrap();
+        let row: std::result::Result<String, _> =
+            conn.query_row(EXT_SPEND_CURSOR_READ_SQL, [], |r| r.get(0));
+        assert!(row.is_err()); // no cursor row → scan starts a fresh sweep
     }
 }

@@ -18,6 +18,7 @@ use crate::storage::readers::{
     GetAnalyticsSummaryArgs, GetBalanceArgs, ListActionsArgs, ListOutputsArgs,
 };
 use crate::storage::relinquish_output::RelinquishOutputArgs;
+use crate::storage::reserve_outputs::{ReserveOutputsArgs, UnreserveOutputsArgs};
 use crate::storage::StorageD1;
 use crate::types::{AuthId, FindCertificatesArgs};
 
@@ -96,6 +97,8 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
 
         // Output management
         "relinquishOutput" => handle_relinquish_output(storage, params, id.clone(), auth).await,
+        "reserveOutputs" => handle_reserve_outputs(storage, params, id.clone(), auth).await,
+        "unreserveOutputs" => handle_unreserve_outputs(storage, params, id.clone(), auth).await,
 
         // Phase 4: Monitor
         "reviewStatus" => handle_review_status(storage, id.clone(), auth).await,
@@ -538,6 +541,52 @@ async fn handle_relinquish_output<
     let args: RelinquishOutputArgs = serde_json::from_value(args_val)?;
     let relinquished = storage.relinquish_output(user_id, args).await?;
     let result = serde_json::json!({ "relinquished": relinquished });
+    Ok(serde_json::to_value(JsonRpcResponse::success(id, result)).unwrap())
+}
+
+/// G1 — atomic UTXO reservation. Params: `[auth, {basket, outputs, ttlSeconds?}]`.
+/// Result: `{"reserved": ["txid.vout", ...]}` — the sublist that transitioned
+/// free → reserved. Already-reserved/spent/absent outpoints are skipped, not
+/// an error. See `storage/reserve_outputs.rs` for the full semantics.
+async fn handle_reserve_outputs<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    let auth = auth.ok_or_else(|| {
+        Error::ValidationError("reserveOutputs requires authentication".to_string())
+    })?;
+
+    let (user_id, _auth) = storage.resolve_auth(auth).await?;
+    let args_val = extract_args(&params, true);
+    let args: ReserveOutputsArgs = serde_json::from_value(args_val)?;
+    let reserved = storage.reserve_outputs(user_id, args).await?;
+    let result = serde_json::json!({ "reserved": reserved });
+    Ok(serde_json::to_value(JsonRpcResponse::success(id, result)).unwrap())
+}
+
+/// G1 — release reservations. Params: `[auth, {basket, outputs}]`.
+/// Result: `{"unreserved": ["txid.vout", ...]}`. Idempotent.
+async fn handle_unreserve_outputs<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    let auth = auth.ok_or_else(|| {
+        Error::ValidationError("unreserveOutputs requires authentication".to_string())
+    })?;
+
+    let (user_id, _auth) = storage.resolve_auth(auth).await?;
+    let args_val = extract_args(&params, true);
+    let args: UnreserveOutputsArgs = serde_json::from_value(args_val)?;
+    let unreserved = storage.unreserve_outputs(user_id, args).await?;
+    let result = serde_json::json!({ "unreserved": unreserved });
     Ok(serde_json::to_value(JsonRpcResponse::success(id, result)).unwrap())
 }
 
