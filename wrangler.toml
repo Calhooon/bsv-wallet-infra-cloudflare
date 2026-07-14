@@ -24,6 +24,17 @@ BEEF_VERIFICATION = "strict"
 # hard DoubleSpend/InvalidTx rejects still reject). Default off.
 INTERNALIZE_ZERO_CONF = "false"
 
+# Broadcast provider selector:
+#   unset / "arc"  = ARC primary with WoC fallback (the classic path)
+#   "arcade"       = Arcade V2 primary (Teranode-native, EF-only submit, async SSE
+#                    verdict gated on SEEN_ON_NETWORK); ARC/WoC fall back ONLY on an
+#                    Arcade OUTAGE — never on a REJECTED verdict. Any other value is a
+#                    hard configuration STOP (visible in GET / health as "broadcaster").
+# Rollback lever = flip back to "arc" + deploy. NOTE a `wrangler secret put BROADCASTER`
+# cannot shadow this [vars] entry — change it here.
+BROADCASTER = "arc"
+# ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"   # override the Arcade endpoint
+
 # Secrets (set via `wrangler secret put`):
 #   ARC_API_KEY — TAAL ARC API key for broadcast acceleration (optional).
 #   WOC_API_KEY — WhatsOnChain API key for fallback broadcast (optional).

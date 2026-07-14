@@ -62,11 +62,23 @@ const ESCALATION_BUDGET_PER_RUN: usize = 5;
 // Task 10 (G5) — scan_external_spends policy knobs
 // =============================================================================
 
-/// Max candidate outputs checked per monitor run. Each candidate costs one
-/// WoC call, so this also caps the task's per-run API budget. 20/run at the
-/// */5 cron = a hard ceiling of 5,760 calls/day, hit only while a backlog
-/// exists; steady state is bounded by `EXT_SPEND_SWEEP_COOLDOWN_MINUTES`.
-const EXT_SPEND_BATCH: usize = 20;
+/// Max candidate outputs checked per monitor run (sweep page). Each candidate
+/// costs one WoC call, so this also caps the task's per-run API budget.
+/// 50/run at the */5 cron = a hard ceiling of 14,400 calls/day, hit only
+/// while a backlog exists; steady state is bounded by
+/// `EXT_SPEND_SWEEP_COOLDOWN_MINUTES`. Raised 20→50 after the 2026-07-08
+/// bsv-blackjack incident: at 823 candidates, 20/run gave a full-sweep time
+/// of ~3.5 h — a freshly-spent hot output could sit spendable for hours.
+const EXT_SPEND_BATCH: usize = 50;
+
+/// HOT page: candidates re-checked newest-first EVERY run, cursor-independent
+/// and immune to the sweep cooldown. The incident class this kills: external
+/// spenders (bsv-blackjack pool stakes) always spend RECENT outputs, and the
+/// ascending sweep reached the newest rows LAST — detection latency was the
+/// full sweep period (~4.5 h) exactly where it needed to be minutes. 30 newest
+/// per run bounds detection for the hot set at one cron tick (~5 min) for
+/// +8,640 WoC calls/day worst case (keyed cap 100k/day — comfortable).
+const EXT_SPEND_HOT_BATCH: usize = 30;
 
 /// Bail out of the run after this many spent-status service errors. A
 /// transient WoC outage must not burn the cron (or the retry budget) on a
@@ -75,10 +87,12 @@ const EXT_SPEND_BATCH: usize = 20;
 const EXT_SPEND_MAX_SERVICE_ERRORS: u32 = 3;
 
 /// Once a full sweep of the candidate set completes, wait this long before
-/// starting the next sweep. Keeps steady-state WoC load at ~(set size) calls
-/// per hour instead of continuously re-scanning (the same throttling concern
-/// as `shallow_reorg_sweep`'s hourly gate).
-const EXT_SPEND_SWEEP_COOLDOWN_MINUTES: i64 = 60;
+/// starting the next sweep. Keeps steady-state WoC load bounded instead of
+/// continuously re-scanning (the same throttling concern as
+/// `shallow_reorg_sweep`'s hourly gate). Cut 60→10 after the 2026-07-08
+/// incident: the hour-long park was a full hour of guaranteed blindness
+/// appended to every sweep. (The HOT page above ignores the park entirely.)
+const EXT_SPEND_SWEEP_COOLDOWN_MINUTES: i64 = 10;
 
 /// Candidate query for the external-spend scan (G5).
 ///
@@ -109,6 +123,21 @@ pub(crate) const EXT_SPEND_CANDIDATES_SQL: &str =
        AND o.txid IS NOT NULL AND o.txid != '' \
        AND t.status IN ('unproven', 'completed') \
      ORDER BY o.output_id ASC \
+     LIMIT ?";
+
+/// HOT-page candidate query: identical predicates, NEWEST first, no cursor.
+/// Runs every monitor tick (even while the sweep is parked) so recently
+/// created outputs — the ones external spenders actually consume — have a
+/// detection latency of one cron interval instead of one sweep period.
+pub(crate) const EXT_SPEND_HOT_CANDIDATES_SQL: &str =
+    "SELECT o.output_id, o.txid, o.vout \
+     FROM outputs o \
+     JOIN transactions t ON o.transaction_id = t.transaction_id \
+     WHERE o.spendable = 1 \
+       AND o.spent_by IS NULL \
+       AND o.txid IS NOT NULL AND o.txid != '' \
+       AND t.status IN ('unproven', 'completed') \
+     ORDER BY o.output_id DESC \
      LIMIT ?";
 
 /// Mark-spent guard for a confirmed external spend (G5).
@@ -480,6 +509,19 @@ struct ExtSpendCandidateRow {
     output_id: Option<f64>,
     txid: Option<String>,
     vout: Option<f64>,
+}
+
+/// Per-row outcome of an external-spend check (shared by the HOT page and
+/// the cursor sweep in `scan_external_spends`).
+enum ExtSpendRowOutcome {
+    /// Provider answered; `found` = the guarded mark-spent UPDATE landed.
+    Checked { found: bool },
+    /// Provider has no outpoint index — abort the run, cursor untouched.
+    Unsupported,
+    /// Transient service error (message pre-formatted for the run report).
+    ServiceErr(String),
+    /// Defensive skip (empty txid — the SQL already excludes these).
+    Skipped,
 }
 
 // =============================================================================
@@ -3202,8 +3244,69 @@ async fn scan_external_spends<P: ProofService>(
     proof_service: &P,
 ) -> Result<(u32, u32, Vec<String>)> {
     let now = Utc::now();
+    let now_str = now.to_rfc3339();
+    let mut scanned = 0u32;
+    let mut found = 0u32;
+    let mut errors = 0u32;
+    let mut error_msgs: Vec<String> = Vec::new();
+    let mut unsupported = false;
 
-    // Load persistent cursor (row reuse: same {details} shape as chain_height).
+    // HOT page (2026-07-08 incident fix): the newest candidates, re-checked
+    // EVERY run, cursor-independent and park-immune. External spenders
+    // consume RECENT outputs, and the ascending sweep reached those last —
+    // this page bounds their detection latency at one cron tick.
+    let hot_rows: Vec<ExtSpendCandidateRow> = Query::new(EXT_SPEND_HOT_CANDIDATES_SQL)
+        .bind(EXT_SPEND_HOT_BATCH as i64)
+        .fetch_all(db)
+        .await
+        .map_err(|e| Error::from(e.to_string()))?;
+    let mut hot_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for row in &hot_rows {
+        let output_id = row.output_id.unwrap_or(0.0) as i64;
+        if output_id == 0 {
+            continue;
+        }
+        hot_seen.insert(output_id);
+        match check_external_spend_row(db, proof_service, row, &now_str).await? {
+            ExtSpendRowOutcome::Checked { found: f } => {
+                scanned += 1;
+                if f {
+                    found += 1;
+                }
+            }
+            ExtSpendRowOutcome::Unsupported => {
+                unsupported = true;
+                break;
+            }
+            ExtSpendRowOutcome::ServiceErr(m) => {
+                errors += 1;
+                if error_msgs.len() < 5 {
+                    error_msgs.push(m);
+                }
+                if errors >= EXT_SPEND_MAX_SERVICE_ERRORS {
+                    break;
+                }
+            }
+            ExtSpendRowOutcome::Skipped => {}
+        }
+    }
+    if unsupported {
+        console_log!(
+            "scan_external_spends: scanned={} spent_found={} errors={} (provider lacks spent-status support — cursor untouched)",
+            scanned, found, errors
+        );
+        return Ok((scanned, found, error_msgs));
+    }
+    if errors >= EXT_SPEND_MAX_SERVICE_ERRORS {
+        console_error!(
+            "scan_external_spends: {} service errors on the hot page — bailing out of this run",
+            errors
+        );
+        return Ok((scanned, found, error_msgs));
+    }
+
+    // SWEEP page — the full candidate set, cursor-paged as before. Load the
+    // persistent cursor (row reuse: same {details} shape as chain_height).
     let cursor_row: Option<ChainHeightRow> = Query::new(EXT_SPEND_CURSOR_READ_SQL)
         .fetch_optional(db)
         .await
@@ -3214,8 +3317,11 @@ async fn scan_external_spends<P: ProofService>(
         .unwrap_or_default();
 
     if ext_spend_sweep_parked(&cursor, now) {
-        console_log!("scan_external_spends: scanned=0 spent_found=0 errors=0 (parked — sweep cooldown)");
-        return Ok((0, 0, Vec::new()));
+        console_log!(
+            "scan_external_spends: scanned={} spent_found={} errors={} (sweep parked — hot page only)",
+            scanned, found, errors
+        );
+        return Ok((scanned, found, error_msgs));
     }
 
     let rows: Vec<ExtSpendCandidateRow> = Query::new(EXT_SPEND_CANDIDATES_SQL)
@@ -3226,78 +3332,38 @@ async fn scan_external_spends<P: ProofService>(
         .map_err(|e| Error::from(e.to_string()))?;
 
     let fetched = rows.len();
-    let now_str = now.to_rfc3339();
-    let mut scanned = 0u32;
-    let mut found = 0u32;
-    let mut errors = 0u32;
-    let mut error_msgs: Vec<String> = Vec::new();
     let mut last_processed = cursor.last_output_id;
-    let mut unsupported = false;
 
     for row in &rows {
         let output_id = row.output_id.unwrap_or(0.0) as i64;
         if output_id == 0 {
             continue;
         }
-        let txid = match &row.txid {
-            Some(t) if !t.is_empty() => t.clone(),
-            _ => {
-                // Defensive — the SQL already excludes these.
-                last_processed = output_id;
-                continue;
-            }
-        };
-        let vout = row.vout.unwrap_or(0.0) as u32;
-
-        match proof_service.get_spent_status(&txid, vout).await {
-            Ok(SpentStatus::Spent { spending_txid }) => {
+        if hot_seen.contains(&output_id) {
+            // already checked (and possibly marked) by the hot page this run
+            last_processed = output_id;
+            continue;
+        }
+        match check_external_spend_row(db, proof_service, row, &now_str).await? {
+            ExtSpendRowOutcome::Checked { found: f } => {
                 scanned += 1;
                 last_processed = output_id;
-                let meta = Query::new(EXT_SPEND_MARK_SQL)
-                    .bind(now_str.as_str())
-                    .bind(output_id)
-                    .execute(db)
-                    .await
-                    .map_err(|e| Error::from(e.to_string()))?;
-                if meta.changes > 0 {
+                if f {
                     found += 1;
-                    console_log!(
-                        "scan_external_spends: output {} ({}.{}) spent externally by {} — marked spendable=0",
-                        output_id,
-                        &txid[..txid.len().min(16)],
-                        vout,
-                        &spending_txid[..spending_txid.len().min(16)]
-                    );
-                } else {
-                    // Row changed between SELECT and UPDATE (createAction lock
-                    // or relinquish) — guard held, hands off, next sweep re-checks.
-                    console_log!(
-                        "scan_external_spends: output {} changed under us — guard held, left alone",
-                        output_id
-                    );
                 }
             }
-            Ok(SpentStatus::Unspent) => {
-                scanned += 1;
-                last_processed = output_id;
-            }
-            Ok(SpentStatus::Unsupported) => {
+            ExtSpendRowOutcome::Unsupported => {
                 // Provider has no outpoint index: leave the cursor untouched so
                 // nothing is skipped once a capable provider is wired back in.
                 unsupported = true;
                 break;
             }
-            Err(e) => {
+            ExtSpendRowOutcome::ServiceErr(m) => {
                 errors += 1;
                 // Skip-and-advance: re-checked on the next full sweep.
                 last_processed = output_id;
                 if error_msgs.len() < 5 {
-                    error_msgs.push(format!(
-                        "ext_spend({}.{}): {}",
-                        &txid[..txid.len().min(8)],
-                        vout,
-                        e
-                    ));
+                    error_msgs.push(m);
                 }
                 if errors >= EXT_SPEND_MAX_SERVICE_ERRORS {
                     console_error!(
@@ -3306,6 +3372,10 @@ async fn scan_external_spends<P: ProofService>(
                     );
                     break;
                 }
+            }
+            ExtSpendRowOutcome::Skipped => {
+                // Defensive — the SQL already excludes these.
+                last_processed = output_id;
             }
         }
     }
@@ -3348,6 +3418,62 @@ async fn scan_external_spends<P: ProofService>(
     );
 
     Ok((scanned, found, error_msgs))
+}
+
+/// Check one candidate against the spent-status service and, when the chain
+/// says it is spent, mark it via the guarded `EXT_SPEND_MARK_SQL` UPDATE
+/// (liveness predicates re-checked at write time — never clobbers a row a
+/// live createAction locked meanwhile). Pure per-row logic; cursor movement,
+/// counters, and error budgets stay with the callers.
+async fn check_external_spend_row<P: ProofService>(
+    db: &D1Database,
+    proof_service: &P,
+    row: &ExtSpendCandidateRow,
+    now_str: &str,
+) -> Result<ExtSpendRowOutcome> {
+    let output_id = row.output_id.unwrap_or(0.0) as i64;
+    let txid = match &row.txid {
+        Some(t) if !t.is_empty() => t.clone(),
+        _ => return Ok(ExtSpendRowOutcome::Skipped),
+    };
+    let vout = row.vout.unwrap_or(0.0) as u32;
+
+    match proof_service.get_spent_status(&txid, vout).await {
+        Ok(SpentStatus::Spent { spending_txid }) => {
+            let meta = Query::new(EXT_SPEND_MARK_SQL)
+                .bind(now_str)
+                .bind(output_id)
+                .execute(db)
+                .await
+                .map_err(|e| Error::from(e.to_string()))?;
+            if meta.changes > 0 {
+                console_log!(
+                    "scan_external_spends: output {} ({}.{}) spent externally by {} — marked spendable=0",
+                    output_id,
+                    &txid[..txid.len().min(16)],
+                    vout,
+                    &spending_txid[..spending_txid.len().min(16)]
+                );
+                Ok(ExtSpendRowOutcome::Checked { found: true })
+            } else {
+                // Row changed between SELECT and UPDATE (createAction lock or
+                // relinquish) — guard held, hands off, next sweep re-checks.
+                console_log!(
+                    "scan_external_spends: output {} changed under us — guard held, left alone",
+                    output_id
+                );
+                Ok(ExtSpendRowOutcome::Checked { found: false })
+            }
+        }
+        Ok(SpentStatus::Unspent) => Ok(ExtSpendRowOutcome::Checked { found: false }),
+        Ok(SpentStatus::Unsupported) => Ok(ExtSpendRowOutcome::Unsupported),
+        Err(e) => Ok(ExtSpendRowOutcome::ServiceErr(format!(
+            "ext_spend({}.{}): {}",
+            &txid[..txid.len().min(8)],
+            vout,
+            e
+        ))),
+    }
 }
 
 /// Persist the scan cursor: UPDATE the existing 'external_spend_cursor' row,

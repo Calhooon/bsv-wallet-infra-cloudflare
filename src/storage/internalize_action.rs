@@ -520,13 +520,25 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     };
 
                     if let Some(output_id) = od.existing_output_id {
-                        // Update existing output
+                        // Update existing output. GUARD (2026-07-08 incident,
+                        // the resurrection bug's second head): `basket_id IS
+                        // NOT NULL` — a RELINQUISHED row (basket NULL,
+                        // spendable 0) is terminally untracked ("goes to
+                        // GONE", relinquish_output.rs) and a late re-credit
+                        // must NOT re-basket it. Measured live: a bj-house
+                        // pool output was credited at SEEN, staked + spent by
+                        // a hand, relinquished — then the crediting cron's
+                        // MINED-gated internalize re-basketed it and the
+                        // monitor's confirmation pass re-enabled spendable,
+                        // resurrecting a spent stake that a later hand picked
+                        // (double-spend orphan). Same guard the wallet-payment
+                        // merge above already carries (audit minor-6).
                         Query::new(
                             r#"UPDATE outputs
                             SET basket_id = ?, type = 'custom', change = 0,
                                 custom_instructions = ?, derivation_prefix = NULL,
                                 derivation_suffix = NULL, sender_identity_key = NULL, updated_at = ?
-                            WHERE output_id = ?"#,
+                            WHERE output_id = ? AND basket_id IS NOT NULL"#,
                         )
                         .bind(basket_id)
                         .bind(insertion.custom_instructions.as_deref())

@@ -258,11 +258,23 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         // =====================================================================
         // Step 6: Get the stored input_beef for proven_tx_req
         // =====================================================================
-        let input_beef_bytes = tx_row
-            .input_beef
-            .as_deref()
-            .filter(|h| !h.is_empty())
-            .and_then(|h| hex::decode(h).ok());
+        // input_beef may live in R2 (D1 column NULL for >4KB blobs — the COMMON case
+        // for deep ancestry). Without this fallback the largest txs silently downgrade
+        // to raw-tx-only inline broadcast — the exact orphan-mempool failure of the
+        // 2026-04-15 incident (the monitor's send_waiting had this fix; the inline
+        // path did not until the 2026-07-13 Arcade migration surfaced it, since Arcade
+        // rejects bare raw txs outright instead of quietly accepting them).
+        let input_beef_bytes = match tx_row.input_beef.as_deref().filter(|h| !h.is_empty()) {
+            Some(h) => hex::decode(h).ok(),
+            None => {
+                let store = crate::r2::BlobStore::new(self.blobs);
+                store
+                    .get("transactions", tx_id, "input_beef", None)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
 
         // =====================================================================
         // Step 7: Determine target status

@@ -1004,8 +1004,8 @@ mod tests {
     //
     // These tests cover the exact failure mode that killed the 2026-04-12
     // two-agent handshake E2E: primary ChainTracks returned an error (the
-    // legacy TS chaintracks host was 200-OK'ing with empty `value` at recent
-    // heights), and the WoC fallback then 500'd. We need to guarantee:
+    // old TS chaintracks deployment was 200-OK'ing with empty `value` at
+    // recent heights), and the WoC fallback then 500'd. We need to guarantee:
     //
     //   1. When primary errors, the fallback is still consulted
     //   2. The fallback's result is returned (even if primary failed)

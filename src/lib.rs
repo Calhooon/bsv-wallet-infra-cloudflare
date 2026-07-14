@@ -34,6 +34,44 @@ use crate::json_rpc::{JsonRpcError, JsonRpcRequest};
 use crate::storage::StorageD1;
 use crate::types::AuthId;
 
+/// Read an env value that may live as either a secret or a plain var.
+fn env_value(env: &Env, name: &str) -> Option<String> {
+    env.secret(name)
+        .ok()
+        .map(|s| s.to_string())
+        .or_else(|| env.var(name).ok().map(|v| v.to_string()))
+}
+
+/// Build the env-selected broadcast/proof provider (`BROADCASTER`: absent/`arc` = today's
+/// ARC→WoC MultiProvider path; `arcade` = Arcade V2 with ARC/WoC as the OUTAGE fallback).
+/// A selector typo is a hard configuration error — callers surface it loudly and refuse
+/// to run, never guessing a broadcaster.
+fn build_provider(
+    env: &Env,
+) -> std::result::Result<crate::services::selected::SelectedProvider, String> {
+    let arc_api_key = env_value(env, "ARC_API_KEY");
+    let woc_api_key = env_value(env, "WOC_API_KEY");
+    let chaintracks_url = env
+        .var("CHAINTRACKS_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.is_empty());
+    let multi = crate::services::multi::MultiProvider::with_chaintracks(
+        arc_api_key,
+        woc_api_key,
+        chaintracks_url,
+    );
+    let choice = crate::services::selected::BroadcasterChoice::parse(
+        env_value(env, "BROADCASTER").as_deref(),
+    )?;
+    let arcade_url = env.var("ARCADE_URL").ok().map(|v| v.to_string());
+    Ok(crate::services::selected::SelectedProvider::new(
+        choice,
+        arcade_url,
+        multi,
+    ))
+}
+
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     init_panic_hook();
@@ -43,11 +81,20 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return handle_cors_preflight();
     }
 
-    // Health check (no auth)
+    // Health check (no auth). Surfaces the active broadcaster selection so a deploy
+    // can be gate-checked (and a BROADCASTER typo is visible here, not just in logs).
     if req.path() == "/" && req.method() == Method::Get {
+        let broadcaster = match crate::services::selected::BroadcasterChoice::parse(
+            env_value(&env, "BROADCASTER").as_deref(),
+        ) {
+            Ok(crate::services::selected::BroadcasterChoice::Arc) => "arc".to_string(),
+            Ok(crate::services::selected::BroadcasterChoice::Arcade) => "arcade".to_string(),
+            Err(e) => format!("MISCONFIGURED: {e}"),
+        };
         let response = Response::from_json(&serde_json::json!({
             "status": "ok",
-            "service": "wallet-infra"
+            "service": "wallet-infra",
+            "broadcaster": broadcaster
         }))?;
         return Ok(add_cors_headers(response));
     }
@@ -87,26 +134,14 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
         let db = env.d1("DB").map_err(|e| Error::from(e.to_string()))?;
         let blobs = env.bucket("BLOBS").map_err(|e| Error::from(e.to_string()))?;
-        let arc_api_key = env
-            .secret("ARC_API_KEY")
-            .ok()
-            .map(|s| s.to_string())
-            .or_else(|| env.var("ARC_API_KEY").ok().map(|v| v.to_string()));
-        let woc_api_key = env
-            .secret("WOC_API_KEY")
-            .ok()
-            .map(|s| s.to_string())
-            .or_else(|| env.var("WOC_API_KEY").ok().map(|v| v.to_string()));
-        let chaintracks_url = env
-            .var("CHAINTRACKS_URL")
-            .ok()
-            .map(|v| v.to_string())
-            .filter(|s| !s.is_empty());
-        let provider = crate::services::multi::MultiProvider::with_chaintracks(
-            arc_api_key,
-            woc_api_key,
-            chaintracks_url,
-        );
+        let provider = match build_provider(&env) {
+            Ok(p) => p,
+            Err(e) => {
+                let response = Response::from_json(&serde_json::json!({ "error": e }))?
+                    .with_status(500);
+                return Ok(add_cors_headers(response));
+            }
+        };
         let result = monitor::run_monitor(&db, &blobs, &provider, &provider).await;
 
         let response = Response::from_json(&serde_json::json!({
@@ -264,20 +299,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .bucket("BLOBS")
         .map_err(|e| Error::from(e.to_string()))?;
 
-    // Read ARC API key (optional — if not set, ARC calls will fail and WoC is used as fallback)
-    let arc_api_key = env
-        .secret("ARC_API_KEY")
-        .ok()
-        .map(|s| s.to_string())
-        .or_else(|| env.var("ARC_API_KEY").ok().map(|v| v.to_string()));
-
     // Read WoC API key (optional — if set, sent as `woc-api-key` header on all
     // WoC requests to bypass anonymous IP-based rate limiting).
-    let woc_api_key = env
-        .secret("WOC_API_KEY")
-        .ok()
-        .map(|s| s.to_string())
-        .or_else(|| env.var("WOC_API_KEY").ok().map(|v| v.to_string()));
+    let woc_api_key = env_value(&env, "WOC_API_KEY");
 
     // Read BEEF verification mode (default: "strict" — verifies merkle roots via ChainTracks/WoC)
     let beef_mode = env
@@ -299,13 +323,16 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         woc_api_key.clone(),
     );
 
-    // Build broadcast/proof provider (ARC → WoC → Bitails failover; ChainTracks
-    // used as the canonical-chain authority for TSC proof filtering)
-    let provider = crate::services::multi::MultiProvider::with_chaintracks(
-        arc_api_key,
-        woc_api_key,
-        chaintracks_url,
-    );
+    // Build the env-selected broadcast/proof provider (BROADCASTER: arc|arcade; proofs
+    // always ride ARC → WoC → Bitails with ChainTracks as the canonical-chain authority).
+    let provider = match build_provider(&env) {
+        Ok(p) => p,
+        Err(e) => {
+            let response = Response::from_json(&serde_json::json!({ "error": e }))?
+                .with_status(500);
+            return Ok(add_cors_headers(response));
+        }
+    };
     // ZERO-CONF dev lever: when INTERNALIZE_ZERO_CONF=true, a freshly-internalized
     // deposit stays spendable even if the internalize-time broadcast hits a transient
     // ServiceError — removing the ~1-block wait for the monitor to reconcile spendable.
@@ -353,26 +380,15 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
         }
     };
 
-    let arc_api_key = env
-        .secret("ARC_API_KEY")
-        .ok()
-        .map(|s| s.to_string())
-        .or_else(|| env.var("ARC_API_KEY").ok().map(|v| v.to_string()));
-    let woc_api_key = env
-        .secret("WOC_API_KEY")
-        .ok()
-        .map(|s| s.to_string())
-        .or_else(|| env.var("WOC_API_KEY").ok().map(|v| v.to_string()));
-    let chaintracks_url = env
-        .var("CHAINTRACKS_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.is_empty());
-    let provider = crate::services::multi::MultiProvider::with_chaintracks(
-        arc_api_key,
-        woc_api_key,
-        chaintracks_url,
-    );
+    let provider = match build_provider(&env) {
+        Ok(p) => p,
+        Err(e) => {
+            // A BROADCASTER typo must not silently run the monitor with a guessed
+            // broadcaster — refuse the run loudly; /health shows the misconfiguration.
+            console_error!("Monitor: refusing to run — {}", e);
+            return;
+        }
+    };
     let result = monitor::run_monitor(&db, &blobs, &provider, &provider).await;
 
     console_log!(

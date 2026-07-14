@@ -31,7 +31,7 @@ Cron (*/5 min) → lib.rs (scheduled) → monitor.rs → proof reconciliation + 
 - **dispatch.rs** — Routes JSON-RPC method names to handlers. Normalizes both positional arrays (from `bsv-wallet-toolbox-rs` `StorageClient`) and named objects.
 - **bench.rs** — `BenchTimer` helper. Emits `BENCH <op>.<phase>: <ms> ms` lines for capture via `wrangler tail`. Production-wide instrumentation, zero cost when no one's tailing.
 - **storage/** — D1 + R2 operations. One file per JSON-RPC method that mutates state.
-- **services/** — Outbound HTTP clients (ARC, WoC, Bitails, chaintracks) behind `BroadcastService` + `ProofService` traits, composed via `MultiProvider`.
+- **services/** — Outbound HTTP clients (Arcade V2, ARC, WoC, Bitails, chaintracks) behind `BroadcastService` + `ProofService` traits. `selected.rs` picks the broadcaster from the `BROADCASTER` var (`arc` = `MultiProvider` ARC→WoC; `arcade` = `arcade.rs` Arcade V2 — EF-only submit, SSE verdict gated on SEEN_ON_NETWORK, ARC/WoC fallback on OUTAGE only, rejects fail hard; typo = hard STOP). Proofs always ride `MultiProvider`.
 - **monitor.rs** — Cron monitor: fetches missing proofs, re-broadcasts unconfirmed txs, fails abandoned actions, reconciles status mismatches.
 - **d1/** — Custom query builder for D1's `JsValue` binding model + `BatchCollector` for atomic 100-statement chunks.
 

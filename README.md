@@ -25,7 +25,11 @@ The upstream TypeScript implementation runs as an Express service backed by MySQ
 - Overflows blobs >4 KB (raw txs, BEEF, locking scripts) to R2
 - Caches per-identity auth sessions in KV (1-hour TTL)
 - Builds and verifies [BEEF](https://brc.dev/62) (BRC-62) for every action with full ancestor proofs
-- Broadcasts via TAAL ARC + GorillaPool (parallel race), falls back to WhatsOnChain
+- Broadcasts via **Arcade V2** (Teranode-native: EF batch submit + async SSE verdict gated
+  on `SEEN_ON_NETWORK`) or TAAL ARC + GorillaPool with WhatsOnChain fallback — selected by
+  the `BROADCASTER` var (`arc` | `arcade`; a typo is a hard STOP, never a silent default).
+  Under `arcade`, ARC/WoC take over only on an Arcade *outage* — a `REJECTED` /
+  `DOUBLE_SPEND_ATTEMPTED` verdict is definitive and fails the action hard
 - Issues automatic refunds via BRC-29 on upstream broadcast failures
 - Re-broadcasts unconfirmed transactions on a 5-minute cron
 

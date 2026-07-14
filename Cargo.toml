@@ -1,13 +1,23 @@
 [package]
 name = "bsv-wallet-infra-cloudflare"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
+description = "BRC-100 wallet storage server on Cloudflare Workers (D1 + R2): createAction/processAction/internalizeAction, BEEF verification, Arcade V2/ARC/WoC broadcast, proof monitor. Rust/WASM port of the wallet-toolbox storage server."
+license = "MIT"
+repository = "https://github.com/Calhooon/bsv-wallet-infra-cloudflare"
+keywords = ["bsv", "wallet", "cloudflare", "blockchain", "brc100"]
+categories = ["cryptography::cryptocurrencies", "wasm"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bsv-auth-cloudflare = { path = "../rust-middleware/bsv-auth-cloudflare" }
+# The BRC-103/104 auth middleware, published as bsv-middleware-cloudflare —
+# aliased so the source keeps its bsv_auth_cloudflare import name. Pinned to the
+# 0.1.x line: it is the worker-0.7 generation (0.2+ moved to worker 0.8, which
+# would split the dependency graph into two `worker` crates — this crate rides
+# worker 0.7 end-to-end; see the worker-build pairing note in wrangler.toml).
+bsv-auth-cloudflare = { package = "bsv-middleware-cloudflare", version = "0.1.2" }
 bsv-sdk = { package = "bsv-rs", version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
 worker = { version = "0.7", features = ["d1"] }
 serde-wasm-bindgen = "0.6"

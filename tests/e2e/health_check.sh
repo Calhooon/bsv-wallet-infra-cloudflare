@@ -21,7 +21,7 @@ echo ""
 # 1. /health endpoint returns 200
 # ---------------------------------------------------------------------------
 echo "--- Test 1: GET /health ---"
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_URL}/health")
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_URL}/")
 if [ "$HTTP_CODE" = "200" ]; then
     pass "/health returned 200"
 else

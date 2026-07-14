@@ -4,9 +4,11 @@
 //! Providers: WoC (legacy), ARC (primary, added in Phase 2b).
 
 pub mod arc;
+pub mod arcade;
 pub mod bitails;
 pub mod chaintracker;
 pub mod multi;
+pub mod selected;
 pub mod woc;
 
 // =============================================================================
