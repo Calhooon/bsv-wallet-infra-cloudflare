@@ -317,6 +317,12 @@ fn fatal_to_broadcast_error(dead_txid: &str, status: &str, subject: &str) -> Bro
 
 pub struct ArcadeProvider {
     base_url: String,
+    /// Webhook registration `(callback_url, secret_token)`. When set, every submit
+    /// registers `X-CallbackUrl` so Arcade POSTs status updates (incl. the free MINED
+    /// `merklePath`) back to us — the push-native proof path (`/arcade/callback`).
+    /// The secret token doubles as the SSE scope token (the scanner filters by txid,
+    /// so a shared token only means more frames on the stream, never a wrong verdict).
+    callback: Option<(String, String)>,
 }
 
 impl ArcadeProvider {
@@ -328,6 +334,24 @@ impl ArcadeProvider {
                 .unwrap_or_else(|| ARCADE_URL_DEFAULT.to_string())
                 .trim_end_matches('/')
                 .to_string(),
+            callback: None,
+        }
+    }
+
+    /// Register the webhook callback `(url, secret_token)` on every submit.
+    pub fn with_callback(mut self, callback: Option<(String, String)>) -> Self {
+        self.callback = callback
+            .filter(|(u, t)| !u.trim().is_empty() && !t.trim().is_empty())
+            .map(|(u, t)| (u.trim().to_string(), t.trim().to_string()));
+        self
+    }
+
+    /// The token that scopes this submit's SSE stream: the shared webhook secret when
+    /// callbacks are registered (one subscription serves both), else the subject txid.
+    fn sse_token<'a>(&'a self, subject_txid: &'a str) -> &'a str {
+        match &self.callback {
+            Some((_, token)) => token,
+            None => subject_txid,
         }
     }
 
@@ -437,7 +461,10 @@ impl ArcadeProvider {
             }
             let headers = worker::Headers::new();
             let _ = headers.set("Content-Type", "application/octet-stream");
-            let _ = headers.set("X-CallbackToken", subject_txid);
+            let _ = headers.set("X-CallbackToken", self.sse_token(subject_txid));
+            if let Some((url, _)) = &self.callback {
+                let _ = headers.set("X-CallbackUrl", url);
+            }
             let _ = headers.set("X-FullStatusUpdates", "true");
             let mut init = worker::RequestInit::new();
             init.with_method(worker::Method::Post);
@@ -494,7 +521,10 @@ impl ArcadeProvider {
             }
             let headers = worker::Headers::new();
             let _ = headers.set("Content-Type", "text/plain");
-            let _ = headers.set("X-CallbackToken", subject_txid);
+            let _ = headers.set("X-CallbackToken", self.sse_token(subject_txid));
+            if let Some((url, _)) = &self.callback {
+                let _ = headers.set("X-CallbackUrl", url);
+            }
             let _ = headers.set("X-FullStatusUpdates", "true");
             let mut init = worker::RequestInit::new();
             init.with_method(worker::Method::Post);
@@ -545,7 +575,11 @@ impl ArcadeProvider {
 
         let mut scanner = SseVerdictScanner::new(subject_txid, batch_txids, ARCADE_GATE_STATUS)
             .map_err(ArcadeFailure::Unverified)?;
-        let events_url = format!("{}/events?callbackToken={}", self.base_url, subject_txid);
+        let events_url = format!(
+            "{}/events?callbackToken={}",
+            self.base_url,
+            self.sse_token(subject_txid)
+        );
 
         let sse = async {
             let mut init = worker::RequestInit::new();
@@ -643,19 +677,28 @@ impl ArcadeProvider {
 
     /// `GET /tx/{txid}` → the current `txStatus`, if Arcade knows the tx.
     async fn poll_status(&self, txid: &str) -> Option<String> {
-        let url = format!("{}/tx/{}", self.base_url, txid);
-        let mut init = worker::RequestInit::new();
-        init.with_method(worker::Method::Get);
-        let request = worker::Request::new_with_init(&url, &init).ok()?;
-        let mut response = worker::Fetch::Request(request).send().await.ok()?;
-        if response.status_code() >= 400 {
-            return None;
-        }
-        let json: serde_json::Value = response.json().await.ok()?;
-        json.get("txStatus")
+        fetch_tx_record(&self.base_url, txid)
+            .await?
+            .get("txStatus")
             .and_then(|s| s.as_str())
             .map(|s| s.to_string())
     }
+}
+
+/// `GET {base}/tx/{txid}` → the full stored record (`txStatus`, `rawTx`, and — once
+/// MINED — `blockHash`/`blockHeight`/`merklePath`). The webhook proof path uses this as
+/// its belt: a bulk MINED fan-out webhook shares block fields across the block's txids
+/// but cannot carry a per-tx merklePath inline, so the handler re-reads the record.
+pub async fn fetch_tx_record(base_url: &str, txid: &str) -> Option<serde_json::Value> {
+    let url = format!("{}/tx/{}", base_url.trim_end_matches('/'), txid);
+    let mut init = worker::RequestInit::new();
+    init.with_method(worker::Method::Get);
+    let request = worker::Request::new_with_init(&url, &init).ok()?;
+    let mut response = worker::Fetch::Request(request).send().await.ok()?;
+    if response.status_code() >= 400 {
+        return None;
+    }
+    response.json().await.ok()
 }
 
 // =============================================================================

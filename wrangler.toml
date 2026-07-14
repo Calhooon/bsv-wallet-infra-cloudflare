@@ -34,6 +34,11 @@ INTERNALIZE_ZERO_CONF = "false"
 # cannot shadow this [vars] entry — change it here.
 BROADCASTER = "arc"
 # ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"   # override the Arcade endpoint
+# Webhook proof delivery (push-native merkle proofs): when BOTH are set, every Arcade
+# submit registers X-CallbackUrl and Arcade POSTs status (+ the free MINED merklePath)
+# to /arcade/callback, Bearer-authed with the ARCADE_CALLBACK_TOKEN secret. The proof is
+# ChainTracks-verified before persisting; the cron monitor remains the fallback.
+# ARCADE_CALLBACK_URL = "https://<your-worker-domain>/arcade/callback"
 
 # Secrets (set via `wrangler secret put`):
 #   ARC_API_KEY — TAAL ARC API key for broadcast acceleration (optional).

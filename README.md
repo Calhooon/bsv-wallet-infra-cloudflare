@@ -32,6 +32,11 @@ The upstream TypeScript implementation runs as an Express service backed by MySQ
   `DOUBLE_SPEND_ATTEMPTED` verdict is definitive and fails the action hard
 - Issues automatic refunds via BRC-29 on upstream broadcast failures
 - Re-broadcasts unconfirmed transactions on a 5-minute cron
+- **Push-native merkle proofs** (Arcade mode): submits register a webhook
+  (`ARCADE_CALLBACK_URL` + `ARCADE_CALLBACK_TOKEN`), Arcade POSTs the MINED status with
+  its free `merklePath` to `POST /arcade/callback` (Bearer-authed, fail-closed), the BUMP
+  is verified against ChainTracks before persisting — proofs land minutes after mining
+  with the cron monitor as fallback
 
 ## Architecture
 

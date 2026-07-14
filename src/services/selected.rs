@@ -69,10 +69,22 @@ pub enum SelectedProvider {
 
 impl SelectedProvider {
     pub fn new(choice: BroadcasterChoice, arcade_url: Option<String>, multi: MultiProvider) -> Self {
+        Self::with_callback(choice, arcade_url, None, multi)
+    }
+
+    /// `callback` = `(ARCADE_CALLBACK_URL, ARCADE_CALLBACK_TOKEN)`: when set (and the
+    /// arcade arm is selected), every submit registers the webhook so Arcade pushes
+    /// status + the free MINED merklePath to `/arcade/callback` (the proof path).
+    pub fn with_callback(
+        choice: BroadcasterChoice,
+        arcade_url: Option<String>,
+        callback: Option<(String, String)>,
+        multi: MultiProvider,
+    ) -> Self {
         match choice {
             BroadcasterChoice::Arc => SelectedProvider::Arc(multi),
             BroadcasterChoice::Arcade => SelectedProvider::Arcade {
-                arcade: ArcadeProvider::new(arcade_url),
+                arcade: ArcadeProvider::new(arcade_url).with_callback(callback),
                 fallback: multi,
             },
         }

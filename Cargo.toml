@@ -1,6 +1,6 @@
 [package]
 name = "bsv-wallet-infra-cloudflare"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "BRC-100 wallet storage server on Cloudflare Workers (D1 + R2): createAction/processAction/internalizeAction, BEEF verification, Arcade V2/ARC/WoC broadcast, proof monitor. Rust/WASM port of the wallet-toolbox storage server."
 license = "MIT"

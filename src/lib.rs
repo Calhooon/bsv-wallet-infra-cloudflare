@@ -8,6 +8,7 @@
 //! - POST /.well-known/auth   -> BRC-31 handshake (middleware)
 //! - POST /                   -> JSON-RPC 2.0 dispatch (authenticated)
 
+pub mod arcade_callback;
 pub mod audit;
 pub mod bench;
 pub mod d1;
@@ -65,15 +66,28 @@ fn build_provider(
         env_value(env, "BROADCASTER").as_deref(),
     )?;
     let arcade_url = env.var("ARCADE_URL").ok().map(|v| v.to_string());
-    Ok(crate::services::selected::SelectedProvider::new(
+    // Webhook proof delivery: when BOTH are set, submits register X-CallbackUrl and
+    // Arcade POSTs status (+ the free MINED merklePath) to /arcade/callback, Bearer-authed
+    // with the token. Either missing ⇒ no registration (SSE-verdict-only, as before).
+    let callback = match (
+        env.var("ARCADE_CALLBACK_URL").ok().map(|v| v.to_string()),
+        env_value(env, "ARCADE_CALLBACK_TOKEN"),
+    ) {
+        (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
+            Some((url, token))
+        }
+        _ => None,
+    };
+    Ok(crate::services::selected::SelectedProvider::with_callback(
         choice,
         arcade_url,
+        callback,
         multi,
     ))
 }
 
 #[event(fetch)]
-pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     init_panic_hook();
 
     // CORS preflight
@@ -97,6 +111,35 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "broadcaster": broadcaster
         }))?;
         return Ok(add_cors_headers(response));
+    }
+
+    // Arcade V2 webhook — the push-native proof path. Registered at submit via
+    // X-CallbackUrl; Arcade POSTs TransactionStatus JSON authed with
+    // `Authorization: Bearer <ARCADE_CALLBACK_TOKEN>`. Fail-closed: no configured
+    // token ⇒ the route does not exist (404); bad/missing bearer ⇒ 401 (Arcade's
+    // reaper retries those). Once authed, ALWAYS 200 — per-tx problems are logged
+    // and left to the cron monitor's fallback, never turned into retry storms.
+    if req.path() == "/arcade/callback" && req.method() == Method::Post {
+        let Some(secret) = env_value(&env, "ARCADE_CALLBACK_TOKEN").filter(|s| !s.is_empty())
+        else {
+            return Response::error("Not Found", 404);
+        };
+        let presented = req.headers().get("Authorization").ok().flatten();
+        if presented.as_deref() != Some(format!("Bearer {secret}").as_str()) {
+            return Response::error("unauthorized", 401);
+        }
+        let body: serde_json::Value = match req.json().await {
+            Ok(b) => b,
+            Err(_) => {
+                // Unparseable body: ack (200) so a malformed event is not retried forever.
+                console_error!("arcade-callback: unparseable JSON body");
+                return Response::from_json(&serde_json::json!({ "ok": true, "processed": 0 }));
+            }
+        };
+        let db = env.d1("DB").map_err(|e| Error::from(e.to_string()))?;
+        let blobs = env.bucket("BLOBS").map_err(|e| Error::from(e.to_string()))?;
+        let outcome = arcade_callback::handle(&env, &db, &blobs, body).await;
+        return Response::from_json(&outcome);
     }
 
     // Monitor status — aggregate counts only, no PII

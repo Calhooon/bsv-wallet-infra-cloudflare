@@ -1521,7 +1521,7 @@ fn read_varint_at(data: &[u8], pos: usize) -> Option<(u64, usize)> {
 }
 
 /// Store a proof from the ProofService: insert proven_tx, update proven_tx_req and transactions.
-async fn store_proof_result(
+pub(crate) async fn store_proof_result(
     db: &D1Database,
     blobs: &worker::Bucket,
     txid: &str,

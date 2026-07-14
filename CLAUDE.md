@@ -33,6 +33,7 @@ Cron (*/5 min) → lib.rs (scheduled) → monitor.rs → proof reconciliation + 
 - **storage/** — D1 + R2 operations. One file per JSON-RPC method that mutates state.
 - **services/** — Outbound HTTP clients (Arcade V2, ARC, WoC, Bitails, chaintracks) behind `BroadcastService` + `ProofService` traits. `selected.rs` picks the broadcaster from the `BROADCASTER` var (`arc` = `MultiProvider` ARC→WoC; `arcade` = `arcade.rs` Arcade V2 — EF-only submit, SSE verdict gated on SEEN_ON_NETWORK, ARC/WoC fallback on OUTAGE only, rejects fail hard; typo = hard STOP). Proofs always ride `MultiProvider`.
 - **monitor.rs** — Cron monitor: fetches missing proofs, re-broadcasts unconfirmed txs, fails abandoned actions, reconciles status mismatches.
+- **arcade_callback.rs** — `POST /arcade/callback`: the push-native proof path (Arcade webhooks, Bearer-authed via `ARCADE_CALLBACK_TOKEN`; no token = route 404s). MINED/IMMUTABLE events → merklePath (inline or re-read from `GET /tx/{txid}`) → BUMP parsed, must contain the txid, root ChainTracks-verified → the same `store_proof_result` persistence the monitor uses. Always 200 once authed (per-tx problems fall to the monitor; Arcade retries non-2xx).
 - **d1/** — Custom query builder for D1's `JsValue` binding model + `BatchCollector` for atomic 100-statement chunks.
 
 ## Cloudflare Bindings
