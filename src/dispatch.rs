@@ -79,6 +79,9 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
         "getAnalyticsSummary" => {
             handle_get_analytics_summary(storage, params, id.clone(), auth).await
         }
+        // btc-relay #2 (additive): raw tx + BRC-74 proof as stored — lets
+        // consumers anchor internalize BEEFs without an overlay dependency.
+        "getBeefForTxid" => handle_get_beef_for_txid(storage, params, id.clone(), auth).await,
 
         // Phase 3: Heavy writers
         "abortAction" => handle_abort_action(storage, params, id.clone(), auth).await,
@@ -320,6 +323,41 @@ async fn handle_get_analytics_summary<
     let args: GetAnalyticsSummaryArgs = serde_json::from_value(args_val)?;
     let result = storage.get_analytics_summary(user_id, args).await?;
     let result_val = serde_json::to_value(&result)?;
+    Ok(serde_json::to_value(JsonRpcResponse::success(id, result_val)).unwrap())
+}
+
+async fn handle_get_beef_for_txid<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    // Auth gates the RPC; the lookup itself is not user-scoped (proofs are
+    // public chain data — same posture as the monitor's proof plane).
+    let auth = auth.ok_or_else(|| {
+        Error::ValidationError("getBeefForTxid requires authentication".to_string())
+    })?;
+    let _ = storage.resolve_auth(auth).await?;
+
+    let args_val = extract_args(&params, true);
+    let txid = args_val
+        .get("txid")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| args_val.as_str().map(str::to_string))
+        .ok_or_else(|| Error::ValidationError("getBeefForTxid: missing txid".to_string()))?;
+    if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::ValidationError(
+            "getBeefForTxid: txid must be 64 hex chars".to_string(),
+        ));
+    }
+
+    let result = storage.get_beef_for_txid(&txid).await?;
+    // Absence is an honest null, never an error — the caller decides what a
+    // wallet-unknown txid means for it.
+    let result_val = result.unwrap_or(Value::Null);
     Ok(serde_json::to_value(JsonRpcResponse::success(id, result_val)).unwrap())
 }
 

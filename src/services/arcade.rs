@@ -1,12 +1,12 @@
 //! Arcade V2 broadcast provider (the ARC successor, Teranode-native).
 //!
 //! The pure core (BEEF→EF batch conversion + the SSE verdict discipline) is ported from
-//! the maintainer's mainnet-proven reqwest/tokio implementation — adapted here to this
+//! the mainnet-proven `dkls-agent` implementation (repo `Calgooon/bsv-mpt`,
+//! `crates/dkls-agent/src/arcade.rs`, proven TXID 8847f74c…) — adapted here to this
 //! crate's `BroadcastService` error taxonomy and to the `worker` Fetch transport
-//! (streaming body read for SSE).
+//! (streaming body read for SSE) instead of reqwest/tokio.
 //!
-//! The verified Arcade V2 facts this module encodes (empirically verified against the
-//! live endpoint + the `github.com/bsv-blockchain/arcade` source, 2026-07-10):
+//! The verified Arcade V2 facts this module encodes (ARCADE-V2-INTEGRATION.md, 2026-07-10):
 //!   • **EF only** — Arcade rejects EVERY BEEF form (V1/V2/Atomic → 400). Submit Extended
 //!     Format (BRC-30); every UNMINED ancestor in the BEEF must be individually converted
 //!     (dependency order) and submitted — interior chain TXs no longer "ride along" inside
@@ -165,7 +165,9 @@ pub fn beef_to_ef_batch(beef_hex: &str) -> std::result::Result<(Vec<EfTx>, Strin
             input.source_transaction = Some(Box::new(src.clone()));
         }
 
-        let ef = tx.to_ef().map_err(|e| format!("Arcade EF: {txid}: {e:?}"))?;
+        let ef = tx
+            .to_ef()
+            .map_err(|e| format!("Arcade EF: {txid}: {e:?}"))?;
         efs.push((txid, ef));
     }
 
@@ -591,7 +593,10 @@ impl ArcadeProvider {
                 .await
                 .map_err(|e| format!("Arcade SSE connect failed: {e}"))?;
             if response.status_code() >= 400 {
-                return Err(format!("Arcade SSE connect HTTP {}", response.status_code()));
+                return Err(format!(
+                    "Arcade SSE connect HTTP {}",
+                    response.status_code()
+                ));
             }
             let mut stream = response
                 .stream()
@@ -615,8 +620,7 @@ impl ArcadeProvider {
         };
 
         let timeout = async {
-            worker::Delay::from(std::time::Duration::from_millis(ARCADE_VERDICT_TIMEOUT_MS))
-                .await;
+            worker::Delay::from(std::time::Duration::from_millis(ARCADE_VERDICT_TIMEOUT_MS)).await;
             Err(format!(
                 "{subject_txid} submitted but no {ARCADE_GATE_STATUS} verdict within {}s",
                 ARCADE_VERDICT_TIMEOUT_MS / 1000
@@ -702,7 +706,7 @@ pub async fn fetch_tx_record(base_url: &str, txid: &str) -> Option<serde_json::V
 }
 
 // =============================================================================
-// Tests — the pure core (ported with the code; no network, no money)
+// Tests — the pure core (ported with the code from dkls-agent; no network, no money)
 // =============================================================================
 
 #[cfg(test)]
@@ -1215,7 +1219,10 @@ mod tests {
             assert!(!is_structural_reject(retryable), "{retryable} retries");
         }
         for structural in [400u16, 401, 404, 409, 413, 422] {
-            assert!(is_structural_reject(structural), "{structural} is structural");
+            assert!(
+                is_structural_reject(structural),
+                "{structural} is structural"
+            );
         }
     }
 

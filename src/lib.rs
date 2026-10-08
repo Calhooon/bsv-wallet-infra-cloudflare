@@ -22,8 +22,8 @@ pub mod services;
 pub mod storage;
 pub mod types;
 
-use bsv_auth_cloudflare::{
-    add_cors_headers, init_panic_hook,
+use bsv_middleware_cloudflare::{
+    add_cors_headers,
     middleware::{
         auth::handle_cors_preflight, process_auth, sign_json_response, AuthMiddlewareOptions,
         AuthResult,
@@ -41,6 +41,30 @@ fn env_value(env: &Env, name: &str) -> Option<String> {
         .ok()
         .map(|s| s.to_string())
         .or_else(|| env.var(name).ok().map(|v| v.to_string()))
+}
+
+/// ChainTracker for the monitor: ChainTracks (CHAINTRACKS_URL) with WoC fallback.
+fn build_monitor_headers(env: &Env) -> crate::services::chaintracker::HeaderProvider {
+    let chaintracks_url = env
+        .var("CHAINTRACKS_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.is_empty());
+    crate::services::chaintracker::build_header_provider(
+        chaintracks_url,
+        env_value(env, "WOC_API_KEY"),
+    )
+}
+
+/// `?key=` must equal MONITOR_TRIGGER_KEY (secret or var); unset key ⇒ always refused.
+fn monitor_key_ok(env: &Env, url: &Url) -> bool {
+    let provided = url
+        .query_pairs()
+        .find(|(k, _)| k == "key")
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+    let expected = env_value(env, "MONITOR_TRIGGER_KEY").unwrap_or_default();
+    !expected.is_empty() && provided == expected
 }
 
 /// Build the env-selected broadcast/proof provider (`BROADCASTER`: absent/`arc` = today's
@@ -79,16 +103,20 @@ fn build_provider(
         _ => None,
     };
     Ok(crate::services::selected::SelectedProvider::with_callback(
-        choice,
-        arcade_url,
-        callback,
-        multi,
+        choice, arcade_url, callback, multi,
     ))
+}
+
+/// HTTP status and JSON body for a `process_auth` error, from the crate's own mapping
+/// (`InvalidAuthentication`/`SessionNotFound`/`Unauthorized` → 401; KV/SDK/config → 500).
+fn auth_error_parts(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> (u16, String) {
+    (e.status_code(), e.to_json())
 }
 
 #[event(fetch)]
 pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    init_panic_hook();
+    // No `init_panic_hook()`: worker 0.8's `#[wasm_bindgen(start)]` installs a logging
+    // panic hook that also flags the instance for re-init; replacing it would lose that.
 
     // CORS preflight
     if req.method() == Method::Options {
@@ -137,7 +165,9 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             }
         };
         let db = env.d1("DB").map_err(|e| Error::from(e.to_string()))?;
-        let blobs = env.bucket("BLOBS").map_err(|e| Error::from(e.to_string()))?;
+        let blobs = env
+            .bucket("BLOBS")
+            .map_err(|e| Error::from(e.to_string()))?;
         let outcome = arcade_callback::handle(&env, &db, &blobs, body).await;
         return Response::from_json(&outcome);
     }
@@ -156,18 +186,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     // next cron cycle.
     if req.path() == "/monitor/run" && req.method() == Method::Post {
         let url = req.url().map_err(|e| Error::from(e.to_string()))?;
-        let provided = url
-            .query_pairs()
-            .find(|(k, _)| k == "key")
-            .map(|(_, v)| v.to_string())
-            .unwrap_or_default();
-        let expected = env
-            .secret("MONITOR_TRIGGER_KEY")
-            .ok()
-            .map(|s| s.to_string())
-            .or_else(|| env.var("MONITOR_TRIGGER_KEY").ok().map(|v| v.to_string()))
-            .unwrap_or_default();
-        if expected.is_empty() || provided != expected {
+        if !monitor_key_ok(&env, &url) {
             let response = Response::from_json(&serde_json::json!({
                 "error": "unauthorized — set MONITOR_TRIGGER_KEY secret and pass ?key=<value>"
             }))?
@@ -176,16 +195,19 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         }
 
         let db = env.d1("DB").map_err(|e| Error::from(e.to_string()))?;
-        let blobs = env.bucket("BLOBS").map_err(|e| Error::from(e.to_string()))?;
+        let blobs = env
+            .bucket("BLOBS")
+            .map_err(|e| Error::from(e.to_string()))?;
         let provider = match build_provider(&env) {
             Ok(p) => p,
             Err(e) => {
-                let response = Response::from_json(&serde_json::json!({ "error": e }))?
-                    .with_status(500);
+                let response =
+                    Response::from_json(&serde_json::json!({ "error": e }))?.with_status(500);
                 return Ok(add_cors_headers(response));
             }
         };
-        let result = monitor::run_monitor(&db, &blobs, &provider, &provider).await;
+        let headers = build_monitor_headers(&env);
+        let result = monitor::run_monitor(&db, &blobs, &provider, &provider, &headers).await;
 
         let response = Response::from_json(&serde_json::json!({
             "sent": result.sent,
@@ -203,9 +225,67 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             "proofs_reverified": result.proofs_reverified,
             "ext_spends_scanned": result.ext_spends_scanned,
             "ext_spends_found": result.ext_spends_found,
+            "deep_sweep_checked": result.deep_sweep_checked,
+            "deep_sweep_mismatched": result.deep_sweep_mismatched,
+            "deep_sweep_repaired": result.deep_sweep_repaired,
             "errors": result.errors,
         }))?;
         return Ok(add_cors_headers(response));
+    }
+
+    // Deep reorg sweep over a height range, now — POST
+    // /monitor/reorg-sweep?key=<MONITOR_TRIGGER_KEY>&from=<h>&to=<h>. Ignores the
+    // cron cursor; at most 500 heights. Every group's root is verified against
+    // the ChainTracker and orphan groups are re-proved (monitor/deep_reorg.rs).
+    if req.path() == "/monitor/reorg-sweep" && req.method() == Method::Post {
+        let url = req.url().map_err(|e| Error::from(e.to_string()))?;
+        if !monitor_key_ok(&env, &url) {
+            let response = Response::from_json(&serde_json::json!({
+                "error": "unauthorized — set MONITOR_TRIGGER_KEY secret and pass ?key=<value>"
+            }))?
+            .with_status(401);
+            return Ok(add_cors_headers(response));
+        }
+        let param = |name: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == name)
+                .and_then(|(_, v)| v.parse::<u32>().ok())
+        };
+        let (Some(from), Some(to)) = (param("from"), param("to")) else {
+            let response = Response::from_json(&serde_json::json!({
+                "error": "from and to (block heights) are required"
+            }))?
+            .with_status(400);
+            return Ok(add_cors_headers(response));
+        };
+        if to < from {
+            let response =
+                Response::from_json(&serde_json::json!({ "error": "to must be >= from" }))?
+                    .with_status(400);
+            return Ok(add_cors_headers(response));
+        }
+        let db = env.d1("DB").map_err(|e| Error::from(e.to_string()))?;
+        let blobs = env
+            .bucket("BLOBS")
+            .map_err(|e| Error::from(e.to_string()))?;
+        let provider = match build_provider(&env) {
+            Ok(p) => p,
+            Err(e) => {
+                let response =
+                    Response::from_json(&serde_json::json!({ "error": e }))?.with_status(500);
+                return Ok(add_cors_headers(response));
+            }
+        };
+        let headers = build_monitor_headers(&env);
+        let out =
+            monitor::deep_reorg::deep_reorg_sweep_range(&db, &blobs, &provider, &headers, from, to)
+                .await;
+        let mut body = out.to_json();
+        body["from"] = serde_json::json!(from);
+        body["to"] = serde_json::json!(
+            to.min(from.saturating_add(monitor::deep_reorg::DEEP_SWEEP_RANGE_MAX_HEIGHTS - 1))
+        );
+        return Ok(add_cors_headers(Response::from_json(&body)?));
     }
 
     // Debug: raw WoC TSC proof probe — GET /monitor/probe-woc?txid=<txid>&key=<MONITOR_TRIGGER_KEY>
@@ -217,16 +297,25 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             .find(|(k, _)| k == "key")
             .map(|(_, v)| v.to_string())
             .unwrap_or_default();
-        let expected = env.secret("MONITOR_TRIGGER_KEY").ok().map(|s| s.to_string()).unwrap_or_default();
+        let expected = env
+            .secret("MONITOR_TRIGGER_KEY")
+            .ok()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         if expected.is_empty() || provided != expected {
             return Ok(add_cors_headers(
                 Response::from_json(&serde_json::json!({"error":"unauthorized"}))?.with_status(401),
             ));
         }
-        let txid = url.query_pairs().find(|(k, _)| k == "txid").map(|(_, v)| v.to_string()).unwrap_or_default();
+        let txid = url
+            .query_pairs()
+            .find(|(k, _)| k == "txid")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
         if txid.len() != 64 {
             return Ok(add_cors_headers(
-                Response::from_json(&serde_json::json!({"error":"txid must be 64-char hex"}))?.with_status(400),
+                Response::from_json(&serde_json::json!({"error":"txid must be 64-char hex"}))?
+                    .with_status(400),
             ));
         }
         let woc_key = env.secret("WOC_API_KEY").ok().map(|s| s.to_string());
@@ -237,9 +326,16 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             let _ = headers.set("woc-api-key", key);
             init.with_headers(headers);
         }
-        let url_str = format!("https://api.whatsonchain.com/v1/bsv/main/tx/{}/proof/tsc", txid);
-        let request = worker::Request::new_with_init(&url_str, &init).map_err(|e| Error::from(e.to_string()))?;
-        let mut response = worker::Fetch::Request(request).send().await.map_err(|e| Error::from(e.to_string()))?;
+        let url_str = format!(
+            "https://api.whatsonchain.com/v1/bsv/main/tx/{}/proof/tsc",
+            txid
+        );
+        let request = worker::Request::new_with_init(&url_str, &init)
+            .map_err(|e| Error::from(e.to_string()))?;
+        let mut response = worker::Fetch::Request(request)
+            .send()
+            .await
+            .map_err(|e| Error::from(e.to_string()))?;
         let status = response.status_code();
         let body = response.text().await.unwrap_or_default();
         return Ok(add_cors_headers(Response::from_json(&serde_json::json!({
@@ -287,9 +383,21 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     };
 
     // Process auth (handles BRC-31 handshake + session validation)
-    let auth_result = process_auth(req, &env, &auth_options)
-        .await
-        .map_err(|e| Error::from(e.to_string()))?;
+    // A refusal (bad signature, header identity not the session's, replayed or
+    // missing nonce) is the crate's status + error JSON — a 401 tells the client to
+    // re-handshake; an opaque 500 would strand it until the session TTL.
+    let auth_result = match process_auth(req, &env, &auth_options).await {
+        Ok(r) => r,
+        Err(e) => {
+            let (status, body) = auth_error_parts(&e);
+            if status >= 500 {
+                console_error!("auth: {}", e);
+            }
+            let resp = Response::from_bytes(body.into_bytes())?.with_status(status);
+            resp.headers().set("Content-Type", "application/json")?;
+            return Ok(add_cors_headers(resp));
+        }
+    };
 
     let (auth_context, req, session, request_body) = match auth_result {
         AuthResult::Authenticated {
@@ -371,8 +479,8 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     let provider = match build_provider(&env) {
         Ok(p) => p,
         Err(e) => {
-            let response = Response::from_json(&serde_json::json!({ "error": e }))?
-                .with_status(500);
+            let response =
+                Response::from_json(&serde_json::json!({ "error": e }))?.with_status(500);
             return Ok(add_cors_headers(response));
         }
     };
@@ -382,7 +490,12 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     let internalize_zero_conf = env
         .var("INTERNALIZE_ZERO_CONF")
         .ok()
-        .map(|v| matches!(v.to_string().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .map(|v| {
+            matches!(
+                v.to_string().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
         .unwrap_or(false);
 
     let mut storage = StorageD1::new(&db, &blobs, &provider)
@@ -432,10 +545,11 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
             return;
         }
     };
-    let result = monitor::run_monitor(&db, &blobs, &provider, &provider).await;
+    let headers = build_monitor_headers(&env);
+    let result = monitor::run_monitor(&db, &blobs, &provider, &provider, &headers).await;
 
     console_log!(
-        "Monitor: {} sent, {} send errors, {} proofs found, {} checked, {} abandoned failed, {} status synced, {} beef compacted, {} unfail recovered, {} purged, {} nosend found, reorg={} depth={} reverified={}, ext_spends {}/{} scanned/found, {} errors",
+        "Monitor: {} sent, {} send errors, {} proofs found, {} checked, {} abandoned failed, {} status synced, {} beef compacted, {} unfail recovered, {} purged, {} nosend found, reorg={} depth={} reverified={}, ext_spends {}/{} scanned/found, deep_sweep {}/{}/{} checked/mismatched/repaired, {} errors",
         result.sent,
         result.send_errors,
         result.proofs_found,
@@ -451,9 +565,78 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
         result.proofs_reverified,
         result.ext_spends_scanned,
         result.ext_spends_found,
+        result.deep_sweep_checked,
+        result.deep_sweep_mismatched,
+        result.deep_sweep_repaired,
         result.errors.len()
     );
     for err in &result.errors {
         console_error!("Monitor error: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auth_error_parts;
+    use bsv_middleware_cloudflare::AuthCloudflareError;
+
+    fn parts(e: AuthCloudflareError) -> (u16, serde_json::Value) {
+        let (status, body) = auth_error_parts(&e);
+        (
+            status,
+            serde_json::from_str(&body).expect("error body is JSON"),
+        )
+    }
+
+    /// The crate's general path refuses a header identity that is not the session's
+    /// with exactly this error (`process_auth_with_storage`, before the signature
+    /// check). It must leave the worker as a 401 so the client re-handshakes.
+    #[test]
+    fn identity_not_the_sessions_is_a_401_with_the_crates_error_json() {
+        let (status, body) = parts(AuthCloudflareError::InvalidAuthentication(
+            "Message identity key is not the session's".into(),
+        ));
+        assert_eq!(status, 401);
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["code"], "ERR_INVALID_AUTH");
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("Message identity key is not the session's"));
+    }
+
+    #[test]
+    fn bad_signature_and_unauthenticated_session_are_401() {
+        for msg in ["Invalid message signature", "Session not authenticated"] {
+            let (status, body) = parts(AuthCloudflareError::InvalidAuthentication(msg.into()));
+            assert_eq!(status, 401, "{msg}");
+            assert_eq!(body["code"], "ERR_INVALID_AUTH");
+        }
+    }
+
+    #[test]
+    fn session_not_found_and_unauthorized_are_401() {
+        let (status, body) = parts(AuthCloudflareError::SessionNotFound("n".into()));
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (401, Some("ERR_SESSION_NOT_FOUND"))
+        );
+        let (status, body) = parts(AuthCloudflareError::Unauthorized);
+        assert_eq!((status, body["code"].as_str()), (401, Some("UNAUTHORIZED")));
+    }
+
+    /// Infrastructure failures stay 5xx: a KV outage must not tell every client
+    /// to re-handshake into the same outage.
+    #[test]
+    fn infrastructure_errors_stay_500() {
+        for e in [
+            AuthCloudflareError::KvError("429".into()),
+            AuthCloudflareError::SdkError("x".into()),
+            AuthCloudflareError::ConfigError("bad key".into()),
+        ] {
+            let (status, body) = parts(e);
+            assert_eq!(status, 500);
+            assert_eq!(body["status"], "error");
+        }
     }
 }

@@ -69,8 +69,13 @@ struct WocSpentTxResponse {
 /// error (ambiguous — the caller must count it as a service error and take
 /// NO action on the output).
 pub(crate) fn parse_spent_response(text: &str) -> std::result::Result<SpentStatus, String> {
-    let parsed: WocSpentTxResponse = serde_json::from_str(text)
-        .map_err(|e| format!("WoC spent-status parse: {} (body: {:?})", e, &text[..text.len().min(120)]))?;
+    let parsed: WocSpentTxResponse = serde_json::from_str(text).map_err(|e| {
+        format!(
+            "WoC spent-status parse: {} (body: {:?})",
+            e,
+            &text[..text.len().min(120)]
+        )
+    })?;
     if parsed.txid.is_empty() {
         return Err("WoC spent-status: 200 with empty spending txid".to_string());
     }
@@ -472,8 +477,8 @@ impl ProofService for WocProvider {
                     init.with_headers(headers);
                     init.with_body(Some(worker::wasm_bindgen::JsValue::from_str(&body_str)));
 
-                    let request = worker::Request::new_with_init(&url, &init)
-                        .map_err(|e| e.to_string())?;
+                    let request =
+                        worker::Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
                     let mut response = match worker::Fetch::Request(request).send().await {
                         Ok(r) => r,
                         Err(e) => {
@@ -668,7 +673,11 @@ async fn fetch_tsc_proof(
         let status = response.status_code();
         let has_key = api_key.is_some();
         if status == 404 {
-            worker::console_log!("WoC TSC proof {}: 404 not-yet-mined (has_key={})", txid, has_key);
+            worker::console_log!(
+                "WoC TSC proof {}: 404 not-yet-mined (has_key={})",
+                txid,
+                has_key
+            );
             return Ok(Vec::new());
         }
         if RetryConfig::is_retryable_status(status) && attempt < retry.max_retries {
@@ -682,7 +691,13 @@ async fn fetch_tsc_proof(
         }
         if status >= 400 {
             let body = response.text().await.unwrap_or_default();
-            worker::console_log!("WoC TSC proof {}: HTTP {} body={} has_key={}", txid, status, &body[..body.len().min(120)], has_key);
+            worker::console_log!(
+                "WoC TSC proof {}: HTTP {} body={} has_key={}",
+                txid,
+                status,
+                &body[..body.len().min(120)],
+                has_key
+            );
             return Err(format!("WoC proof API error {}", status));
         }
 

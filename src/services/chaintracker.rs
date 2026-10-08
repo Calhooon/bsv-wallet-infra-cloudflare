@@ -807,7 +807,8 @@ mod tests {
 
     #[test]
     fn test_build_header_provider_with_url() {
-        let provider = build_header_provider(Some("https://chaintracks.example.com".to_string()), None);
+        let provider =
+            build_header_provider(Some("https://chaintracks.example.com".to_string()), None);
         assert!(matches!(
             provider,
             HeaderProvider::ChainTracksWithFallback(_)
@@ -1004,8 +1005,8 @@ mod tests {
     //
     // These tests cover the exact failure mode that killed the 2026-04-12
     // two-agent handshake E2E: primary ChainTracks returned an error (the
-    // old TS chaintracks deployment was 200-OK'ing with empty `value` at
-    // recent heights), and the WoC fallback then 500'd. We need to guarantee:
+    // old api.calhouninfra.com was 200-OK'ing with empty `value` at recent
+    // heights), and the WoC fallback then 500'd. We need to guarantee:
     //
     //   1. When primary errors, the fallback is still consulted
     //   2. The fallback's result is returned (even if primary failed)

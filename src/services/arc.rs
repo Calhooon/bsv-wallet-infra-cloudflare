@@ -414,12 +414,7 @@ async fn arc_broadcast_with_failover(
                 }
             }
             Err(e) => {
-                worker::console_log!(
-                    "BENCH arc.post_tx[{},err]: {:.0} ms ({})",
-                    host,
-                    post_ms,
-                    e
-                );
+                worker::console_log!("BENCH arc.post_tx[{},err]: {:.0} ms ({})", host, post_ms, e);
                 errors.push(format!("{}: {}", host, e));
             }
         }

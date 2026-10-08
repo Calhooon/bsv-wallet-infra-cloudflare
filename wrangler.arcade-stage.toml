@@ -1,0 +1,47 @@
+# STAGING copy for the Arcade V2 migration proof (2026-07-13) — its OWN worker name and
+# its OWN fresh D1/R2/KV. NEVER point this at the prod D1/R2/KV: the staging books are a
+# throwaway fixture. Deploy: npx wrangler deploy -c wrangler.arcade-stage.toml
+# Secrets to set (all THROWAWAY except the API keys):
+#   SERVER_PRIVATE_KEY (fresh — never the prod one), MONITOR_TRIGGER_KEY,
+#   ARC_API_KEY (fallback drills), WOC_API_KEY (rate-limit bypass)
+name = "wallet-infra-arcade-stage"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+account_id = "<your-account-id>"
+workers_dev = true
+
+[vars]
+# btc-relay #56 fix 15: MUST be the custom domain — same-account
+# worker-to-worker fetches to *.workers.dev are blocked by Cloudflare
+# (error 1042 class; the monitor's currentHeight was failing and silently
+# falling back to WoC). Verified live: /currentHeight answers on the domain.
+CHAINTRACKS_URL = "https://chaintracks.calhouninfra.com"
+BEEF_VERIFICATION = "strict"
+INTERNALIZE_ZERO_CONF = "true"
+# The migration under test: Arcade V2 primary, ARC/WoC fallback on OUTAGE only.
+BROADCASTER = "arcade"
+ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
+# Webhook proof delivery: Arcade POSTs status (+ MINED merklePath) here, Bearer-authed
+# with the ARCADE_CALLBACK_TOKEN secret. Both must be set for registration to happen.
+ARCADE_CALLBACK_URL = "https://wallet-infra-arcade-stage.dev-a3e.workers.dev/arcade/callback"
+
+[build]
+command = "cargo install -q --version ^0.8 worker-build && worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "wallet-infra-arcade-stage"
+database_id = "<your-d1-database-id>"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "wallet-infra-arcade-stage-blobs"
+
+[[kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "<your-account-id>"
+
+# Cron intentionally OFF: staging is a drill fixture — an idle */5 monitor would
+# just burn WoC anon rate-limit quota alongside prod. Re-add for monitor drills.
+# [triggers]
+# crons = ["*/5 * * * *"]

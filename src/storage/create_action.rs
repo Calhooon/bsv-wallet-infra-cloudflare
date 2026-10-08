@@ -733,12 +733,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
     /// (G2 failure path only). Best-effort read — if the diagnostic query
     /// itself fails, return a generic reason rather than masking the original
     /// unavailability error.
-    async fn diagnose_unavailable_input(
-        &self,
-        user_id: i64,
-        txid: &str,
-        vout: i64,
-    ) -> String {
+    async fn diagnose_unavailable_input(&self, user_id: i64, txid: &str, vout: i64) -> String {
         #[derive(Deserialize)]
         struct DiagRow {
             spendable: Option<f64>,
@@ -805,6 +800,27 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
     /// - R2 BlobStore fallback when the D1 hex column is NULL (blob overflow >4KB)
     /// - `console_log!` instead of `tracing::`
     /// - `HeaderProvider` enum instead of `&dyn ChainTracker`
+    ///
+    /// `getBeefForTxid` (btc-relay #2): expose the unified tx+proof lookup
+    /// as a read RPC. Returns the raw tx and its BRC-74 merkle path exactly
+    /// as stored (3-tier: proven_txs → transactions → proven_tx_reqs, with
+    /// R2 blob fallback), so a consumer can anchor a minimal Atomic BEEF
+    /// without rebuilding ancestry from an overlay. Proofs are public chain
+    /// data — the lookup is deliberately NOT user-scoped (auth still gates
+    /// the RPC itself). No network fallback: this reports what the wallet
+    /// KNOWS; absence is an honest answer, not a trigger for side effects.
+    pub(crate) async fn get_beef_for_txid(&self, txid: &str) -> Result<Option<serde_json::Value>> {
+        let Some(data) = self.get_tx_with_proof(txid).await? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::json!({
+            "txid": txid,
+            "rawTx": hex::encode(&data.raw_tx),
+            "merklePath": data.merkle_path.as_ref().map(hex::encode),
+            "proven": data.merkle_path.is_some(),
+        })))
+    }
+
     pub(crate) async fn build_input_beef(&self, input_txids: &[String]) -> Result<Option<Vec<u8>>> {
         if input_txids.is_empty() {
             return Ok(None);
@@ -814,9 +830,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         let mut processed_txids: HashSet<String> = HashSet::new();
 
         for txid in input_txids {
-            if !processed_txids.contains(txid)
-                && !pending_txids.iter().any(|(t, _)| t == txid)
-            {
+            if !processed_txids.contains(txid) && !pending_txids.iter().any(|(t, _)| t == txid) {
                 pending_txids.push((txid.clone(), 0));
             }
         }
@@ -854,7 +868,9 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         .path
                         .first()
                         .map(|level0| {
-                            level0.iter().any(|l| l.txid && l.hash.as_deref() == Some(&txid))
+                            level0
+                                .iter()
+                                .any(|l| l.txid && l.hash.as_deref() == Some(&txid))
                         })
                         .unwrap_or(false);
                 if !correct {
@@ -867,7 +883,9 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                             .path
                             .first()
                             .map(|level0| {
-                                level0.iter().any(|l| l.txid && l.hash.as_deref() == Some(&txid))
+                                level0
+                                    .iter()
+                                    .any(|l| l.txid && l.hash.as_deref() == Some(&txid))
                             })
                             .unwrap_or(false);
                         if hit {
@@ -920,25 +938,37 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     let mut reason = String::from("unknown");
                     'check: {
                         if !sr.missing_inputs.is_empty() {
-                            reason = format!("missing_inputs={:?}", &sr.missing_inputs[..sr.missing_inputs.len().min(3)]);
+                            reason = format!(
+                                "missing_inputs={:?}",
+                                &sr.missing_inputs[..sr.missing_inputs.len().min(3)]
+                            );
                             break 'check;
                         }
                         if !sr.not_valid.is_empty() {
-                            reason = format!("not_valid={:?}", &sr.not_valid[..sr.not_valid.len().min(3)]);
+                            reason = format!(
+                                "not_valid={:?}",
+                                &sr.not_valid[..sr.not_valid.len().min(3)]
+                            );
                             break 'check;
                         }
                         if !sr.with_missing_inputs.is_empty() {
-                            reason = format!("with_missing_inputs={:?}", &sr.with_missing_inputs[..sr.with_missing_inputs.len().min(3)]);
+                            reason = format!(
+                                "with_missing_inputs={:?}",
+                                &sr.with_missing_inputs[..sr.with_missing_inputs.len().min(3)]
+                            );
                             break 'check;
                         }
                         // Check 1: duplicate root at same height across bumps
-                        let mut roots_by_height: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+                        let mut roots_by_height: std::collections::HashMap<u32, String> =
+                            std::collections::HashMap::new();
                         for bump in &beef.bumps {
                             for leaf in &bump.path[0] {
                                 if leaf.txid {
                                     if let Some(ref hash) = leaf.hash {
                                         if let Ok(r) = bump.compute_root(Some(hash)) {
-                                            if let Some(existing) = roots_by_height.get(&bump.block_height) {
+                                            if let Some(existing) =
+                                                roots_by_height.get(&bump.block_height)
+                                            {
                                                 if existing != &r {
                                                     reason = format!("bump_root_conflict height={} existing={} new={}", bump.block_height, existing, r);
                                                     break 'check;
@@ -955,20 +985,31 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         for tx in &beef.txs {
                             if let Some(bump_idx) = tx.bump_index() {
                                 if bump_idx >= beef.bumps.len() {
-                                    reason = format!("bump_index_oob tx={} idx={} bumps={}", tx.txid(), bump_idx, beef.bumps.len());
+                                    reason = format!(
+                                        "bump_index_oob tx={} idx={} bumps={}",
+                                        tx.txid(),
+                                        bump_idx,
+                                        beef.bumps.len()
+                                    );
                                     break 'check;
                                 }
                                 if !beef.bumps[bump_idx].contains(&tx.txid()) {
                                     let txid_str = tx.txid();
-                                    let bump_heights: Vec<u32> = beef.bumps.iter().map(|b| b.block_height).collect();
-                                    let actual_idx: Option<usize> = beef.bumps.iter().position(|b| b.contains(&txid_str));
+                                    let bump_heights: Vec<u32> =
+                                        beef.bumps.iter().map(|b| b.block_height).collect();
+                                    let actual_idx: Option<usize> =
+                                        beef.bumps.iter().position(|b| b.contains(&txid_str));
                                     let claimed_leaves: Vec<String> = beef.bumps[bump_idx]
-                                        .path.first()
-                                        .map(|level0| level0.iter()
-                                            .filter(|l| l.txid)
-                                            .filter_map(|l| l.hash.clone())
-                                            .take(3)
-                                            .collect())
+                                        .path
+                                        .first()
+                                        .map(|level0| {
+                                            level0
+                                                .iter()
+                                                .filter(|l| l.txid)
+                                                .filter_map(|l| l.hash.clone())
+                                                .take(3)
+                                                .collect()
+                                        })
                                         .unwrap_or_default();
                                     reason = format!(
                                         "bump_missing_txid tx={} claimed_bump_idx={} claimed_bump_height={} actual_bump_idx={:?} bump_heights={:?} claimed_leaves_sample={:?}",
@@ -984,7 +1025,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                             }
                         }
                         // Check 3: dependency order (input not yet seen)
-                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
                         for bump in &beef.bumps {
                             for leaf in &bump.path[0] {
                                 if leaf.txid {
@@ -999,7 +1041,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                                 if !seen.contains(input_txid) {
                                     reason = format!(
                                         "dep_order tx={} missing_input={} position=?",
-                                        tx.txid(), input_txid
+                                        tx.txid(),
+                                        input_txid
                                     );
                                     break 'check;
                                 }
@@ -1019,9 +1062,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                             summary
                         );
                     } else {
-                        return Err(Error::ValidationError(
-                            format!("inputBEEF: BEEF structure is invalid ({})", summary),
-                        ));
+                        return Err(Error::ValidationError(format!(
+                            "inputBEEF: BEEF structure is invalid ({})",
+                            summary
+                        )));
                     }
                 }
 
@@ -1276,9 +1320,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
         if let Some(r) = row {
             let id = r.transaction_id.map(|v| v as i64).unwrap_or(0);
-            let raw_tx =
-                decode_blob_with_r2(&store, "transactions", id, "raw_tx", r.raw_tx_hex.as_deref())
-                    .await?;
+            let raw_tx = decode_blob_with_r2(
+                &store,
+                "transactions",
+                id,
+                "raw_tx",
+                r.raw_tx_hex.as_deref(),
+            )
+            .await?;
             let input_beef = decode_blob_with_r2(
                 &store,
                 "transactions",
@@ -1516,7 +1565,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         }
 
         // Skip mode → never discard stored BEEFs due to tracker mismatch.
-        if matches!(self.beef_verification_mode, crate::types::BeefVerificationMode::Skip) {
+        if matches!(
+            self.beef_verification_mode,
+            crate::types::BeefVerificationMode::Skip
+        ) {
             return true;
         }
 
@@ -1603,7 +1655,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             _ => None,
         };
 
-        Ok(Some(BeefTxData { raw_tx, merkle_path }))
+        Ok(Some(BeefTxData {
+            raw_tx,
+            merkle_path,
+        }))
     }
 }
 
@@ -2793,17 +2848,17 @@ mod tests {
     fn bfs_queue_is_fifo_not_lifo() {
         // The reference uses `pending_txids.first().cloned() + remove(0)` — FIFO.
         // Our previous DFS used `pending.pop()` which was LIFO. Regression guard.
-        let mut pending: Vec<(String, usize)> = vec![
-            ("a".into(), 0),
-            ("b".into(), 0),
-            ("c".into(), 0),
-        ];
+        let mut pending: Vec<(String, usize)> =
+            vec![("a".into(), 0), ("b".into(), 0), ("c".into(), 0)];
         let mut order = Vec::new();
         while let Some((t, _)) = pending.first().cloned() {
             pending.remove(0);
             order.push(t);
         }
-        assert_eq!(order, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            order,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]
@@ -2883,7 +2938,10 @@ mod tests {
         tx.extend_from_slice(&0u32.to_le_bytes()); // locktime
 
         let txids = parse_input_txids(&tx);
-        assert!(txids.is_empty(), "coinbase inputs must not enter the BFS queue");
+        assert!(
+            txids.is_empty(),
+            "coinbase inputs must not enter the BFS queue"
+        );
     }
 
     // =========================================================================
@@ -2903,9 +2961,9 @@ mod tests {
         fn decode_d1_only(hex: Option<&str>) -> Result<Option<Vec<u8>>> {
             if let Some(h) = hex {
                 if !h.is_empty() {
-                    return hex::decode(h).map(Some).map_err(|e| {
-                        Error::InternalError(format!("bad hex: {}", e))
-                    });
+                    return hex::decode(h)
+                        .map(Some)
+                        .map_err(|e| Error::InternalError(format!("bad hex: {}", e)));
                 }
             }
             Ok(None)
@@ -3074,18 +3132,19 @@ mod tests {
 
     #[test]
     fn chunking_splits_small_collection_into_one_query() {
-        let unproven_txids: Vec<String> =
-            (0..100).map(|i| format!("txid{:02}", i)).collect();
+        let unproven_txids: Vec<String> = (0..100).map(|i| format!("txid{:02}", i)).collect();
         let n_chunks = unproven_txids.chunks(400).count();
         assert_eq!(n_chunks, 1, "100 txids should be one chunk");
     }
 
     #[test]
     fn chunking_splits_500_into_two_queries() {
-        let unproven_txids: Vec<String> =
-            (0..500).map(|i| format!("txid{:04}", i)).collect();
+        let unproven_txids: Vec<String> = (0..500).map(|i| format!("txid{:04}", i)).collect();
         let n_chunks = unproven_txids.chunks(400).count();
-        assert_eq!(n_chunks, 2, "500 txids: one chunk of 400 + one chunk of 100");
+        assert_eq!(
+            n_chunks, 2,
+            "500 txids: one chunk of 400 + one chunk of 100"
+        );
 
         let sizes: Vec<usize> = unproven_txids.chunks(400).map(|c| c.len()).collect();
         assert_eq!(sizes, vec![400, 100]);
@@ -3093,8 +3152,7 @@ mod tests {
 
     #[test]
     fn chunking_handles_exactly_400() {
-        let unproven_txids: Vec<String> =
-            (0..400).map(|i| format!("txid{:04}", i)).collect();
+        let unproven_txids: Vec<String> = (0..400).map(|i| format!("txid{:04}", i)).collect();
         let n_chunks = unproven_txids.chunks(400).count();
         assert_eq!(n_chunks, 1);
     }

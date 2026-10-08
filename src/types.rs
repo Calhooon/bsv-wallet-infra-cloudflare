@@ -234,6 +234,37 @@ pub struct StorageInternalizeActionResult {
     pub satoshis: i64,
     pub send_with_results: Option<Vec<SendWithResult>>,
     pub not_delayed_results: Option<Vec<ReviewActionResult>>,
+    /// NON-NORMATIVE debug hints (btc-relay #56 fix 13; conformance note):
+    /// the ecosystem protocol expresses merge no-ops by SILENCE — the real
+    /// client mechanism is a read-back (listOutputs) after internalize,
+    /// which conforming clients (the btc-beacon worker) perform. These
+    /// fields exist purely so operators can see a 0-row merge in logs;
+    /// no client behavior may depend on them. merged:false = the guarded
+    /// UPDATE changed 0 rows (relinquished/terminal row).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub merge_results: Option<Vec<MergeResult>>,
+    /// NON-NORMATIVE debug hint (see merge_results): Some(true) iff any
+    /// requested merge changed 0 rows.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub noop: Option<bool>,
+}
+
+/// One output's merge outcome (#56 fix 13).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeResult {
+    pub output_index: u32,
+    pub merged: bool,
+}
+
+/// Pure (unit-tested): the top-level noop flag — Some(true) iff any
+/// requested merge changed 0 rows; absent otherwise (never a noisy false).
+pub fn merge_noop(results: &[MergeResult]) -> Option<bool> {
+    if results.iter().any(|r| !r.merged) {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 // =============================================================================
@@ -860,5 +891,123 @@ mod tests {
         assert_eq!(statuses[0], TransactionStatus::Completed);
         assert_eq!(statuses[1], TransactionStatus::Failed);
         assert_eq!(args.no_raw_tx, Some(true));
+    }
+
+    // ---- btc-relay #56 fixes 13/14: honest internalize results -----------------
+
+    #[test]
+    fn merge_noop_fires_only_when_a_merge_changed_zero_rows() {
+        use super::{merge_noop, MergeResult};
+        assert_eq!(merge_noop(&[]), None);
+        assert_eq!(
+            merge_noop(&[MergeResult {
+                output_index: 0,
+                merged: true
+            }]),
+            None,
+            "clean merges stay quiet"
+        );
+        assert_eq!(
+            merge_noop(&[
+                MergeResult {
+                    output_index: 0,
+                    merged: true
+                },
+                MergeResult {
+                    output_index: 1,
+                    merged: false
+                },
+            ]),
+            Some(true),
+            "any 0-row merge surfaces as noop:true"
+        );
+    }
+
+    #[test]
+    fn internalize_result_serializes_the_new_honesty_fields_camel_case() {
+        use super::{MergeResult, StorageInternalizeActionResult};
+        // Merge no-op simulation: the NON-NORMATIVE debug hints reach the
+        // wire with the toolbox's camelCase names (protocol expresses merge
+        // no-ops by silence; clients rely on read-back, never these).
+        let r = StorageInternalizeActionResult {
+            accepted: true,
+            is_merge: true,
+            txid: "ab".repeat(32),
+            satoshis: 5_000,
+            send_with_results: None,
+            not_delayed_results: None,
+            merge_results: Some(vec![MergeResult {
+                output_index: 1,
+                merged: false,
+            }]),
+            noop: Some(true),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["accepted"], serde_json::json!(true));
+        assert_eq!(v["mergeResults"][0]["outputIndex"], serde_json::json!(1));
+        assert_eq!(v["mergeResults"][0]["merged"], serde_json::json!(false));
+        assert_eq!(v["noop"], serde_json::json!(true));
+        assert!(
+            v.get("outputsDemoted").is_none(),
+            "the private flag is GONE (canonical fields instead)"
+        );
+        // And a clean result omits them entirely (no noisy nulls — old
+        // clients see the exact pre-#56 shape).
+        let clean = StorageInternalizeActionResult {
+            accepted: true,
+            is_merge: false,
+            txid: "cd".repeat(32),
+            satoshis: 1,
+            send_with_results: None,
+            not_delayed_results: None,
+            merge_results: None,
+            noop: None,
+        };
+        let v = serde_json::to_value(&clean).unwrap();
+        assert!(v.get("mergeResults").is_none());
+        assert!(v.get("noop").is_none());
+    }
+
+    #[test]
+    fn demotion_is_expressed_via_the_canonical_toolbox_fields() {
+        use super::{
+            ReviewActionResult, ReviewActionResultStatus, SendWithResult,
+            StorageInternalizeActionResult,
+        };
+        // Conformance pin (wallet-toolbox WalletStorage.interfaces.ts:272-303
+        // + sdk/types.ts SendWithResultStatus): the ServiceError demotion
+        // rides sendWithResults 'unproven' + notDelayedResults
+        // 'serviceError' — exactly what a TS wallet's
+        // throwIfUnsuccessfulInternalizeAction tolerates.
+        let txid = "ef".repeat(32);
+        let r = StorageInternalizeActionResult {
+            accepted: true,
+            is_merge: false,
+            txid: txid.clone(),
+            satoshis: 7_000,
+            send_with_results: Some(vec![SendWithResult {
+                txid: txid.clone(),
+                status: "unproven".into(),
+            }]),
+            not_delayed_results: Some(vec![ReviewActionResult {
+                txid: txid.clone(),
+                status: ReviewActionResultStatus::ServiceError,
+                competing_txs: None,
+                competing_beef: None,
+            }]),
+            merge_results: None,
+            noop: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["sendWithResults"][0]["txid"], serde_json::json!(txid));
+        assert_eq!(
+            v["sendWithResults"][0]["status"],
+            serde_json::json!("unproven")
+        );
+        assert_eq!(
+            v["notDelayedResults"][0]["status"],
+            serde_json::json!("serviceError")
+        );
+        assert_eq!(v["notDelayedResults"][0]["txid"], serde_json::json!(txid));
     }
 }

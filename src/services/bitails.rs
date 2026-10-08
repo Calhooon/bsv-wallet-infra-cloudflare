@@ -161,9 +161,7 @@ impl ProofService for BitailsProvider {
     }
 }
 
-async fn fetch_bitails_tsc_proof(
-    txid: &str,
-) -> std::result::Result<Option<WocTscProof>, String> {
+async fn fetch_bitails_tsc_proof(txid: &str) -> std::result::Result<Option<WocTscProof>, String> {
     let url = format!("{}/tx/{}/proof/tsc", BITAILS_BASE, txid);
     let mut init = worker::RequestInit::new();
     init.with_method(worker::Method::Get);

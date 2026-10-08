@@ -330,9 +330,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         // of blowing up the D1 1MB row limit on multi-input drain/consolidate
         // txs. tx_id is known here so single-phase works.
         let store = crate::r2::BlobStore::new(self.blobs);
-        let (raw_tx_d1, _) = store
-            .put("transactions", tx_id, "raw_tx", raw_tx)
-            .await?;
+        let (raw_tx_d1, _) = store.put("transactions", tx_id, "raw_tx", raw_tx).await?;
         batch.add(
             "UPDATE transactions SET txid = ?, status = ?, raw_tx = ?, input_beef = NULL, updated_at = ? WHERE transaction_id = ?",
             vec![
@@ -442,7 +440,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             // (nullable, potentially huge) goes through BlobStore.
             let req_ib_d1 = match input_beef_bytes.as_deref() {
                 Some(bytes) => {
-                    store.put("proven_tx_reqs", req_id, "input_beef", bytes).await?.0
+                    store
+                        .put("proven_tx_reqs", req_id, "input_beef", bytes)
+                        .await?
+                        .0
                 }
                 None => None,
             };

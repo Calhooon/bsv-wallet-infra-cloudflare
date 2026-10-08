@@ -65,20 +65,30 @@ impl<'de> serde::Deserialize<'de> for OutputRef {
             }
 
             fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<Self::Value, E> {
-                let dot = s.rfind('.').ok_or_else(|| de::Error::custom("missing '.' in outpoint string"))?;
+                let dot = s
+                    .rfind('.')
+                    .ok_or_else(|| de::Error::custom("missing '.' in outpoint string"))?;
                 let txid = &s[..dot];
                 let vout: u32 = s[dot + 1..].parse().map_err(de::Error::custom)?;
-                Ok(OutputRef { txid: txid.to_string(), vout })
+                Ok(OutputRef {
+                    txid: txid.to_string(),
+                    vout,
+                })
             }
 
-            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> std::result::Result<Self::Value, M::Error> {
+            fn visit_map<M: MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
                 let mut txid = None;
                 let mut vout = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "txid" => txid = Some(map.next_value()?),
                         "vout" => vout = Some(map.next_value()?),
-                        _ => { let _ = map.next_value::<serde::de::IgnoredAny>()?; }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
                     }
                 }
                 Ok(OutputRef {
@@ -240,7 +250,10 @@ mod tests {
         // bsv-rs SDK serializes Outpoint as "txid.vout"
         let val = json!("aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb.0");
         let oref: OutputRef = serde_json::from_value(val).unwrap();
-        assert_eq!(oref.txid, "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb");
+        assert_eq!(
+            oref.txid,
+            "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb"
+        );
         assert_eq!(oref.vout, 0);
     }
 

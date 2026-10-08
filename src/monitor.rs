@@ -13,6 +13,9 @@
 //! 10. `scan_external_spends` — (G5) detect tracked outputs spent on-chain OUTSIDE
 //!     wallet-infra (e.g. a blackjack stake consumed by an escrow covenant) and
 //!     mark them `spendable = 0`
+//! 11. `deep_reorg_sweep` — verify EVERY stored proof's merkle root against the
+//!     ChainTracker, 40 heights per run on a wrapping cursor; re-prove orphans
+//!     (see `deep_reorg.rs`)
 
 #[cfg(test)]
 use bsv_sdk::transaction::MerklePathLeaf;
@@ -23,7 +26,10 @@ use worker::*;
 
 use crate::d1::batch::BatchCollector;
 use crate::d1::{QVal, Query};
+use crate::services::chaintracker::HeaderService;
 use crate::services::{BroadcastService, ProofService, SpentStatus};
+
+pub mod deep_reorg;
 
 // NOTE: the old `MAX_PROOF_ATTEMPTS = 12 → invalid` predicate lived here. Its
 // comment claimed reference alignment ("Go default is 10 attempts") — that
@@ -113,8 +119,7 @@ const EXT_SPEND_SWEEP_COOLDOWN_MINUTES: i64 = 10;
 /// must still be marked. The scan never WRITES `reserved_until` either.
 ///
 /// Paged by `output_id > ?` cursor, `LIMIT ?` (= EXT_SPEND_BATCH).
-pub(crate) const EXT_SPEND_CANDIDATES_SQL: &str =
-    "SELECT o.output_id, o.txid, o.vout \
+pub(crate) const EXT_SPEND_CANDIDATES_SQL: &str = "SELECT o.output_id, o.txid, o.vout \
      FROM outputs o \
      JOIN transactions t ON o.transaction_id = t.transaction_id \
      WHERE o.output_id > ? \
@@ -129,8 +134,7 @@ pub(crate) const EXT_SPEND_CANDIDATES_SQL: &str =
 /// Runs every monitor tick (even while the sweep is parked) so recently
 /// created outputs — the ones external spenders actually consume — have a
 /// detection latency of one cron interval instead of one sweep period.
-pub(crate) const EXT_SPEND_HOT_CANDIDATES_SQL: &str =
-    "SELECT o.output_id, o.txid, o.vout \
+pub(crate) const EXT_SPEND_HOT_CANDIDATES_SQL: &str = "SELECT o.output_id, o.txid, o.vout \
      FROM outputs o \
      JOIN transactions t ON o.transaction_id = t.transaction_id \
      WHERE o.spendable = 1 \
@@ -163,8 +167,7 @@ pub(crate) const EXT_SPEND_MARK_SQL: &str =
 /// as `'chain_height'`, but UPDATEd in place (single row in steady state;
 /// INSERT only fires the first time). `event_id DESC` tiebreak because
 /// `created_at` has second granularity.
-pub(crate) const EXT_SPEND_CURSOR_READ_SQL: &str =
-    "SELECT details FROM monitor_events \
+pub(crate) const EXT_SPEND_CURSOR_READ_SQL: &str = "SELECT details FROM monitor_events \
      WHERE event = 'external_spend_cursor' \
      ORDER BY created_at DESC, event_id DESC LIMIT 1";
 
@@ -553,7 +556,10 @@ fn parse_ext_spend_cursor(details: &str) -> ExtSpendCursor {
         Err(_) => return ExtSpendCursor::default(),
     };
     ExtSpendCursor {
-        last_output_id: v.get("last_output_id").and_then(|x| x.as_i64()).unwrap_or(0),
+        last_output_id: v
+            .get("last_output_id")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0),
         sweep_completed_at: v
             .get("sweep_completed_at")
             .and_then(|x| x.as_str())
@@ -610,6 +616,12 @@ pub struct MonitorResult {
     pub ext_spends_scanned: u32,
     /// Task 10 (G5): outputs found externally spent and marked spendable=0.
     pub ext_spends_found: u32,
+    /// Task 11: proof groups (height, block_hash, merkle_root) verified this run.
+    pub deep_sweep_checked: u32,
+    /// Task 11: groups whose root is NOT canonical for their height.
+    pub deep_sweep_mismatched: u32,
+    /// Task 11: rows rewritten with a verified canonical proof.
+    pub deep_sweep_repaired: u32,
     pub errors: Vec<String>,
 }
 
@@ -617,11 +629,12 @@ pub struct MonitorResult {
 // Main orchestrator
 // =============================================================================
 
-pub async fn run_monitor<B: BroadcastService, P: ProofService>(
+pub async fn run_monitor<B: BroadcastService, P: ProofService, H: HeaderService>(
     db: &D1Database,
     blobs: &worker::Bucket,
     broadcast: &B,
     proof_service: &P,
+    headers: &H,
 ) -> MonitorResult {
     let mut result = MonitorResult {
         sent: 0,
@@ -639,6 +652,9 @@ pub async fn run_monitor<B: BroadcastService, P: ProofService>(
         proofs_reverified: 0,
         ext_spends_scanned: 0,
         ext_spends_found: 0,
+        deep_sweep_checked: 0,
+        deep_sweep_mismatched: 0,
+        deep_sweep_repaired: 0,
         errors: Vec::new(),
     };
 
@@ -653,7 +669,7 @@ pub async fn run_monitor<B: BroadcastService, P: ProofService>(
     }
 
     // Task 2: Check for proofs
-    match check_for_proofs(db, blobs, proof_service).await {
+    match check_for_proofs(db, blobs, proof_service, headers).await {
         Ok((found, checked, proof_errors)) => {
             result.proofs_found = found;
             result.proofs_checked = checked;
@@ -691,7 +707,7 @@ pub async fn run_monitor<B: BroadcastService, P: ProofService>(
 
     // Task 5: Unfail transactions (runs every ~10 min — when minute is divisible by 10)
     if Utc::now().minute() % 10 < 5 {
-        match unfail_transactions(db, blobs, proof_service).await {
+        match unfail_transactions(db, blobs, proof_service, headers).await {
             Ok((recovered, unfail_errors)) => {
                 result.unfail_recovered = recovered;
                 result.errors.extend(unfail_errors);
@@ -715,7 +731,7 @@ pub async fn run_monitor<B: BroadcastService, P: ProofService>(
 
     // Task 7: Check nosend transactions for external mining (daily at midnight UTC)
     if Utc::now().hour() == 0 && Utc::now().minute() == 0 {
-        match check_no_sends(db, blobs, proof_service).await {
+        match check_no_sends(db, blobs, proof_service, headers).await {
             Ok((found, nosend_errors)) => {
                 result.nosend_found = found;
                 result.errors.extend(nosend_errors);
@@ -742,6 +758,22 @@ pub async fn run_monitor<B: BroadcastService, P: ProofService>(
             result.errors.extend(scan_errors);
         }
         Err(e) => result.errors.push(format!("scan_external_spends: {}", e)),
+    }
+
+    // Task 11: Deep reorg sweep — every cycle; bounded to DEEP_SWEEP_MAX_HEIGHTS
+    // header lookups (ChainTracks first), get_proof only for orphan groups.
+    match deep_reorg::deep_reorg_sweep(db, blobs, proof_service, headers).await {
+        Ok(out) => {
+            result.deep_sweep_checked = out.pairs_checked;
+            result.deep_sweep_mismatched = out.mismatched;
+            result.deep_sweep_repaired = out.repaired;
+            result.errors.extend(
+                out.errors
+                    .into_iter()
+                    .map(|e| format!("deep_reorg_sweep: {e}")),
+            );
+        }
+        Err(e) => result.errors.push(format!("deep_reorg_sweep: {}", e)),
     }
 
     // Log to monitor_events table
@@ -978,10 +1010,11 @@ async fn send_waiting<B: BroadcastService>(
 // Task 2: Check for proofs (proof-only, no broadcasting)
 // =============================================================================
 
-async fn check_for_proofs<P: ProofService>(
+async fn check_for_proofs<P: ProofService, H: HeaderService>(
     db: &D1Database,
     blobs: &worker::Bucket,
     proof_service: &P,
+    headers: &H,
 ) -> Result<(u32, u32, Vec<String>)> {
     // Reset per-run caches (e.g. WocProvider's block hash→header cache).
     // Prevents stale cache entries from bleeding across monitor ticks if
@@ -1010,7 +1043,10 @@ async fn check_for_proofs<P: ProofService>(
         }
         Ok(h) => Some(h),
         Err(e) => {
-            console_error!("check_for_proofs: tip unavailable ({}) — attempt clock frozen", e);
+            console_error!(
+                "check_for_proofs: tip unavailable ({}) — attempt clock frozen",
+                e
+            );
             None
         }
     };
@@ -1229,16 +1265,27 @@ async fn check_for_proofs<P: ProofService>(
                         continue;
                     }
                 }
-                // Proof found — store it
-                if let Err(e) =
-                    store_proof_result(db, blobs, &txid, req_id, &row.raw_tx, &proof_result).await
+                // Proof found — store it (store-time root gate may refuse it;
+                // the req stays pending and is re-fetched next cycle).
+                match store_proof_result(
+                    db,
+                    blobs,
+                    headers,
+                    &txid,
+                    req_id,
+                    &row.raw_tx,
+                    &proof_result,
+                )
+                .await
                 {
-                    console_error!("store_proof({}) failed: {}", txid, e);
-                    if proof_errors.len() < 3 {
-                        proof_errors.push(format!("store({}):{}", &txid[..8], e));
+                    Err(e) => {
+                        console_error!("store_proof({}) failed: {}", txid, e);
+                        if proof_errors.len() < 3 {
+                            proof_errors.push(format!("store({}):{}", &txid[..8], e));
+                        }
                     }
-                } else {
-                    found += 1;
+                    Ok(true) => found += 1,
+                    Ok(false) => {}
                 }
             }
             Ok(None) => {
@@ -1284,13 +1331,14 @@ async fn check_for_proofs<P: ProofService>(
     Ok((found, checked, proof_errors))
 }
 
-/// Chain-truth escalation for a req the network has reported "unknown" for
-/// >= UNKNOWN_ESCALATION_ATTEMPTS block-clocked attempts (the tx should have
-/// been SEEN by now if the original broadcast propagated).
+/// Chain-truth escalation for a req the network has reported "unknown" for at
+/// least UNKNOWN_ESCALATION_ATTEMPTS block-clocked attempts (the tx should
+/// have been SEEN by now if the original broadcast propagated).
 ///
 /// Evidence gathering (positive signals only — see decide_escalation):
 ///   1. Re-poll the txid status (kills triage-drift races).
 ///   2. Check each input outpoint's spent-status.
+///
 /// Verdicts:
 ///   * ConfirmedDoubleSpend — an input is consumed by a DIFFERENT
 ///     network-known tx: req 'doubleSpend', tx 'failed', inputs released,
@@ -1354,7 +1402,7 @@ async fn escalate_unknown_req<P: ProofService>(
     // that the conflicting spend exists).
     if let EscalationVerdict::ConfirmedDoubleSpend { spending_txid } = &verdict {
         let spender_known = proof_service
-            .get_status_for_txids(&[spending_txid.clone()])
+            .get_status_for_txids(std::slice::from_ref(spending_txid))
             .await
             .ok()
             .and_then(|v| v.into_iter().next())
@@ -1521,14 +1569,23 @@ fn read_varint_at(data: &[u8], pos: usize) -> Option<(u64, usize)> {
 }
 
 /// Store a proof from the ProofService: insert proven_tx, update proven_tx_req and transactions.
-pub(crate) async fn store_proof_result(
+///
+/// Store-time gate (Task 11): the proof's root is verified for its height via
+/// the ChainTracker BEFORE anything is written. `Ok(false)` = refused (not
+/// canonical / path does not prove the txid) — nothing stored, the req stays
+/// pending and the next cycle re-fetches. Tracker outage → stored as before.
+pub(crate) async fn store_proof_result<H: HeaderService>(
     db: &D1Database,
     blobs: &worker::Bucket,
+    headers: &H,
     txid: &str,
     req_id: i64,
     raw_tx_hex: &Option<String>,
     proof_result: &crate::services::ProofResult,
-) -> Result<()> {
+) -> Result<bool> {
+    let Some(facts) = gated_proof_facts(headers, txid, proof_result, "store_proof").await else {
+        return Ok(false);
+    };
     let now = Utc::now().to_rfc3339();
 
     // Decode raw_tx from hex back to bytes for proven_txs.raw_tx
@@ -1555,9 +1612,10 @@ pub(crate) async fn store_proof_result(
     let _ = blobs; // unused on this path
     let _ = Query::new(
         "INSERT INTO proven_txs (txid, height, idx, block_hash, merkle_root, merkle_path, raw_tx, created_at, updated_at) \
-         VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(txid) DO UPDATE SET \
            height = excluded.height, \
+           idx = excluded.idx, \
            block_hash = excluded.block_hash, \
            merkle_root = excluded.merkle_root, \
            merkle_path = excluded.merkle_path, \
@@ -1565,9 +1623,10 @@ pub(crate) async fn store_proof_result(
            updated_at = excluded.updated_at",
     )
     .bind(txid)
-    .bind(proof_result.block_height as i64)
+    .bind(facts.height as i64)
+    .bind(facts.idx as i64)
     .bind(proof_result.block_hash.as_str())
-    .bind(proof_result.merkle_root.as_str())
+    .bind(facts.root.as_str())
     .bind(QVal::Blob(merkle_path_binary.clone()))
     .bind(QVal::Blob(raw_tx_bytes))
     .bind(now.as_str())
@@ -1578,13 +1637,12 @@ pub(crate) async fn store_proof_result(
 
     // After UPSERT, look up the row to get proven_tx_id (may be the
     // existing row's id, not last_row_id which is 0 on UPDATE path).
-    let id_row: Option<ProvenTxIdOnlyRow> = Query::new(
-        "SELECT proven_tx_id FROM proven_txs WHERE txid = ?",
-    )
-    .bind(txid)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| Error::from(e.to_string()))?;
+    let id_row: Option<ProvenTxIdOnlyRow> =
+        Query::new("SELECT proven_tx_id FROM proven_txs WHERE txid = ?")
+            .bind(txid)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| Error::from(e.to_string()))?;
     let proven_tx_id = id_row
         .and_then(|r| r.proven_tx_id.map(|v| v as i64))
         .unwrap_or(0);
@@ -1638,7 +1696,41 @@ pub(crate) async fn store_proof_result(
         txid,
         proof_result.block_height,
     );
-    Ok(())
+    Ok(true)
+}
+
+/// Shared store-time gate for both proven_txs INSERT paths. `None` = do not
+/// store (logged once here). Otherwise the path's own height/idx/root, which
+/// are what BEEF verification will recompute — the provider's `merkle_root`
+/// is '' for ARC proofs, so the computed root also fills that gap.
+async fn gated_proof_facts<H: HeaderService>(
+    headers: &H,
+    txid: &str,
+    proof: &crate::services::ProofResult,
+    path: &str,
+) -> Option<deep_reorg::PathFacts> {
+    match deep_reorg::gate_proof_for_store(headers, txid, proof).await {
+        deep_reorg::StoreGate::Store(f) => Some(f),
+        deep_reorg::StoreGate::StoreUnverified(f, e) => {
+            console_log!(
+                "{}: root for {} unverified (tracker unavailable: {}) — storing as before",
+                path,
+                txid,
+                e
+            );
+            Some(f)
+        }
+        deep_reorg::StoreGate::Reject(why) => {
+            console_error!(
+                "{}: REFUSED proof for {} at h={} — {} (retry next cycle)",
+                path,
+                txid,
+                proof.block_height,
+                why
+            );
+            None
+        }
+    }
 }
 
 /// Advance the block-clocked attempt counter. PURE COUNTER: attempts feed
@@ -1647,15 +1739,13 @@ pub(crate) async fn store_proof_result(
 /// was one of the two false-FAIL predicates — deleted, not tuned).
 async fn increment_attempts(db: &D1Database, req_id: i64, current_attempts: i64) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    Query::new(
-        "UPDATE proven_tx_reqs SET attempts = ?, updated_at = ? WHERE proven_tx_req_id = ?",
-    )
-    .bind(current_attempts + 1)
-    .bind(now.as_str())
-    .bind(req_id)
-    .execute(db)
-    .await
-    .map_err(|e| Error::from(e.to_string()))?;
+    Query::new("UPDATE proven_tx_reqs SET attempts = ?, updated_at = ? WHERE proven_tx_req_id = ?")
+        .bind(current_attempts + 1)
+        .bind(now.as_str())
+        .bind(req_id)
+        .execute(db)
+        .await
+        .map_err(|e| Error::from(e.to_string()))?;
     Ok(())
 }
 
@@ -2111,10 +2201,11 @@ async fn compact_beef(db: &D1Database, blobs: &worker::Bucket) -> Result<u32> {
 /// 2. Check chain for merkle proof via ProofService
 /// 3. If proof found: insert proven_tx, complete the req, complete the tx, re-enable outputs
 /// 4. If no proof: mark the req as 'invalid', don't touch tx or outputs
-async fn unfail_transactions<P: ProofService>(
+async fn unfail_transactions<P: ProofService, H: HeaderService>(
     db: &D1Database,
     blobs: &worker::Bucket,
     proof_service: &P,
+    headers: &H,
 ) -> Result<(u32, Vec<String>)> {
     let rows: Vec<UnfailRow> = Query::new(
         "SELECT proven_tx_req_id, txid, hex(raw_tx) as raw_tx \
@@ -2143,16 +2234,30 @@ async fn unfail_transactions<P: ProofService>(
         match proof_service.get_proof(&txid).await {
             Ok(Some(proof_result)) => {
                 // Proof found — tx IS mined on-chain. Store proof and restore everything.
-                if let Err(e) =
-                    store_unfail_proof(db, blobs, proof_service, &txid, req_id, &row.raw_tx, &proof_result).await
+                match store_unfail_proof(
+                    db,
+                    blobs,
+                    proof_service,
+                    headers,
+                    &txid,
+                    req_id,
+                    &row.raw_tx,
+                    &proof_result,
+                )
+                .await
                 {
-                    console_error!("unfail store_proof({}) failed: {}", txid, e);
-                    if errors.len() < 3 {
-                        errors.push(format!("unfail({}):{}", &txid[..txid.len().min(8)], e));
+                    Err(e) => {
+                        console_error!("unfail store_proof({}) failed: {}", txid, e);
+                        if errors.len() < 3 {
+                            errors.push(format!("unfail({}):{}", &txid[..txid.len().min(8)], e));
+                        }
                     }
-                } else {
-                    recovered += 1;
-                    console_log!("Unfail recovered: txid={}", txid);
+                    // Refused by the store-time root gate: retried next cycle.
+                    Ok(false) => {}
+                    Ok(true) => {
+                        recovered += 1;
+                        console_log!("Unfail recovered: txid={}", txid);
+                    }
                 }
             }
             Ok(None) => {
@@ -2163,7 +2268,7 @@ async fn unfail_transactions<P: ProofService>(
                 // watching it (proof lag must never re-fail it).
                 let now = Utc::now().to_rfc3339();
                 let net_status = proof_service
-                    .get_status_for_txids(&[txid.clone()])
+                    .get_status_for_txids(std::slice::from_ref(&txid))
                     .await
                     .ok()
                     .and_then(|v| v.into_iter().next())
@@ -2268,20 +2373,38 @@ async fn unfail_transactions<P: ProofService>(
         }
         match proof_service.get_proof(&txid).await {
             Ok(Some(proof_result)) => {
-                if let Err(e) =
-                    store_unfail_proof(db, blobs, proof_service, &txid, req_id, &row.raw_tx, &proof_result).await
+                match store_unfail_proof(
+                    db,
+                    blobs,
+                    proof_service,
+                    headers,
+                    &txid,
+                    req_id,
+                    &row.raw_tx,
+                    &proof_result,
+                )
+                .await
                 {
-                    console_error!("auto-unfail store_proof({}) failed: {}", txid, e);
-                    if errors.len() < 3 {
-                        errors.push(format!("auto-unfail({}):{}", &txid[..txid.len().min(8)], e));
+                    Err(e) => {
+                        console_error!("auto-unfail store_proof({}) failed: {}", txid, e);
+                        if errors.len() < 3 {
+                            errors.push(format!(
+                                "auto-unfail({}):{}",
+                                &txid[..txid.len().min(8)],
+                                e
+                            ));
+                        }
                     }
-                } else {
-                    recovered += 1;
-                    canary_hits.push(txid.clone());
-                    console_error!(
-                        "CANARY: false-failed tx WAS MINED — recovered txid={}",
-                        txid
-                    );
+                    // Refused by the store-time root gate: retried next cycle.
+                    Ok(false) => {}
+                    Ok(true) => {
+                        recovered += 1;
+                        canary_hits.push(txid.clone());
+                        console_error!(
+                            "CANARY: false-failed tx WAS MINED — recovered txid={}",
+                            txid
+                        );
+                    }
                 }
             }
             Ok(None) => {
@@ -2291,7 +2414,7 @@ async fn unfail_transactions<P: ProofService>(
                 // books lying until a proof shows up.
                 let now = Utc::now().to_rfc3339();
                 let net_status = proof_service
-                    .get_status_for_txids(&[txid.clone()])
+                    .get_status_for_txids(std::slice::from_ref(&txid))
                     .await
                     .ok()
                     .and_then(|v| v.into_iter().next())
@@ -2377,12 +2500,7 @@ async fn unfail_transactions<P: ProofService>(
 /// outputs matching the tx's input outpoints get `spendable=0, spent_by=<tx>`.
 /// The fail path had released them; with the tx back in the books they are
 /// factually consumed (TS TaskUnFail.ts:118-129 parity; audit M4).
-async fn remark_inputs_spent(
-    db: &D1Database,
-    txid: &str,
-    raw_tx_hex: &Option<String>,
-    now: &str,
-) {
+async fn remark_inputs_spent(db: &D1Database, txid: &str, raw_tx_hex: &Option<String>, now: &str) {
     let outpoints = raw_tx_hex
         .as_ref()
         .and_then(|h| hex::decode(h).ok())
@@ -2420,15 +2538,22 @@ async fn remark_inputs_spent(
 ///
 /// Similar to `store_proof_result` but specific to the unfail flow — the transaction
 /// was previously 'failed', so we restore it to 'completed' and re-enable outputs.
-async fn store_unfail_proof<P: ProofService>(
+#[allow(clippy::too_many_arguments)]
+async fn store_unfail_proof<P: ProofService, H: HeaderService>(
     db: &D1Database,
     blobs: &worker::Bucket,
     proof_service: &P,
+    headers: &H,
     txid: &str,
     req_id: i64,
     raw_tx_hex: &Option<String>,
     proof_result: &crate::services::ProofResult,
-) -> Result<()> {
+) -> Result<bool> {
+    // Store-time gate (Task 11) — same contract as store_proof_result.
+    let Some(facts) = gated_proof_facts(headers, txid, proof_result, "store_unfail_proof").await
+    else {
+        return Ok(false);
+    };
     let now = Utc::now().to_rfc3339();
 
     // Decode raw_tx from hex back to bytes for proven_txs.raw_tx
@@ -2445,9 +2570,10 @@ async fn store_unfail_proof<P: ProofService>(
     let _ = blobs;
     let _ = Query::new(
         "INSERT INTO proven_txs (txid, height, idx, block_hash, merkle_root, merkle_path, raw_tx, created_at, updated_at) \
-         VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(txid) DO UPDATE SET \
            height = excluded.height, \
+           idx = excluded.idx, \
            block_hash = excluded.block_hash, \
            merkle_root = excluded.merkle_root, \
            merkle_path = excluded.merkle_path, \
@@ -2455,9 +2581,10 @@ async fn store_unfail_proof<P: ProofService>(
            updated_at = excluded.updated_at",
     )
     .bind(txid)
-    .bind(proof_result.block_height as i64)
+    .bind(facts.height as i64)
+    .bind(facts.idx as i64)
     .bind(proof_result.block_hash.as_str())
-    .bind(proof_result.merkle_root.as_str())
+    .bind(facts.root.as_str())
     .bind(QVal::Blob(merkle_path_binary.clone()))
     .bind(QVal::Blob(raw_tx_bytes))
     .bind(now.as_str())
@@ -2466,13 +2593,12 @@ async fn store_unfail_proof<P: ProofService>(
     .await
     .map_err(|e| Error::from(e.to_string()))?;
 
-    let id_row: Option<ProvenTxIdOnlyRow> = Query::new(
-        "SELECT proven_tx_id FROM proven_txs WHERE txid = ?",
-    )
-    .bind(txid)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| Error::from(e.to_string()))?;
+    let id_row: Option<ProvenTxIdOnlyRow> =
+        Query::new("SELECT proven_tx_id FROM proven_txs WHERE txid = ?")
+            .bind(txid)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| Error::from(e.to_string()))?;
     let proven_tx_id = id_row
         .and_then(|r| r.proven_tx_id.map(|v| v as i64))
         .unwrap_or(0);
@@ -2571,7 +2697,7 @@ async fn store_unfail_proof<P: ProofService>(
         txid,
         proof_result.block_height,
     );
-    Ok(())
+    Ok(true)
 }
 
 // =============================================================================
@@ -2589,10 +2715,11 @@ async fn store_unfail_proof<P: ProofService>(
 /// 2. Check chain for merkle proof via ProofService
 /// 3. If proof found: insert proven_tx, complete the req, complete the tx, re-enable outputs
 /// 4. If no proof: do nothing — tx wasn't externally broadcast
-async fn check_no_sends<P: ProofService>(
+async fn check_no_sends<P: ProofService, H: HeaderService>(
     db: &D1Database,
     blobs: &worker::Bucket,
     proof_service: &P,
+    headers: &H,
 ) -> Result<(u32, Vec<String>)> {
     let rows: Vec<UnfailRow> = Query::new(
         "SELECT proven_tx_req_id, txid, hex(raw_tx) as raw_tx \
@@ -2621,16 +2748,30 @@ async fn check_no_sends<P: ProofService>(
         match proof_service.get_proof(&txid).await {
             Ok(Some(proof_result)) => {
                 // Proof found — tx WAS mined externally. Store proof and complete everything.
-                if let Err(e) =
-                    store_unfail_proof(db, blobs, proof_service, &txid, req_id, &row.raw_tx, &proof_result).await
+                match store_unfail_proof(
+                    db,
+                    blobs,
+                    proof_service,
+                    headers,
+                    &txid,
+                    req_id,
+                    &row.raw_tx,
+                    &proof_result,
+                )
+                .await
                 {
-                    console_error!("nosend store_proof({}) failed: {}", txid, e);
-                    if errors.len() < 3 {
-                        errors.push(format!("nosend({}):{}", &txid[..txid.len().min(8)], e));
+                    Err(e) => {
+                        console_error!("nosend store_proof({}) failed: {}", txid, e);
+                        if errors.len() < 3 {
+                            errors.push(format!("nosend({}):{}", &txid[..txid.len().min(8)], e));
+                        }
                     }
-                } else {
-                    found += 1;
-                    console_log!("NoSend mined externally: txid={}", txid);
+                    // Refused by the store-time root gate: retried next cycle.
+                    Ok(false) => {}
+                    Ok(true) => {
+                        found += 1;
+                        console_log!("NoSend mined externally: txid={}", txid);
+                    }
                 }
             }
             Ok(None) => {
@@ -2811,8 +2952,7 @@ async fn check_chain_reorg<P: ProofService>(
             );
 
             // Re-verify proofs at heights above the current tip
-            let reverified =
-                handle_reorg(db, blobs, proof_service, current_height, depth).await?;
+            let reverified = handle_reorg(db, blobs, proof_service, current_height, depth).await?;
 
             // Store the new (lower) height
             store_chain_height(db, current_height).await?;
@@ -2901,13 +3041,12 @@ async fn shallow_reorg_sweep<P: ProofService>(
         };
 
         // Read our stored block_hash
-        let stored: Option<StoredBlockHashRow> = Query::new(
-            "SELECT block_hash FROM proven_txs WHERE proven_tx_id = ?",
-        )
-        .bind(proven_tx_id)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| Error::from(e.to_string()))?;
+        let stored: Option<StoredBlockHashRow> =
+            Query::new("SELECT block_hash FROM proven_txs WHERE proven_tx_id = ?")
+                .bind(proven_tx_id)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| Error::from(e.to_string()))?;
 
         let stored_hash = match stored.and_then(|r| r.block_hash) {
             Some(h) => h,
@@ -3209,7 +3348,6 @@ struct LastProofRow {
     last_found: Option<f64>,
 }
 
-/// Returns aggregate monitor status for the dashboard (no auth needed).
 // =============================================================================
 // Task 10 (G5): Scan tracked outpoints for external (out-of-wallet) spends
 // =============================================================================
@@ -3543,6 +3681,9 @@ async fn log_monitor_event(db: &D1Database, result: &MonitorResult) -> Result<()
         "proofs_reverified": result.proofs_reverified,
         "ext_spends_scanned": result.ext_spends_scanned,
         "ext_spends_found": result.ext_spends_found,
+        "deep_sweep_checked": result.deep_sweep_checked,
+        "deep_sweep_mismatched": result.deep_sweep_mismatched,
+        "deep_sweep_repaired": result.deep_sweep_repaired,
         "errors": result.errors,
     })
     .to_string();
@@ -3580,13 +3721,15 @@ mod tests {
     fn test_beef_replay_roundtrip() {
         use bsv_sdk::transaction::Beef;
 
-        let hex_str = std::env::var("BEEF_HEX")
-            .expect("set BEEF_HEX=<hex> env var to run this test");
-        let bytes = hex::decode(hex_str.trim())
-            .expect("BEEF_HEX is not valid hex");
+        let hex_str =
+            std::env::var("BEEF_HEX").expect("set BEEF_HEX=<hex> env var to run this test");
+        let bytes = hex::decode(hex_str.trim()).expect("BEEF_HEX is not valid hex");
 
         println!("INPUT_LEN: {} bytes", bytes.len());
-        println!("INPUT_PREFIX: {}", hex::encode(&bytes[..bytes.len().min(16)]));
+        println!(
+            "INPUT_PREFIX: {}",
+            hex::encode(&bytes[..bytes.len().min(16)])
+        );
 
         let mut beef = Beef::from_binary(&bytes).expect("Beef::from_binary failed");
         println!("PARSED: {} txs, {} bumps", beef.txs.len(), beef.bumps.len());
@@ -3602,7 +3745,10 @@ mod tests {
 
         let canonical = beef.to_binary();
         println!("CANONICAL_LEN: {} bytes", canonical.len());
-        println!("CANONICAL_PREFIX: {}", hex::encode(&canonical[..canonical.len().min(16)]));
+        println!(
+            "CANONICAL_PREFIX: {}",
+            hex::encode(&canonical[..canonical.len().min(16)])
+        );
         println!("CANONICAL_HEX_BEGIN");
         println!("{}", hex::encode(&canonical));
         println!("CANONICAL_HEX_END");
@@ -4153,7 +4299,10 @@ mod tests {
                 }),
                 "Known tx must not escalate to double-spend hunting"
             );
-            if let ReqAction::Wait { count_attempt: true } = action {
+            if let ReqAction::Wait {
+                count_attempt: true,
+            } = action
+            {
                 attempts += 1;
             }
         }
@@ -4284,9 +4433,18 @@ mod tests {
     fn test_attempt_clock_is_block_clocked() {
         assert!(!attempt_counts_now(None, None), "no tip → no attempt");
         assert!(!attempt_counts_now(None, Some(100)), "no tip → no attempt");
-        assert!(attempt_counts_now(Some(100), None), "first observation counts");
-        assert!(!attempt_counts_now(Some(100), Some(100)), "same tip → no attempt");
-        assert!(attempt_counts_now(Some(101), Some(100)), "tip advanced → counts");
+        assert!(
+            attempt_counts_now(Some(100), None),
+            "first observation counts"
+        );
+        assert!(
+            !attempt_counts_now(Some(100), Some(100)),
+            "same tip → no attempt"
+        );
+        assert!(
+            attempt_counts_now(Some(101), Some(100)),
+            "tip advanced → counts"
+        );
         assert!(
             !attempt_counts_now(Some(99), Some(100)),
             "tip regression (reorg/provider flap) is not an attempt"
@@ -4302,10 +4460,20 @@ mod tests {
         let a = decide_req_action(&TriageStatus::Unknown, 1, true, true);
         assert!(matches!(a, ReqAction::Wait { .. }));
         // At/above streak with budget: escalate.
-        let a = decide_req_action(&TriageStatus::Unknown, UNKNOWN_ESCALATION_ATTEMPTS, true, true);
+        let a = decide_req_action(
+            &TriageStatus::Unknown,
+            UNKNOWN_ESCALATION_ATTEMPTS,
+            true,
+            true,
+        );
         assert!(matches!(a, ReqAction::Escalate { .. }));
         // At/above streak, budget exhausted: wait (retry next run).
-        let a = decide_req_action(&TriageStatus::Unknown, UNKNOWN_ESCALATION_ATTEMPTS, true, false);
+        let a = decide_req_action(
+            &TriageStatus::Unknown,
+            UNKNOWN_ESCALATION_ATTEMPTS,
+            true,
+            false,
+        );
         assert!(matches!(a, ReqAction::Wait { .. }));
     }
 
@@ -4324,15 +4492,17 @@ mod tests {
         // IN, not = (review H3): transactions.txid is not unique across
         // users — a scalar subquery picked an arbitrary row and could
         // strand the other user's input locks.
-        assert!(FAIL_RELEASE_INPUTS_SQL
-            .contains("WHERE spent_by IN (SELECT transaction_id FROM transactions WHERE txid = ?)"));
+        assert!(FAIL_RELEASE_INPUTS_SQL.contains(
+            "WHERE spent_by IN (SELECT transaction_id FROM transactions WHERE txid = ?)"
+        ));
         assert!(
             FAIL_RELEASE_INPUTS_SQL.contains("basket_id IS NOT NULL"),
             "must not resurrect relinquished (chain-gone) outputs"
         );
         assert!(FAIL_DERECOGNIZE_CREATED_SQL.contains("spendable = 0"));
-        assert!(FAIL_DERECOGNIZE_CREATED_SQL
-            .contains("transaction_id IN (SELECT transaction_id FROM transactions WHERE txid = ?)"));
+        assert!(FAIL_DERECOGNIZE_CREATED_SQL.contains(
+            "transaction_id IN (SELECT transaction_id FROM transactions WHERE txid = ?)"
+        ));
     }
 
     /// parse_input_outpoints: version(4) + vin count + [txid(32) vout(4)
@@ -4342,14 +4512,14 @@ mod tests {
     fn test_parse_input_outpoints() {
         let mut tx = vec![1, 0, 0, 0]; // version
         tx.push(2); // vin count
-        // input 0: prev txid internal 0x01 at byte 31 → display 01..00? build:
+                    // input 0: prev txid internal 0x01 at byte 31 → display 01..00? build:
         let mut prev0 = [0u8; 32];
         prev0[31] = 0x01; // internal LE — display begins "01"
         tx.extend_from_slice(&prev0);
         tx.extend_from_slice(&7u32.to_le_bytes()); // vout 7
         tx.push(0); // empty script
         tx.extend_from_slice(&[0xFF; 4]); // sequence
-        // input 1: coinbase (all-zero txid) — must be skipped
+                                          // input 1: coinbase (all-zero txid) — must be skipped
         tx.extend_from_slice(&[0u8; 32]);
         tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         tx.push(0);
@@ -4381,9 +4551,15 @@ mod tests {
                      AND r.updated_at < datetime('now', '-1 hour') \
                    ORDER BY r.updated_at ASC \
                    LIMIT 20";
-        assert!(!sql.contains("attempts <"), "no attempt cap on self-correction");
+        assert!(
+            !sql.contains("attempts <"),
+            "no attempt cap on self-correction"
+        );
         assert!(sql.contains("'doubleSpend'"));
-        assert!(sql.contains("datetime('now', '-1 hour')"), "hourly backoff retained");
+        assert!(
+            sql.contains("datetime('now', '-1 hour')"),
+            "hourly backoff retained"
+        );
     }
 
     // =========================================================================
@@ -4530,6 +4706,9 @@ mod tests {
             proofs_reverified: 0,
             ext_spends_scanned: 0,
             ext_spends_found: 0,
+            deep_sweep_checked: 0,
+            deep_sweep_mismatched: 0,
+            deep_sweep_repaired: 0,
             errors: Vec::new(),
         };
         assert_eq!(result.unfail_recovered, 5);
@@ -4553,6 +4732,9 @@ mod tests {
             proofs_reverified: 0,
             ext_spends_scanned: 0,
             ext_spends_found: 0,
+            deep_sweep_checked: 0,
+            deep_sweep_mismatched: 0,
+            deep_sweep_repaired: 0,
             errors: vec![],
         };
         assert_eq!(result.sent, 5);
@@ -4577,6 +4759,9 @@ mod tests {
             proofs_reverified: 0,
             ext_spends_scanned: 0,
             ext_spends_found: 0,
+            deep_sweep_checked: 0,
+            deep_sweep_mismatched: 0,
+            deep_sweep_repaired: 0,
             errors: vec!["test".to_string()],
         };
         let details = serde_json::json!({
@@ -4795,6 +4980,9 @@ mod tests {
             proofs_reverified: 0,
             ext_spends_scanned: 0,
             ext_spends_found: 0,
+            deep_sweep_checked: 0,
+            deep_sweep_mismatched: 0,
+            deep_sweep_repaired: 0,
             errors: Vec::new(),
         };
         assert_eq!(result.purged, 42);
@@ -4940,6 +5128,9 @@ mod tests {
             proofs_reverified: 0,
             ext_spends_scanned: 0,
             ext_spends_found: 0,
+            deep_sweep_checked: 0,
+            deep_sweep_mismatched: 0,
+            deep_sweep_repaired: 0,
             errors: Vec::new(),
         };
         assert_eq!(result.nosend_found, 7);
@@ -5010,6 +5201,9 @@ mod tests {
             proofs_reverified: 0,
             ext_spends_scanned: 0,
             ext_spends_found: 0,
+            deep_sweep_checked: 0,
+            deep_sweep_mismatched: 0,
+            deep_sweep_repaired: 0,
             errors: Vec::new(),
         };
         let details = serde_json::json!({
@@ -5221,6 +5415,9 @@ mod tests {
             proofs_reverified: 0,
             ext_spends_scanned: 0,
             ext_spends_found: 0,
+            deep_sweep_checked: 0,
+            deep_sweep_mismatched: 0,
+            deep_sweep_repaired: 0,
             errors: Vec::new(),
         };
         assert!(!result.reorg_detected);
@@ -5246,6 +5443,9 @@ mod tests {
             proofs_reverified: 5,
             ext_spends_scanned: 0,
             ext_spends_found: 0,
+            deep_sweep_checked: 0,
+            deep_sweep_mismatched: 0,
+            deep_sweep_repaired: 0,
             errors: Vec::new(),
         };
         assert!(result.reorg_detected);
@@ -5271,6 +5471,9 @@ mod tests {
             proofs_reverified: 7,
             ext_spends_scanned: 0,
             ext_spends_found: 0,
+            deep_sweep_checked: 0,
+            deep_sweep_mismatched: 0,
+            deep_sweep_repaired: 0,
             errors: Vec::new(),
         };
         let details = serde_json::json!({
@@ -5345,7 +5548,8 @@ mod tests {
         // The reorg batch must contain exactly: proven_txs proof-null +
         // proven_tx_reqs demote. Neither a transactions demote nor an
         // outputs clamp may reappear.
-        let proof_null_sql = "UPDATE proven_txs SET block_hash = '', merkle_root = '', merkle_path = NULL, \
+        let proof_null_sql =
+            "UPDATE proven_txs SET block_hash = '', merkle_root = '', merkle_path = NULL, \
                    updated_at = ? WHERE proven_tx_id = ?";
         assert!(proof_null_sql.contains("merkle_path = NULL"));
         assert!(
@@ -5614,7 +5818,10 @@ mod tests {
     #[test]
     fn test_ext_spend_cursor_defaults_on_garbage() {
         // A corrupt cursor must degrade to "restart sweep now", never error.
-        assert_eq!(parse_ext_spend_cursor("not json"), ExtSpendCursor::default());
+        assert_eq!(
+            parse_ext_spend_cursor("not json"),
+            ExtSpendCursor::default()
+        );
         assert_eq!(parse_ext_spend_cursor("{}"), ExtSpendCursor::default());
         assert_eq!(parse_ext_spend_cursor(""), ExtSpendCursor::default());
         assert_eq!(
@@ -5634,8 +5841,8 @@ mod tests {
     #[test]
     fn test_ext_spend_parked_within_cooldown() {
         let now = chrono::Utc::now();
-        let done = (now - chrono::Duration::minutes(EXT_SPEND_SWEEP_COOLDOWN_MINUTES - 5))
-            .to_rfc3339();
+        let done =
+            (now - chrono::Duration::minutes(EXT_SPEND_SWEEP_COOLDOWN_MINUTES - 5)).to_rfc3339();
         let c = ExtSpendCursor {
             last_output_id: 0,
             sweep_completed_at: Some(done),
@@ -5646,8 +5853,8 @@ mod tests {
     #[test]
     fn test_ext_spend_not_parked_after_cooldown() {
         let now = chrono::Utc::now();
-        let done = (now - chrono::Duration::minutes(EXT_SPEND_SWEEP_COOLDOWN_MINUTES + 5))
-            .to_rfc3339();
+        let done =
+            (now - chrono::Duration::minutes(EXT_SPEND_SWEEP_COOLDOWN_MINUTES + 5)).to_rfc3339();
         let c = ExtSpendCursor {
             last_output_id: 0,
             sweep_completed_at: Some(done),
@@ -5750,8 +5957,10 @@ mod tests {
             .unwrap();
         conn.execute_batch(include_str!("../migrations/0002_add_indexes.sql"))
             .unwrap();
-        conn.execute_batch(include_str!("../migrations/0003_add_output_reservations.sql"))
-            .unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/0003_add_output_reservations.sql"
+        ))
+        .unwrap();
 
         conn.execute_batch(
             r#"
@@ -5799,7 +6008,10 @@ mod tests {
         // Full sweep from cursor 0: exactly the free, chain-real outputs —
         // including the reserved one (reservations are orthogonal), excluding
         // relinquished / tx-locked / txid-less / unsigned / failed / nosend.
-        assert_eq!(g5_candidates(&conn, 0, EXT_SPEND_BATCH as i64), vec![1, 2, 9]);
+        assert_eq!(
+            g5_candidates(&conn, 0, EXT_SPEND_BATCH as i64),
+            vec![1, 2, 9]
+        );
     }
 
     #[test]
@@ -5816,7 +6028,10 @@ mod tests {
     fn test_g5_sqlite_mark_spent_happy_path() {
         let conn = g5_test_db();
         let changes = conn
-            .execute(EXT_SPEND_MARK_SQL, rusqlite::params!["2026-07-05T00:00:00Z", 1i64])
+            .execute(
+                EXT_SPEND_MARK_SQL,
+                rusqlite::params!["2026-07-05T00:00:00Z", 1i64],
+            )
             .unwrap();
         assert_eq!(changes, 1);
 
@@ -5839,13 +6054,15 @@ mod tests {
     fn test_g5_sqlite_mark_spent_idempotent() {
         let conn = g5_test_db();
         assert_eq!(
-            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t0", 1i64]).unwrap(),
+            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t0", 1i64])
+                .unwrap(),
             1
         );
         // Second application: guard sees spendable=0 → no-op, `changes` stays
         // an accurate found-counter.
         assert_eq!(
-            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t1", 1i64]).unwrap(),
+            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t1", 1i64])
+                .unwrap(),
             0
         );
     }
@@ -5862,11 +6079,16 @@ mod tests {
         .unwrap();
         // The write-time guard must refuse.
         assert_eq!(
-            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t0", 2i64]).unwrap(),
+            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t0", 2i64])
+                .unwrap(),
             0
         );
         let spent_by: Option<i64> = conn
-            .query_row("SELECT spent_by FROM outputs WHERE output_id = 2", [], |r| r.get(0))
+            .query_row(
+                "SELECT spent_by FROM outputs WHERE output_id = 2",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(spent_by, Some(1)); // the action's lock survives untouched
     }
@@ -5875,16 +6097,25 @@ mod tests {
     fn test_g5_sqlite_mark_spent_preserves_reservation() {
         let conn = g5_test_db();
         let before: Option<String> = conn
-            .query_row("SELECT reserved_until FROM outputs WHERE output_id = 2", [], |r| r.get(0))
+            .query_row(
+                "SELECT reserved_until FROM outputs WHERE output_id = 2",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(before.is_some()); // fixture: live reservation
 
         assert_eq!(
-            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t0", 2i64]).unwrap(),
+            conn.execute(EXT_SPEND_MARK_SQL, rusqlite::params!["t0", 2i64])
+                .unwrap(),
             1
         );
         let after: Option<String> = conn
-            .query_row("SELECT reserved_until FROM outputs WHERE output_id = 2", [], |r| r.get(0))
+            .query_row(
+                "SELECT reserved_until FROM outputs WHERE output_id = 2",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         // G4: expiry/unreserve are the ONLY reservation release paths — the
         // spent-scan marks the row but leaves the reservation bytes alone.
@@ -5901,10 +6132,12 @@ mod tests {
 
         // First persist: UPDATE misses (no row yet) → INSERT.
         assert_eq!(
-            conn.execute(EXT_SPEND_CURSOR_UPDATE_SQL, rusqlite::params![c1]).unwrap(),
+            conn.execute(EXT_SPEND_CURSOR_UPDATE_SQL, rusqlite::params![c1])
+                .unwrap(),
             0
         );
-        conn.execute(EXT_SPEND_CURSOR_INSERT_SQL, rusqlite::params![c1]).unwrap();
+        conn.execute(EXT_SPEND_CURSOR_INSERT_SQL, rusqlite::params![c1])
+            .unwrap();
 
         // Second persist: UPDATE hits in place — still exactly one row.
         let c2 = ext_spend_cursor_json(&ExtSpendCursor {
@@ -5912,7 +6145,8 @@ mod tests {
             sweep_completed_at: Some("2026-07-05T00:00:00+00:00".to_string()),
         });
         assert_eq!(
-            conn.execute(EXT_SPEND_CURSOR_UPDATE_SQL, rusqlite::params![c2]).unwrap(),
+            conn.execute(EXT_SPEND_CURSOR_UPDATE_SQL, rusqlite::params![c2])
+                .unwrap(),
             1
         );
         let (count, details): (i64, String) = conn

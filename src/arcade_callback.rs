@@ -32,7 +32,8 @@ use crate::services::chaintracker::HeaderService;
 /// The proven_tx_reqs statuses that still await a proof — mirror of the monitor's
 /// `check_for_proofs` candidate set. A webhook for any other row (already completed,
 /// failed, or unknown to these books) is acknowledged and ignored.
-const PENDING_STATUSES: &str = "('unmined', 'unknown', 'unconfirmed', 'callback', 'sending', 'reorg')";
+const PENDING_STATUSES: &str =
+    "('unmined', 'unknown', 'unconfirmed', 'callback', 'sending', 'reorg')";
 
 #[derive(serde::Deserialize)]
 struct ReqRow {
@@ -133,7 +134,8 @@ pub async fn handle(
         .ok()
         .map(|s| s.to_string())
         .or_else(|| env.var("WOC_API_KEY").ok().map(|v| v.to_string()));
-    let headers = crate::services::chaintracker::build_header_provider(chaintracks_url, woc_api_key);
+    let headers =
+        crate::services::chaintracker::build_header_provider(chaintracks_url, woc_api_key);
 
     let mut processed = 0u32;
     let mut ignored = 0u32;
@@ -260,9 +262,24 @@ async fn handle_one(
         block_hash,
         merkle_root: root,
     };
-    crate::monitor::store_proof_result(db, blobs, &ev.txid, req_id, &req.raw_tx, &proof)
-        .await
-        .map_err(|e| format!("store_proof_result: {e}"))?;
+    // store_proof_result re-runs the same root gate (a RootCache hit — no extra lookup).
+    let stored = crate::monitor::store_proof_result(
+        db,
+        blobs,
+        headers,
+        &ev.txid,
+        req_id,
+        &req.raw_tx,
+        &proof,
+    )
+    .await
+    .map_err(|e| format!("store_proof_result: {e}"))?;
+    if !stored {
+        return Err(format!(
+            "proof for {} refused by the store-time root gate",
+            ev.txid
+        ));
+    }
     console_log!(
         "arcade-callback: PROOF persisted for {} (h={}, pushed by Arcade)",
         ev.txid,
@@ -323,7 +340,11 @@ mod tests {
         }
         let body = serde_json::json!({ "txStatus": "MINED", "txids": ["short", T1] });
         let evs = unfan(&body);
-        assert_eq!(evs.len(), 1, "garbage bulk entries are dropped, good ones kept");
+        assert_eq!(
+            evs.len(),
+            1,
+            "garbage bulk entries are dropped, good ones kept"
+        );
         assert_eq!(evs[0].txid, T1);
     }
 

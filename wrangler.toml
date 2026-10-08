@@ -1,51 +1,56 @@
 name = "wallet-infra"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-01-01"
-# account_id = "<your-cloudflare-account-id>"
+account_id = "<your-account-id>"
 
-# Optional custom domain — uncomment and edit after initial deploy.
-# routes = [
-#   { pattern = "wallet-infra.example.com", custom_domain = true }
-# ]
+routes = [
+  { pattern = "wallet-infra.x402agency.com", custom_domain = true }
+]
 
 [vars]
-# Public chaintracker worker exposing /findHeaderHexForHeight.
-# Default points at the open `Calhooon/chaintracks-cloudflare` deployment;
-# replace with your own deploy if you'd rather not depend on it.
-CHAINTRACKS_URL = "https://chaintracks.example.com"
-
-# BEEF verification mode: "strict" | "log_only" | "skip"
-#   strict   — hard-reject on bad merkle root (recommended)
-#   log_only — validate + log, return BEEF anyway
-#   skip     — bypass tracker entirely (drain-time / emergency only)
+# BUG-005 FIX (2026-04-12): switched from api.calhouninfra.com (old TS
+# chaintracks, intermittently returns 200-success with empty value for
+# recent heights) to the new rust-chaintracks CF Worker, which has
+# better reliability and correctly serves findHeaderHexForHeight.
+# btc-relay #56 fix 15: MUST be the custom domain — same-account
+# worker-to-worker fetches to *.workers.dev are blocked by Cloudflare
+# (error 1042 class; the monitor's currentHeight was failing and silently
+# falling back to WoC). Verified live: /currentHeight answers on the domain.
+CHAINTRACKS_URL = "https://chaintracks.calhouninfra.com"
 BEEF_VERIFICATION = "strict"
-# Zero-conf internalize lever: "true" keeps deposited outputs spendable on a
-# transient broadcast provider error (operator-funded deployments only —
-# hard DoubleSpend/InvalidTx rejects still reject). Default off.
-INTERNALIZE_ZERO_CONF = "false"
-
-# Broadcast provider selector:
-#   unset / "arc"  = ARC primary with WoC fallback (the classic path)
-#   "arcade"       = Arcade V2 primary (Teranode-native, EF-only submit, async SSE
-#                    verdict gated on SEEN_ON_NETWORK); ARC/WoC fall back ONLY on an
-#                    Arcade OUTAGE — never on a REJECTED verdict. Any other value is a
-#                    hard configuration STOP (visible in GET / health as "broadcaster").
-# Rollback lever = flip back to "arc" + deploy. NOTE a `wrangler secret put BROADCASTER`
-# cannot shadow this [vars] entry — change it here.
-BROADCASTER = "arc"
-# ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"   # override the Arcade endpoint
-# Webhook proof delivery (push-native merkle proofs): when BOTH are set, every Arcade
-# submit registers X-CallbackUrl and Arcade POSTs status (+ the free MINED merklePath)
-# to /arcade/callback, Bearer-authed with the ARCADE_CALLBACK_TOKEN secret. The proof is
-# ChainTracks-verified before persisting; the cron monitor remains the fallback.
-# ARCADE_CALLBACK_URL = "https://<your-worker-domain>/arcade/callback"
-
-# Secrets (set via `wrangler secret put`):
-#   ARC_API_KEY — TAAL ARC API key for broadcast acceleration (optional).
-#   WOC_API_KEY — WhatsOnChain API key for fallback broadcast (optional).
+# ZERO-CONF dev lever (2026-06-08): keep a freshly-internalized deposit spendable
+# even if the internalize-time broadcast hits a transient ServiceError, removing the
+# ~1-block (~10 min) wait for the monitor to reconcile spendable. Safe for the dev
+# setup (operator funds from their own already-broadcast wallet, so the funding tx is
+# genuinely on-network; a true DoubleSpend/InvalidTx still hard-rejects upstream). The
+# monitor still fetches the proof + completes status normally. Set to "false" to
+# restore the conservative confirmation-gated behavior.
+INTERNALIZE_ZERO_CONF = "true"
+# BROADCASTER selects the broadcast provider (2026-07-13 Arcade V2 migration):
+#   unset / "arc"  = the pre-migration ARC→WoC MultiProvider path (no-regression default)
+#   "arcade"       = Arcade V2 primary (EF-only, async SSE verdict gated on
+#                    SEEN_ON_NETWORK); ARC/WoC fall back ONLY on an Arcade OUTAGE —
+#                    never on a REJECTED verdict. Any other value = hard STOP
+#                    (visible in GET / health as "broadcaster").
+# ARCADE_URL overrides the Arcade endpoint (default https://arcade-v2-us-1.bsvblockchain.tech).
+# ROLLBACK LEVER: flip this line back to "arc" + `npx wrangler deploy` (~60s; verify via
+# GET / "broadcaster"). NOTE `wrangler secret put BROADCASTER` does NOT work — a secret
+# cannot shadow a [vars] entry (staging drill 2026-07-13). Allow ~1 min after deploy for
+# old isolates to drain before reading gate checks.
+BROADCASTER = "arcade"
+# Webhook proof delivery (push-native merkle proofs): every Arcade submit registers
+# X-CallbackUrl so Arcade POSTs status (+ the free MINED merklePath) to /arcade/callback,
+# Bearer-authed with the ARCADE_CALLBACK_TOKEN secret (`wrangler secret put`). BOTH must
+# be set for registration; the proof is still ChainTracks-verified before persisting, and
+# the cron monitor remains the fallback. Unset either to disable (SSE-verdict-only).
+ARCADE_CALLBACK_URL = "https://wallet-infra.x402agency.com/arcade/callback"
 
 [build]
-command = "worker-build --release"
+# Self-pinning (the worker-build pairing trap, see the-composer
+# docs/ARCHITECTURE.md): this crate is on worker 0.8.x, which needs
+# worker-build ^0.8 — a stale 0.7.x install bricks the build with
+# "Unsupported version worker@0.8".
+command = "cargo install -q --version ^0.8 worker-build && worker-build --release"
 
 [[d1_databases]]
 binding = "DB"
@@ -58,11 +63,10 @@ bucket_name = "wallet-infra-blobs"
 
 [[kv_namespaces]]
 binding = "AUTH_SESSIONS"
-id = "<your-kv-namespace-id>"
+id = "<your-account-id>"
 
 [triggers]
-# Background monitor: re-broadcasts unconfirmed txs and reconciles state.
-# */5 minutes is the conservative cadence. Tighter cadences combined with
-# upstream rate limits (e.g. WoC 429s) can cascade — only adjust after
-# observing the failure mode.
+# 2026-04-15: reverted */2 → */5 after WoC blanket-429'd us. The */2 cadence
+# combined with 5 retries and LIMIT 1000 hammered WoC into rate-limiting.
+# */5 + LIMIT 200 + 1 retry is the conservative recovery configuration.
 crons = ["*/5 * * * *"]

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: Check, Lint, Test, Build
+    runs-on: ubuntu-latest
+
+    steps:
+      # Self-contained once bsv-middleware-cloudflare 0.3.6 is on crates.io: until
+      # then Cargo.toml path-deps a local lane worktree (TEMP, M5 #36) and CI cannot resolve it.
+      - name: Checkout rust-wallet-infra
+        uses: actions/checkout@v4
+        with:
+          path: rust-wallet-infra
+
+      # --- Rust toolchain ---
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      # --- Cache ---
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-wallet-infra/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-wallet-infra/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # --- Checks (run from the project directory) ---
+      - name: cargo fmt --check
+        working-directory: rust-wallet-infra
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: rust-wallet-infra
+        run: cargo clippy -- -D warnings
+
+      - name: cargo test
+        working-directory: rust-wallet-infra
+        run: cargo test
+
+      # --- WASM build verification ---
+      - name: Install worker-build
+        run: cargo install --version ^0.8 worker-build
+
+      - name: worker-build --release
+        working-directory: rust-wallet-infra
+        run: worker-build --release

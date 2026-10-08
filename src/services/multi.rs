@@ -61,8 +61,7 @@ impl MultiProvider {
             bitails: BitailsProvider::new()
                 .with_chaintracks_url(chaintracks_url.clone())
                 .with_woc_api_key(woc_api_key),
-            chaintracks_url: chaintracks_url
-                .map(|u| u.trim_end_matches('/').to_string()),
+            chaintracks_url: chaintracks_url.map(|u| u.trim_end_matches('/').to_string()),
         }
     }
 }

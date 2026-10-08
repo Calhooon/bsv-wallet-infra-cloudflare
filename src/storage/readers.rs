@@ -1034,7 +1034,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     satoshis: *sats,
                 })
                 .collect();
-            senders.sort_by(|a, b| b.satoshis.cmp(&a.satoshis));
+            senders.sort_by_key(|s| std::cmp::Reverse(s.satoshis));
 
             let total_revenue = senders.iter().map(|s| s.satoshis).sum();
             let total_transactions = senders.iter().map(|s| s.tx_count).sum();

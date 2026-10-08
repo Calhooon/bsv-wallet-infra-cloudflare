@@ -68,7 +68,11 @@ pub enum SelectedProvider {
 }
 
 impl SelectedProvider {
-    pub fn new(choice: BroadcasterChoice, arcade_url: Option<String>, multi: MultiProvider) -> Self {
+    pub fn new(
+        choice: BroadcasterChoice,
+        arcade_url: Option<String>,
+        multi: MultiProvider,
+    ) -> Self {
         Self::with_callback(choice, arcade_url, None, multi)
     }
 

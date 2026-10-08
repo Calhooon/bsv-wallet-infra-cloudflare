@@ -118,7 +118,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             if let Some(txid) = txid_row.and_then(|r| r.txid).filter(|t| !t.is_empty()) {
                 let net_status = self
                     .broadcast
-                    .get_status_for_txids(&[txid.clone()])
+                    .get_status_for_txids(std::slice::from_ref(&txid))
                     .await
                     .ok()
                     .and_then(|v| v.into_iter().next())
