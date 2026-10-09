@@ -12,6 +12,7 @@ pub mod arcade_callback;
 pub mod audit;
 pub mod beef_at_rest;
 pub mod bench;
+pub mod broadcast_at_rest;
 pub mod d1;
 pub mod dispatch;
 pub mod entities;

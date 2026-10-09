@@ -1,4 +1,4 @@
-// NL-7 on the compiled Worker, fully local: internalizeAction from a BEEF at
+// NL-7 and NL-7c on the compiled Worker, fully local: internalizeAction from a BEEF at
 // rest in a Miniflare R2 bucket bound as BEEF_AT_REST, through the BRC-31
 // door a client uses (@bsv/sdk's AuthFetch), with D1, KV and both buckets in
 // Miniflare. Every request the Worker makes is answered here: the header
@@ -8,8 +8,9 @@
 // worker-build --release   (worker-build ^0.8, the wrangler.toml [build] line)
 // MINIFLARE_MODULE=<miniflare>/dist/src/index.js \
 // BSV_SDK_MODULE=<@bsv/sdk>/dist/esm/mod.js node tests/worker_beef_at_rest.mjs
-import { readFileSync, readdirSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { readFileSync, readdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { resolve, join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import assert from 'node:assert/strict'
@@ -65,11 +66,29 @@ const chain = n => {
 // ---------------------------------------------------------------------------
 
 const BUCKET = 'bsv-messagebox-beefs'
+const MONITOR_KEY = 'nl7c-local'
 const out = []
 let carry = true
+// NL-7c: while `arcAnswers`, ARC takes every post (SEEN_ON_NETWORK) and each
+// is recorded: the host, the content type and length, the bytes' SHA-256.
+let arcAnswers = false
+const posts = []
 const outbound = async request => {
   const url = new URL(request.url)
   out.push(url.host + url.pathname)
+  if (arcAnswers && url.host.startsWith('arc.') && url.pathname === '/v1/tx' && request.method === 'POST') {
+    let bytes = null
+    try { bytes = Buffer.from(await request.arrayBuffer()) } catch { /* the race's loser, cancelled */ }
+    posts.push({
+      host: url.host,
+      type: request.headers.get('content-type'),
+      length: request.headers.get('content-length'),
+      bytes: bytes?.length,
+      sha: bytes && createHash('sha256').update(bytes).digest('hex'),
+    })
+    return new Response(JSON.stringify({ txid: '', txStatus: 'SEEN_ON_NETWORK' }),
+      { headers: { 'content-type': 'application/json' } })
+  }
   if (url.host === 'headers.test' && url.pathname === '/findHeaderHexForHeight') {
     const height = Number(url.searchParams.get('height'))
     const merkleRoot = carry && height === HEIGHT ? display(fundingRoot) : '00'.repeat(32)
@@ -79,7 +98,9 @@ const outbound = async request => {
   return new Response('not found', { status: 404 })
 }
 
-const mf = new Miniflare({
+// Storage on disk, so it outlives setOptions (the arcade selection, step 7).
+const persist = mkdtempSync(join(tmpdir(), 'nl7c-mf-'))
+const options = {
   modules: true,
   scriptPath: resolve('build/worker/shim.mjs'),
   modulesRules: [
@@ -96,12 +117,17 @@ const mf = new Miniflare({
     INTERNALIZE_ZERO_CONF: 'false',
     BROADCASTER: 'arc',
     BEEF_AT_REST_BUCKET: BUCKET,
+    MONITOR_TRIGGER_KEY: MONITOR_KEY,
   },
   d1Databases: ['DB'],
   kvNamespaces: ['AUTH_SESSIONS'],
   r2Buckets: ['BLOBS', 'BEEF_AT_REST'],
+  d1Persist: join(persist, 'd1'),
+  kvPersist: join(persist, 'kv'),
+  r2Persist: join(persist, 'r2'),
   outboundService: outbound,
-})
+}
+const mf = new Miniflare(options)
 
 const lines = []
 const say = line => { lines.push(line); console.log(line) }
@@ -127,7 +153,10 @@ print(json.dumps(statements))
   const atRest = await mf.getR2Bucket('BEEF_AT_REST')
   const blobs = await mf.getR2Bucket('BLOBS')
 
-  const client = new AuthFetch(new ProtoWallet(PrivateKey.fromRandom()))
+  const callerKey = PrivateKey.fromRandom()
+  const caller = callerKey.toPublicKey().toString()
+  const another = PrivateKey.fromRandom().toPublicKey().toString()
+  const client = new AuthFetch(new ProtoWallet(callerKey))
   let id = 0
   const rpc = async (method, args) => {
     const body = JSON.stringify({ jsonrpc: '2.0', method, id: ++id, params: [{ identityKey: '' }, args] })
@@ -141,9 +170,12 @@ print(json.dumps(statements))
   const outputs = [{ outputIndex: 0, protocol: 'basket insertion', insertionRemittance: { basket: 'nl7' } }]
   const internalize = (beefArg, description) =>
     rpc('internalizeAction', { ...beefArg, outputs, description, labels: [], seekPermission: false })
-  const upload = async (key, beef) => {
+  // The relay writes the recipient's identity key on every object it spools
+  // (NL-7b); `recipient` null puts an object that names nobody.
+  const upload = async (key, beef, recipient = caller) => {
+    const customMetadata = recipient === null ? {} : { 'recipient-identity-key': recipient }
     // Miniflare's proxy takes a plain Uint8Array, not a Node Buffer.
-    const object = await atRest.put(key, new Uint8Array(beef))
+    const object = await atRest.put(key, new Uint8Array(beef), { customMetadata })
     return { r2Key: key, size: beef.length, etag: object.etag, bucket: BUCKET }
   }
   const sha256 = b => createHash('sha256').update(b).digest('hex')
@@ -165,8 +197,10 @@ print(json.dumps(statements))
 
   // 2 and 3. The relay's two shapes at rest: the 100,000-link payment and the
   // first chain over the relay's 8 MiB line (DRAIN_INLINE_BYTES).
+  const paid = {}
   for (const [n, key] of [[100000, '02aa/nl7-100k.beef'], [135299, '02aa/nl7-over-8mib.beef']]) {
     const { beef, txid } = chain(n)
+    paid[n] = { beef, txid }
     const reference = await upload(key, beef)
     const t0 = Date.now()
     const r = await internalize({ beefAtRest: reference }, `NL-7 at rest, ${n} links`)
@@ -212,6 +246,35 @@ print(json.dumps(statements))
     say(`refused, the BEEF inline and at rest: ${both.error.message}`)
   }
 
+  // 4b. NL-7c: the reference is honoured only for the caller the object names.
+  // A valid payment named for another caller, and one naming nobody, are
+  // refused by reason; nothing is copied and no row is written. Bytes that
+  // are not a BEEF at all, named for another, are refused for the caller,
+  // never for the bytes: the body is not read.
+  {
+    const blobsBefore = (await blobs.list()).objects.length
+    const { beef, txid } = chain(4)
+    const garbage = Buffer.alloc(300, 0x5a)
+    for (const [name, key, bytes, recipient] of [
+      ['a payment named for another caller', '02bb/nl7c-another.beef', beef, another],
+      ['a payment that names no recipient', '02bb/nl7c-nobody.beef', beef, null],
+      ['bytes that are no BEEF, named for another', '02bb/nl7c-garbage.beef', garbage, another],
+    ]) {
+      const r = await internalize({ beefAtRest: await upload(key, bytes, recipient) }, 'NL-7c refused')
+      assert.ok(r.error, `${name}: accepted ${JSON.stringify(r).slice(0, 300)}`)
+      const words = recipient === null ? 'names no recipient' : 'names another recipient'
+      assert.ok(r.error.message.includes(words), `${name}: ${r.error.message}`)
+      assert.ok(!r.error.message.includes(another), `${name}: the refusal says whose: ${r.error.message}`)
+      say(`refused, ${name}: ${r.error.message}`)
+    }
+    assert.equal((await blobs.list()).objects.length, blobsBefore, 'a refused reference copied into BLOBS')
+    assert.equal(await db.prepare('SELECT COUNT(*) AS n FROM transactions WHERE txid = ?').bind(txid).first('n'), 0)
+    // The same payment named for the caller is accepted.
+    const r = await internalize({ beefAtRest: await upload('02aa/nl7c-mine.beef', beef) }, 'NL-7c mine')
+    assert.ok(r.result && r.result.accepted, JSON.stringify(r).slice(0, 300))
+    say(`accepted, the same payment named for the caller: ${txid}`)
+  }
+
   // 5. Invalid bytes at rest are refused at their offset, by their kind.
   {
     const { beef } = chain(5)
@@ -229,10 +292,54 @@ print(json.dumps(statements))
     say(`refused, a root the header service does not carry: ${unrooted.error.message.slice(0, 120)}`)
   }
 
+  // 7. NL-7c: the monitor posts the subject at rest, which has no proof and
+  // which the network does not know, as a stream: the stored AtomicBEEF's
+  // BEEF behind its 36-byte prefix, application/octet-stream, its length
+  // known, byte for byte; never the whole BEEF parsed, re-written and
+  // hex-encoded into JSON. The row is handed back as the escalation's
+  // Rebroadcast hands it (`unsent`). Under BROADCASTER arc, then arcade
+  // (Arcade's /tx takes no BEEF: the stream goes to ARC).
+  {
+    const { beef, txid } = paid[100000]
+    const want = { bytes: beef.length - 36, sha: sha256(beef.subarray(36)) }
+    for (const broadcaster of ['arc', 'arcade']) {
+      if (broadcaster === 'arcade') {
+        await mf.setOptions({ ...options, bindings: { ...options.bindings, BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.test' } })
+      }
+      const url = await mf.ready
+      const d1 = await mf.getD1Database('DB')
+      await d1.prepare("UPDATE proven_tx_reqs SET status = 'unsent', attempts = 0 WHERE txid = ?").bind(txid).run()
+      posts.length = 0
+      const before = out.length
+      arcAnswers = true
+      const t0 = Date.now()
+      const response = await fetch(new URL(`/monitor/run?key=${MONITOR_KEY}`, url), { method: 'POST' })
+      const ms = Date.now() - t0
+      arcAnswers = false
+      const run = await response.json()
+      assert.equal(response.status, 200, JSON.stringify(run))
+      const whole = posts.filter(p => p.bytes !== undefined)
+      assert.ok(whole.length >= 1, `${broadcaster}: no post was received: ${JSON.stringify(posts)}`)
+      for (const post of whole) {
+        assert.equal(post.type, 'application/octet-stream', `${broadcaster}: ${JSON.stringify(post)}`)
+        assert.equal(post.bytes, want.bytes, `${broadcaster}: ${JSON.stringify(post)}`)
+        assert.equal(post.sha, want.sha, `${broadcaster}: ${JSON.stringify(post)}`)
+        assert.equal(post.length, String(want.bytes), `${broadcaster}: ${JSON.stringify(post)}`)
+      }
+      assert.ok(run.sent >= 1, JSON.stringify(run).slice(0, 600))
+      const req = await d1.prepare('SELECT status FROM proven_tx_reqs WHERE txid = ?').bind(txid).first()
+      assert.equal(req.status, 'unmined')
+      const arcade = out.slice(before).filter(u => u.startsWith('arcade.test/tx'))
+      assert.deepEqual(arcade, [], `${broadcaster}: the BEEF went to Arcade's /tx`)
+      say(`monitor, ${broadcaster}: the 100000-link subject at rest posted as a stream in ${ms} ms to ${whole.map(p => p.host).join(' and ')}: application/octet-stream, content-length ${want.bytes}, byte for byte the BEEF behind the prefix; the row unmined`)
+    }
+  }
+
   // 6. The requests the Worker made: the header service and the status lookups.
   const hosts = [...new Set(out.map(u => u.split('/')[0]))].sort()
   say(`outbound hosts answered here: ${hosts.join(', ')}`)
-  console.log('Local compiled Worker GREEN (NL-7): internalizeAction takes a BEEF at rest in R2, streamed, held to its reference, refused at the offset and the kind')
+  console.log('Local compiled Worker GREEN (NL-7, NL-7c): internalizeAction takes a BEEF at rest in R2, streamed, held to its reference and to the caller the object names, refused at the offset and the kind; the monitor posts it as a stream')
 } finally {
   await mf.dispose()
+  rmSync(persist, { recursive: true, force: true })
 }

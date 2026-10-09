@@ -4,6 +4,54 @@ rust-wallet-infra is a deployed Worker, not a published crate: the version in
 `Cargo.toml` stays 0.1.0 and an entry here is named by its program and its
 date.
 
+## NL-7c, 2026-10-09: a BEEF at rest is read only for the caller the object names; the monitor posts it as a stream
+
+The two remaining items of NL-7 (bsv-stack-lean #62), before the binding
+deploys. An abuse bound, never a size.
+
+### Changed
+
+- **The caller on the object.** A `beefAtRest` reference is honoured only when
+  the object's custom metadata `recipient-identity-key` (the key the relay
+  writes on every object it spools, rust-message-box NL-7b) equals the
+  signed-in caller's BRC-31 identity key (hex, either case). The object's head
+  is read first and carries no body; the caller is held before the etag and
+  the size, so a refusal never says another caller's object's etag, size or
+  owner; the etag-conditioned get is held again before its body is handed
+  out. A missing or different key is a `-32602` by reason (`beefAtRest: the
+  object at <key> names another recipient than the caller; it is read only
+  for the caller it names`, or `names no recipient`), with no body read and
+  no copy. Objects spooled without the metadata are refused: the relay's
+  NL-7b writes it.
+- **The monitor's broadcast of a subject at rest streams.** `send_waiting`
+  reads a stored R2 `input_beef`'s 36-byte BRC-95 prefix (a ranged get); when
+  it names the row's subject, the BEEF behind it is posted to ARC as an
+  `application/octet-stream` body piped from R2 through a `FixedLengthStream`
+  (its length known), one fresh etag-conditioned body per endpoint of the
+  race, the bytes never in the Worker. ARC knows a BEEF by its marker
+  (bitcoin-sv/arc@e7efc5b6 `internal/api/handler/parsers.go:50-51`,
+  `internal/beef/beef.go:24-34`), so the AtomicBEEF prefix stays behind.
+  Arcade's `/tx` takes no BEEF (bsv-blockchain/arcade@1ae1208
+  `openapi/arcade.openapi.yaml:209-238`): under `BROADCASTER = "arcade"` the
+  stream goes to ARC too. Any other stored shape (the `createAction`
+  ancestors to merge, a BEEF in D1, another subject) takes the route it took.
+  A store that does not answer leaves the row for the next cycle, no attempt
+  counted.
+
+### Added
+
+- `beef_at_rest::{RECIPIENT_IDENTITY_KEY, hold_to}`; `src/broadcast_at_rest.rs`
+  (`StoredBeef`, `StreamBroadcast`, `post_stored`, `R2Stored`);
+  `StreamBroadcast` for ARC, `MultiProvider` and `SelectedProvider`.
+- Tests: `tests/beef_at_rest_caller.rs` (the key's name, the caller honoured,
+  another's and none refused by reason, the caller held first);
+  `tests/broadcast_at_rest.rs` (the 100,000-link payment: 212.1 MiB on the
+  base's route, 130.5 KiB streamed over two endpoints on the host, byte for
+  byte); `tests/worker_beef_at_rest.mjs` gains the caller's refusals (bytes
+  that are no BEEF, named for another, refused for the caller and never for
+  the bytes; nothing copied) and the monitor's streamed post under `arc` and
+  `arcade`, received by ARC byte for byte with its content-length.
+
 ## NL-7, 2026-10-09: `internalizeAction` takes bytes at rest
 
 The posture of the no-limits program (bsv-stack-lean
@@ -55,6 +103,7 @@ never for its size or its counts, and is read one element in hand.
   services do not know is not posted from the request (posting it would make
   the BEEF whole); it is left to the monitor as a transient fault is, and
   `INTERNALIZE_ZERO_CONF` decides whether its outputs are spendable
-  meanwhile. The monitor reads a stored `input_beef` whole when it posts.
+  meanwhile. The monitor read a stored `input_beef` whole when it posted it
+  (since NL-7c an AtomicBEEF naming its subject is posted as a stream).
 - `createAction`'s `inputBEEF` is decoded by its argument type and never read
   by the storage; no reference form is built for it.

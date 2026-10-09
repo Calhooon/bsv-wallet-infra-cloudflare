@@ -234,7 +234,7 @@ async fn handle_internalize_action<
         InternalizeParams::Inline(args) => storage.internalize_action(user_id, args).await?,
         InternalizeParams::AtRest { reference, args } => {
             storage
-                .internalize_action_at_rest(user_id, args, reference)
+                .internalize_action_at_rest(user_id, &auth.identity_key, args, reference)
                 .await?
         }
     };

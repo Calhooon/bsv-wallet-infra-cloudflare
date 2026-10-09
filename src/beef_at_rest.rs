@@ -25,7 +25,16 @@
 //! BUMP's offset, a lookup that fails is neither an acceptance nor a refusal.
 //! A refusal names the offset and the kind (one of bsv-rs's nineteen) or the
 //! refused spend.
+//!
+//! The reference is honoured only for the caller the object names (NL-7c):
+//! the relay writes the recipient's identity key on every object it spools as
+//! the custom metadata `recipient-identity-key`, and the object's head is held
+//! to the signed-in caller's identity key before the body is asked for. A
+//! missing or different key is refused by reason, with no body read and no
+//! copy. An abuse bound (a caller reads its own payments and nothing else),
+//! never a size.
 
+use std::collections::HashMap;
 use std::io;
 
 use bsv_sdk::transaction::beef_stream::{display_hex, AsyncVerifyError, Hash32, Step, TxBody};
@@ -424,15 +433,88 @@ fn bare(etag: &str) -> &str {
     etag.trim_matches('"')
 }
 
-/// The object a reference names, held to its bucket, etag and size, with
-/// its body. Another upload at the key is never read as this one.
-pub async fn open(store: &AtRestBucket<'_>, r: &BeefAtRest) -> Result<worker::Object, Error> {
+/// The custom metadata on a spooled object that names the identity key of the
+/// caller it is for (the relay writes it, rust-message-box NL-7b).
+pub const RECIPIENT_IDENTITY_KEY: &str = "recipient-identity-key";
+
+/// Hold an object's head to the reference and the caller: the caller first,
+/// so a refusal never says another caller's object's etag or size, and never
+/// whose it is; then the etag and the size. Identity keys are compared as
+/// the hex they are, in either case.
+pub fn hold_to(
+    r: &BeefAtRest,
+    etag: &str,
+    size: u64,
+    metadata: &HashMap<String, String>,
+    caller: &str,
+) -> Result<(), Error> {
+    match metadata.get(RECIPIENT_IDENTITY_KEY).map(String::as_str) {
+        None | Some("") => {
+            return Err(Error::ValidationError(format!(
+                "beefAtRest: the object at {} names no recipient ({RECIPIENT_IDENTITY_KEY}); it is read only for the caller it names",
+                r.r2_key
+            )))
+        }
+        Some(named) if !named.eq_ignore_ascii_case(caller) => {
+            return Err(Error::ValidationError(format!(
+                "beefAtRest: the object at {} names another recipient than the caller; it is read only for the caller it names",
+                r.r2_key
+            )))
+        }
+        Some(_) => {}
+    }
+    if bare(etag) != bare(&r.etag) {
+        return Err(Error::ValidationError(format!(
+            "beefAtRest: another upload is at {} (etag {}, the reference names {})",
+            r.r2_key, etag, r.etag
+        )));
+    }
+    if size != r.size {
+        return Err(Error::ValidationError(format!(
+            "beefAtRest: the object at {} is {} bytes, the reference names {}",
+            r.r2_key, size, r.size
+        )));
+    }
+    Ok(())
+}
+
+fn custom_metadata(object: &worker::Object) -> Result<HashMap<String, String>, Error> {
+    object
+        .custom_metadata()
+        .map_err(|e| Error::InternalError(format!("beefAtRest: the object's metadata: {e}")))
+}
+
+/// The object a reference names for `caller`, held to its bucket, the caller
+/// it names, its etag and its size, with its body. The head is read first
+/// and carries no body: an object for another caller is refused before its
+/// body is asked for. The get is then conditional on the etag, and its head
+/// is held again before the body is handed out. Another upload at the key is
+/// never read as this one.
+pub async fn open(
+    store: &AtRestBucket<'_>,
+    r: &BeefAtRest,
+    caller: &str,
+) -> Result<worker::Object, Error> {
     if r.bucket != store.name {
         return Err(Error::ValidationError(format!(
             "beefAtRest: bucket {} is not bound here (this Worker reads {})",
             r.bucket, store.name
         )));
     }
+    let no_object = || Error::ValidationError(format!("beefAtRest: no object at {}", r.r2_key));
+    let head = store
+        .bucket
+        .head(&r.r2_key)
+        .await
+        .map_err(|e| Error::InternalError(format!("beefAtRest: R2 head failed: {e}")))?
+        .ok_or_else(no_object)?;
+    hold_to(
+        r,
+        &head.etag(),
+        head.size(),
+        &custom_metadata(&head)?,
+        caller,
+    )?;
     let object = store
         .bucket
         .get(&r.r2_key)
@@ -445,21 +527,20 @@ pub async fn open(store: &AtRestBucket<'_>, r: &BeefAtRest) -> Result<worker::Ob
         .execute()
         .await
         .map_err(|e| Error::InternalError(format!("beefAtRest: R2 get failed: {e}")))?
-        .ok_or_else(|| Error::ValidationError(format!("beefAtRest: no object at {}", r.r2_key)))?;
-    if bare(&object.etag()) != bare(&r.etag) || object.body().is_none() {
+        .ok_or_else(no_object)?;
+    hold_to(
+        r,
+        &object.etag(),
+        object.size(),
+        &custom_metadata(&object)?,
+        caller,
+    )?;
+    if object.body().is_none() {
         return Err(Error::ValidationError(format!(
             "beefAtRest: another upload is at {} (etag {}, the reference names {})",
             r.r2_key,
             object.etag(),
             r.etag
-        )));
-    }
-    if object.size() != r.size {
-        return Err(Error::ValidationError(format!(
-            "beefAtRest: the object at {} is {} bytes, the reference names {}",
-            r.r2_key,
-            object.size(),
-            r.size
         )));
     }
     Ok(object)
@@ -481,10 +562,11 @@ pub fn body_of(object: &worker::Object) -> Result<R2Body, Error> {
 pub async fn copy_to(
     store: &AtRestBucket<'_>,
     r: &BeefAtRest,
+    caller: &str,
     dest: &worker::Bucket,
     key: &str,
 ) -> Result<(), Error> {
-    let object = open(store, r).await?;
+    let object = open(store, r, caller).await?;
     let R2Body(stream) = body_of(&object)?;
     let fixed = worker::FixedLengthStream::wrap(stream, r.size);
     dest.put(key, worker::Data::Stream(fixed))
@@ -497,8 +579,12 @@ pub async fn copy_to(
 /// The referenced object's bytes, read whole: for an object no larger than
 /// the blob store keeps in D1 (`r2.rs`, 4,096 bytes), which goes the inline
 /// way once it has been verified.
-pub async fn read_small(store: &AtRestBucket<'_>, r: &BeefAtRest) -> Result<Vec<u8>, Error> {
-    let object = open(store, r).await?;
+pub async fn read_small(
+    store: &AtRestBucket<'_>,
+    r: &BeefAtRest,
+    caller: &str,
+) -> Result<Vec<u8>, Error> {
+    let object = open(store, r, caller).await?;
     let mut source = body_of(&object)?;
     let mut bytes = Vec::with_capacity(r.size as usize);
     while let Some(chunk) = source

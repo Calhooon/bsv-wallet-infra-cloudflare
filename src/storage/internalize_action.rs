@@ -116,6 +116,8 @@ enum BeefBlob<'b> {
     AtRest {
         store: &'b AtRestBucket<'b>,
         reference: &'b BeefAtRest,
+        /// The signed-in caller, the one the object must name (NL-7c).
+        caller: &'b str,
     },
 }
 
@@ -343,9 +345,13 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
     /// storage is handed the subject alone, and the BEEF is stored by a
     /// streamed copy. The reference form is verified in full whatever
     /// `BEEF_VERIFICATION` says: the structure, the scripts and every root.
+    /// The object is read only for the caller it names (`caller`, the
+    /// BRC-31 identity key; NL-7c): another's is refused before its body is
+    /// asked for.
     pub async fn internalize_action_at_rest(
         &self,
         user_id: i64,
+        caller: &str,
         args: InternalizeActionArgs,
         reference: BeefAtRest,
     ) -> Result<StorageInternalizeActionResult> {
@@ -359,7 +365,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 "beefAtRest: no header service is configured to verify the roots".to_string(),
             )
         })?;
-        let object = crate::beef_at_rest::open(store, &reference).await?;
+        let object = crate::beef_at_rest::open(store, &reference, caller).await?;
         let mut source = crate::beef_at_rest::body_of(&object)?;
         let reading =
             crate::beef_at_rest::read_at_rest(&mut source, headers, reference.size).await?;
@@ -376,7 +382,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         if reference.size <= crate::r2::THRESHOLD as u64 {
             // Small enough for D1: verified above, stored and broadcast the
             // inline way.
-            let bytes = crate::beef_at_rest::read_small(store, &reference).await?;
+            let bytes = crate::beef_at_rest::read_small(store, &reference, caller).await?;
             return self
                 .internalize_subject(user_id, &args, subject, BeefBlob::Inline(&bytes))
                 .await;
@@ -388,6 +394,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             BeefBlob::AtRest {
                 store,
                 reference: &reference,
+                caller,
             },
         )
         .await
@@ -981,9 +988,13 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 let store = crate::r2::BlobStore::new(self.blobs);
                 Ok(store.put(table, id, "input_beef", bytes).await?.0)
             }
-            BeefBlob::AtRest { store, reference } => {
+            BeefBlob::AtRest {
+                store,
+                reference,
+                caller,
+            } => {
                 let key = crate::r2::r2_key(table, id, "input_beef");
-                crate::beef_at_rest::copy_to(store, reference, self.blobs, &key).await?;
+                crate::beef_at_rest::copy_to(store, reference, caller, self.blobs, &key).await?;
                 Ok(None)
             }
         }

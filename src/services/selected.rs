@@ -161,6 +161,26 @@ impl BroadcastService for SelectedProvider {
     }
 }
 
+/// A BEEF at rest as its body stream (NL-7c) goes to ARC under either
+/// selection: Arcade's `/tx` takes a raw or Extended Format transaction and
+/// no BEEF (`[SRC] bsv-blockchain/arcade@1ae1208 openapi/arcade.openapi.yaml:209-238`),
+/// and its BEEF path converts every unproven transaction to EF in memory
+/// (`arcade.rs`, `broadcast_beef_arcade`), the whole load this replaces.
+impl crate::broadcast_at_rest::StreamBroadcast<wasm_bindgen::JsValue> for SelectedProvider {
+    async fn broadcast_beef_body<
+        S: crate::broadcast_at_rest::StoredBeef<Body = wasm_bindgen::JsValue>,
+    >(
+        &self,
+        stored: &S,
+        offset: u64,
+        length: u64,
+    ) -> std::result::Result<BroadcastResult, BroadcastError> {
+        self.multi()
+            .broadcast_beef_body(stored, offset, length)
+            .await
+    }
+}
+
 impl ProofService for SelectedProvider {
     async fn get_proof(&self, txid: &str) -> std::result::Result<Option<ProofResult>, String> {
         self.multi().get_proof(txid).await

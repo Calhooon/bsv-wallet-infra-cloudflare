@@ -141,6 +141,21 @@ impl BroadcastService for MultiProvider {
     }
 }
 
+/// A BEEF at rest as its body stream (NL-7c): ARC alone. WoC takes no BEEF
+/// (`woc.rs`, `broadcast_beef`), so there is no fallback to fall to.
+impl crate::broadcast_at_rest::StreamBroadcast<wasm_bindgen::JsValue> for MultiProvider {
+    async fn broadcast_beef_body<
+        S: crate::broadcast_at_rest::StoredBeef<Body = wasm_bindgen::JsValue>,
+    >(
+        &self,
+        stored: &S,
+        offset: u64,
+        length: u64,
+    ) -> std::result::Result<BroadcastResult, BroadcastError> {
+        self.arc.broadcast_beef_body(stored, offset, length).await
+    }
+}
+
 // =============================================================================
 // ProofService
 // =============================================================================

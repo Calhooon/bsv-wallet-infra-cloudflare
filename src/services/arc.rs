@@ -134,9 +134,9 @@ impl ArcProvider {
         Self { api_key }
     }
 
-    fn build_headers(&self) -> worker::Headers {
+    fn build_headers(&self, content_type: &str) -> worker::Headers {
         let headers = worker::Headers::new();
-        let _ = headers.set("Content-Type", "application/json");
+        let _ = headers.set("Content-Type", content_type);
         let _ = headers.set("X-WaitFor", "SEEN_ON_NETWORK");
         let _ = headers.set("X-MaxTimeout", "15");
         if let Some(ref key) = self.api_key {
@@ -145,16 +145,19 @@ impl ArcProvider {
         headers
     }
 
+    /// POST `/v1/tx` with `body` (a JSON string, or a BEEF's body stream as
+    /// `application/octet-stream`, NL-7c).
     async fn post_tx(
         &self,
         base_url: &str,
-        json_body: &str,
+        body: wasm_bindgen::JsValue,
+        content_type: &str,
     ) -> std::result::Result<(u16, String), String> {
         let url = format!("{}/v1/tx", base_url);
         let mut init = worker::RequestInit::new();
         init.with_method(worker::Method::Post);
-        init.with_headers(self.build_headers());
-        init.with_body(Some(wasm_bindgen::JsValue::from_str(json_body)));
+        init.with_headers(self.build_headers(content_type));
+        init.with_body(Some(body));
 
         let request = worker::Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
         let mut response = worker::Fetch::Request(request)
@@ -364,15 +367,32 @@ async fn arc_broadcast_with_failover(
     provider: &ArcProvider,
     json_body: &str,
 ) -> std::result::Result<BroadcastResult, BroadcastError> {
+    arc_race(|base_url| {
+        provider.post_tx(
+            base_url,
+            wasm_bindgen::JsValue::from_str(json_body),
+            "application/json",
+        )
+    })
+    .await
+}
+
+/// The race over [`ARC_ENDPOINTS`], each asked by `post`.
+async fn arc_race<F, Fut>(post: F) -> std::result::Result<BroadcastResult, BroadcastError>
+where
+    F: Fn(&'static str) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(u16, String), String>>,
+{
     use futures_util::stream::{FuturesUnordered, StreamExt};
 
     let race_t0 = js_sys::Date::now();
+    let post = &post;
     let mut in_flight: FuturesUnordered<_> = ARC_ENDPOINTS
         .iter()
         .map(|&base_url| async move {
             let host = base_url.strip_prefix("https://").unwrap_or(base_url);
             let t0 = js_sys::Date::now();
-            let post_result = provider.post_tx(base_url, json_body).await;
+            let post_result = post(base_url).await;
             let post_ms = js_sys::Date::now() - t0;
             (host, post_ms, post_result)
         })
@@ -441,6 +461,27 @@ impl BroadcastService for ArcProvider {
     ) -> std::result::Result<BroadcastResult, BroadcastError> {
         let body = serde_json::json!({ "rawTx": beef_hex }).to_string();
         arc_broadcast_with_failover(self, &body).await
+    }
+}
+
+/// A BEEF at rest posted as its body stream (NL-7c): `application/octet-stream`,
+/// one fresh body per endpoint of the race; ARC knows a BEEF by its marker.
+impl crate::broadcast_at_rest::StreamBroadcast<wasm_bindgen::JsValue> for ArcProvider {
+    async fn broadcast_beef_body<
+        S: crate::broadcast_at_rest::StoredBeef<Body = wasm_bindgen::JsValue>,
+    >(
+        &self,
+        stored: &S,
+        offset: u64,
+        length: u64,
+    ) -> std::result::Result<BroadcastResult, BroadcastError> {
+        worker::console_log!("BENCH broadcast.arc[beef-stream,bytes={}]", length);
+        arc_race(|base_url| async move {
+            let body = stored.body_from(offset).await?;
+            self.post_tx(base_url, body, "application/octet-stream")
+                .await
+        })
+        .await
     }
 }
 

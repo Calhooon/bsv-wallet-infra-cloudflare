@@ -24,6 +24,7 @@ use chrono::{Timelike, Utc};
 use serde::Deserialize;
 use worker::*;
 
+use crate::broadcast_at_rest::{post_stored, R2Stored, StreamBroadcast};
 use crate::d1::batch::BatchCollector;
 use crate::d1::{QVal, Query};
 use crate::services::chaintracker::HeaderService;
@@ -629,7 +630,11 @@ pub struct MonitorResult {
 // Main orchestrator
 // =============================================================================
 
-pub async fn run_monitor<B: BroadcastService, P: ProofService, H: HeaderService>(
+pub async fn run_monitor<
+    B: BroadcastService + StreamBroadcast<wasm_bindgen::JsValue>,
+    P: ProofService,
+    H: HeaderService,
+>(
     db: &D1Database,
     blobs: &worker::Bucket,
     broadcast: &B,
@@ -786,7 +791,7 @@ pub async fn run_monitor<B: BroadcastService, P: ProofService, H: HeaderService>
 // Task 1: Broadcast unsent/sending transactions
 // =============================================================================
 
-async fn send_waiting<B: BroadcastService>(
+async fn send_waiting<B: BroadcastService + StreamBroadcast<wasm_bindgen::JsValue>>(
     db: &D1Database,
     blobs: &worker::Bucket,
     broadcast: &B,
@@ -829,64 +834,95 @@ async fn send_waiting<B: BroadcastService>(
         // that never reached the network (audit C3).
         let raw_tx_hex: Option<&String> = row.raw_tx.as_ref().filter(|h| !h.is_empty());
 
-        // input_beef may live in R2 (D1 column NULL for >4KB blobs — the
-        // COMMON case for deep ancestry; review M-D: without this fallback
-        // the largest txs silently downgraded to raw-tx-only broadcast,
-        // the exact orphan-mempool failure of the 2026-04-15 incident).
-        let beef_bytes: Option<Vec<u8>> = match &row.input_beef {
-            Some(h) if !h.is_empty() => hex::decode(h).ok(),
+        // A stored AtomicBEEF in R2 whose prefix names this subject already
+        // holds it (a payment internalized from bytes at rest, NL-7, or an
+        // inline one over the D1 line): posted as it rests, a body stream
+        // per endpoint, never read into the Worker (NL-7c,
+        // `crate::broadcast_at_rest`). Any other shape takes the route below.
+        let streamed = match &row.input_beef {
+            Some(h) if !h.is_empty() => None,
             _ => {
-                let store = crate::r2::BlobStore::new(blobs);
-                store
-                    .get("proven_tx_reqs", req_id, "input_beef", None)
-                    .await
-                    .ok()
-                    .flatten()
+                let stored = R2Stored::new(
+                    blobs,
+                    crate::r2::r2_key("proven_tx_reqs", req_id, "input_beef"),
+                );
+                match post_stored(&stored, broadcast, &txid).await {
+                    Ok(posted) => posted,
+                    Err(e) => {
+                        // The store did not answer: the row waits for the
+                        // next cycle as it is (no attempt counted).
+                        error_msgs.push(format!("{}: the stored BEEF: {}", txid, e));
+                        continue;
+                    }
+                }
             }
         };
 
-        let merged_beef_hex: Option<String> = match (beef_bytes, raw_tx_hex) {
-            (Some(beef_bytes), Some(raw_hex)) => hex::decode(raw_hex).ok().and_then(|raw_bytes| {
-                match Beef::from_binary(&beef_bytes) {
-                    Ok(mut beef) => {
-                        beef.merge_raw_tx(raw_bytes, None);
-                        Some(hex::encode(beef.to_binary()))
+        let broadcast_result = match streamed {
+            Some(posted) => posted,
+            None => {
+                // input_beef may live in R2 (D1 column NULL for >4KB blobs — the
+                // COMMON case for deep ancestry; review M-D: without this fallback
+                // the largest txs silently downgraded to raw-tx-only broadcast,
+                // the exact orphan-mempool failure of the 2026-04-15 incident).
+                let beef_bytes: Option<Vec<u8>> = match &row.input_beef {
+                    Some(h) if !h.is_empty() => hex::decode(h).ok(),
+                    _ => {
+                        let store = crate::r2::BlobStore::new(blobs);
+                        store
+                            .get("proven_tx_reqs", req_id, "input_beef", None)
+                            .await
+                            .ok()
+                            .flatten()
                     }
-                    Err(e) => {
-                        console_error!(
+                };
+
+                let merged_beef_hex: Option<String> = match (beef_bytes, raw_tx_hex) {
+                    (Some(beef_bytes), Some(raw_hex)) => {
+                        hex::decode(raw_hex).ok().and_then(|raw_bytes| {
+                            match Beef::from_binary(&beef_bytes) {
+                                Ok(mut beef) => {
+                                    beef.merge_raw_tx(raw_bytes, None);
+                                    Some(hex::encode(beef.to_binary()))
+                                }
+                                Err(e) => {
+                                    console_error!(
                             "send_waiting: BEEF rebuild failed for {} (falling back to raw_tx): {}",
                             txid,
                             e
                         );
-                        None
+                                    None
+                                }
+                            }
+                        })
                     }
-                }
-            }),
-            _ => None,
-        };
+                    _ => None,
+                };
 
-        let broadcast_result = if let Some(ref beef_hex) = merged_beef_hex {
-            broadcast.broadcast_beef(beef_hex).await
-        } else if let Some(raw_hex) = raw_tx_hex {
-            broadcast.broadcast_raw_tx(raw_hex).await
-        } else {
-            // Nothing broadcastable (no raw_tx). Bump attempts so the row
-            // sinks in the ordering instead of clogging the window forever
-            // (review M-C), and surface it — this state should not exist.
-            console_error!(
-                "send_waiting: req {} for {} has no raw_tx — cannot broadcast (attempts+1)",
-                req_id,
-                txid
-            );
-            let now = Utc::now().to_rfc3339();
-            let _ = Query::new(
+                if let Some(ref beef_hex) = merged_beef_hex {
+                    broadcast.broadcast_beef(beef_hex).await
+                } else if let Some(raw_hex) = raw_tx_hex {
+                    broadcast.broadcast_raw_tx(raw_hex).await
+                } else {
+                    // Nothing broadcastable (no raw_tx). Bump attempts so the row
+                    // sinks in the ordering instead of clogging the window forever
+                    // (review M-C), and surface it — this state should not exist.
+                    console_error!(
+                        "send_waiting: req {} for {} has no raw_tx — cannot broadcast (attempts+1)",
+                        req_id,
+                        txid
+                    );
+                    let now = Utc::now().to_rfc3339();
+                    let _ = Query::new(
                 "UPDATE proven_tx_reqs SET attempts = attempts + 1, updated_at = ? WHERE proven_tx_req_id = ?",
             )
             .bind(now.as_str())
             .bind(req_id)
             .execute(db)
             .await;
-            continue;
+                    continue;
+                }
+            }
         };
 
         match broadcast_result {
