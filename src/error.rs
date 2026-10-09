@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn error_message_extraction() {
-        let errors = vec![
+        let errors = [
             Error::ValidationError("msg_v".to_string()),
             Error::NotFound("msg_n".to_string()),
             Error::DatabaseError("msg_d".to_string()),

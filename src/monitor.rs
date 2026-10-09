@@ -3705,6 +3705,8 @@ async fn log_monitor_event(db: &D1Database, result: &MonitorResult) -> Result<()
 /// Test helper: parse_tsc_proof_response is pub(crate) so tests can access it.
 /// Tests are in tests/monitor_tests.rs (separate binary, no WASM deps).
 #[cfg(test)]
+// The constant assertions pin documented rules (cadence arithmetic, layouts, bounds).
+#[allow(clippy::assertions_on_constants, clippy::identity_op)]
 mod tests {
     use super::*;
 
@@ -4189,7 +4191,7 @@ mod tests {
 
     #[test]
     fn test_unfail_timing_guard_runs_on_0_minute() {
-        assert!(0u32 % 10 < 5);
+        assert!(0u32 < 5);
     }
 
     #[test]
@@ -4209,17 +4211,17 @@ mod tests {
 
     #[test]
     fn test_unfail_timing_guard_runs_on_2_minute() {
-        assert!(2u32 % 10 < 5);
+        assert!(2u32 < 5);
     }
 
     #[test]
     fn test_unfail_timing_guard_skips_on_5_minute() {
-        assert!(!(5u32 % 10 < 5));
+        assert!(!(5u32 < 5));
     }
 
     #[test]
     fn test_unfail_timing_guard_skips_on_7_minute() {
-        assert!(!(7u32 % 10 < 5));
+        assert!(!(7u32 < 5));
     }
 
     #[test]
@@ -5762,7 +5764,7 @@ mod tests {
     fn test_triage_classification_counts() {
         use crate::services::TxStatusDetail;
 
-        let statuses = vec![
+        let statuses = [
             TxStatusDetail {
                 txid: "a".to_string(),
                 status: "mined".to_string(),

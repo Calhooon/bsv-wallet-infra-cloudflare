@@ -5,6 +5,7 @@
     "dev": "npx wrangler dev",
     "deploy": "npx wrangler deploy",
     "test": "cargo test 2>&1",
+    "test:worker": "node tests/worker_beef_at_rest.mjs",
     "test:e2e": "./tests/e2e/run_all.sh",
     "test:e2e:health": "./tests/e2e/health_check.sh",
     "test:e2e:monitor": "./tests/e2e/monitor_health.sh",

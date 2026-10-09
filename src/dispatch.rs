@@ -22,7 +22,9 @@ use crate::storage::reserve_outputs::{ReserveOutputsArgs, UnreserveOutputsArgs};
 use crate::storage::StorageD1;
 use crate::types::{AuthId, FindCertificatesArgs};
 
-use bsv_sdk::wallet::{AbortActionArgs, CreateActionArgs, InternalizeActionArgs};
+use bsv_sdk::wallet::{AbortActionArgs, CreateActionArgs};
+
+use crate::beef_at_rest::InternalizeParams;
 
 use crate::types::StorageProcessActionArgs;
 
@@ -39,7 +41,7 @@ use crate::types::StorageProcessActionArgs;
 /// For non-auth'd methods (findOrInsertUser, migrate):
 ///   - If array with 1+ elements: return index 0
 ///   - If object: return as-is
-fn extract_args(params: &Value, auth_method: bool) -> Value {
+pub(crate) fn extract_args(params: &Value, auth_method: bool) -> Value {
     match params {
         Value::Array(arr) => {
             if auth_method && arr.len() >= 2 {
@@ -226,25 +228,16 @@ async fn handle_internalize_action<
     })?;
 
     let (user_id, _auth) = storage.resolve_auth(auth).await?;
-    let mut args_val = extract_args(&params, true);
-
-    // The bsv-sdk InternalizeActionArgs expects `tx` as a hex string (via #[serde(with = "hex_bytes")]).
-    // But the bsv-auth-cloudflare payment middleware sends `tx` as a JSON array of byte values
-    // (Vec<u8> serialized). Convert array → hex string so deserialization works for both formats.
-    if let Some(tx_val) = args_val.get("tx") {
-        if tx_val.is_array() {
-            let bytes: Vec<u8> = tx_val
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|v| v.as_u64().map(|n| n as u8))
-                .collect();
-            args_val["tx"] = Value::String(hex::encode(&bytes));
+    // The BEEF inline (`tx`) or at rest (`beefAtRest`, NL-7): see
+    // `crate::beef_at_rest::parse_internalize_params`.
+    let result = match crate::beef_at_rest::parse_internalize_params(&params)? {
+        InternalizeParams::Inline(args) => storage.internalize_action(user_id, args).await?,
+        InternalizeParams::AtRest { reference, args } => {
+            storage
+                .internalize_action_at_rest(user_id, args, reference)
+                .await?
         }
-    }
-
-    let args: InternalizeActionArgs = serde_json::from_value(args_val)?;
-    let result = storage.internalize_action(user_id, args).await?;
+    };
     let result_val = serde_json::to_value(&result)?;
     Ok(serde_json::to_value(JsonRpcResponse::success(id, result_val)).unwrap())
 }

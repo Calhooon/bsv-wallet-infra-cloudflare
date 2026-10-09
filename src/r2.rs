@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use worker::*;
 
 /// Blobs larger than this go to R2; smaller ones stay in D1.
-const THRESHOLD: usize = 4096;
+pub const THRESHOLD: usize = 4096;
 
 pub struct BlobStore<'a> {
     bucket: &'a Bucket,

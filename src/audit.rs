@@ -865,10 +865,12 @@ mod tests {
 
     #[test]
     fn audit_summary_serializes_camel_case() {
-        let mut summary = AuditSummary::default();
-        summary.total_utxos_checked = 100;
-        summary.locked_by_failed = 3;
-        summary.auto_repaired = 3;
+        let summary = AuditSummary {
+            total_utxos_checked: 100,
+            locked_by_failed: 3,
+            auto_repaired: 3,
+            ..Default::default()
+        };
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["totalUtxosChecked"], 100);
         assert_eq!(json["lockedByFailed"], 3);

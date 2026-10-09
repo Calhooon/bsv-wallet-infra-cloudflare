@@ -44,6 +44,11 @@ BROADCASTER = "arcade"
 # be set for registration; the proof is still ChainTracks-verified before persisting, and
 # the cron monitor remains the fallback. Unset either to disable (SSE-verdict-only).
 ARCADE_CALLBACK_URL = "https://wallet-infra.x402agency.com/arcade/callback"
+# NL-7: internalizeAction takes a reference to a BEEF at rest
+# ({ r2Key, size, etag, bucket }) in the bucket bound as BEEF_AT_REST below;
+# this names that bucket (a binding does not say it), and a reference naming
+# any other is refused. Unset either, and only the inline `tx` is taken.
+BEEF_AT_REST_BUCKET = "bsv-messagebox-beefs"
 
 [build]
 # Self-pinning (the worker-build pairing trap, see the-composer
@@ -60,6 +65,15 @@ database_id = "<your-d1-database-id>"
 [[r2_buckets]]
 binding = "BLOBS"
 bucket_name = "wallet-infra-blobs"
+
+# NL-7, the deploy's item (the owner's go; not deployed by the lane): the
+# relay's bucket (rust-message-box wrangler.toml, BEEF_BLOBS, same account),
+# read by internalizeAction for a fee whose BEEF is over the relay's 8 MiB
+# line. wallet-infra only reads it (a conditional get on the etag, the body
+# as a stream); the relay owns and deletes its objects.
+[[r2_buckets]]
+binding = "BEEF_AT_REST"
+bucket_name = "bsv-messagebox-beefs"
 
 [[kv_namespaces]]
 binding = "AUTH_SESSIONS"

@@ -199,7 +199,7 @@ Measured against the private 0.1.3 `process_auth_with_storage`. The public crate
 
 - bsv-rs `Peer`/`SimplifiedFetchTransport`, toolbox-rs `StorageClient`, public and legacy `WorkerStorageClient`,
   every fleet agent (kling, veo, reader, whisper, …), `agents/manage`, btc-relay, overlay-cloudflare,
-  rust-message-box, dkls-wallet, bsv-mpc, a private program scripts, and TS `AuthFetch` + wallet-toolbox `StorageClient`:
+  rust-message-box, dkls-wallet, bsv-mpc, zanaadu scripts, and TS `AuthFetch` + wallet-toolbox `StorageClient`:
   each binds one client to one wallet, signs every general message with a fresh random 32-byte nonce, and
   re-signs on retry. None re-sends pre-signed bytes. **They are not affected by (A), (B) or (C).**
 - **x402 helper** (`~/bsv/x402-skill-repo`): the session file is keyed **only by a hash of the server URL**
@@ -250,3 +250,23 @@ instead of 401) turns any such edge into a stuck client for up to the 1 h sessio
 **~5–7 hours**: ~1.5 h code and config (steps 2–8, including the error-mapping tests), ~1 h build, dry-run
 and CI, ~2–3 h staging client matrix and negative tests, ~1 h gate prep (D1 snapshot, rollback id, deploy
 note). The prod deploy is separate and owner-gated.
+
+## 6. 0.5.0 (core 0.2.0) and bsv-rs 0.4 (2026-10-09, lane wallet-infra-050)
+
+- **Pins.** `bsv-middleware-cloudflare = "=0.5.0"` (pulls `bsv-middleware-core` 0.2.0), `bsv-sdk` = `bsv-rs`
+  `0.4` (resolved 0.4.0, same features). One `bsv-rs` in `cargo tree`. No compile changes: the breaking
+  surface of 0.5.0 is the payment verifier (`PaymentVerifyError::Unverifiable { reason }`), and of bsv-rs 0.4
+  `BeefLimits`; wallet-infra uses neither. Its own `Beef::from_binary` calls (internalize, process, monitor)
+  now get bsv-rs 0.4's iterative walks (no stack abort on a deep chain). No BEEF size limit was added.
+- **Dead mapping removed.** Since 0.4.1 every authentication refusal is the middleware's own 401
+  `AuthResult::Response` (CORS set), which `main` passes through unchanged; `process_auth`'s `Err` is a
+  fault only. `auth_error_parts` (and its 401 tests) became `auth_fault_parts`: KV/SDK/transport/config →
+  500, unreadable JSON → 400, always logged. Covered by
+  `tests::the_middlewares_401_reaches_the_client_unchanged` (`src/lib.rs`) and, live,
+  `tests/e2e/auth_refusals.sh` (`UNAUTHORIZED`, `ERR_SESSION_NOT_FOUND`, `ERR_INVALID_AUTH`, each 401 with
+  CORS; passed 3/3 on `wrangler dev`). `ERR_REPLAYED_REQUEST` needs a signed session and is the middleware's
+  tests' to cover.
+- **Gates.** `cargo test` 821 pass; `cargo clippy --all-targets -- -D warnings` clean (35 test-code lints of
+  clippy 1.98, pre-existing, cleared in a separate commit); `wrangler deploy --dry-run` built (worker-build
+  0.8.7, 2792 KiB / gzip 933 KiB). Not deployed: staging then production are the captain's.
+- **Stale e2e suites rewritten (lane wi-e2e-401).** `health_check.sh` and `json_rpc_smoke.sh` expected unauthenticated JSON-RPC answers, which the middleware-first 401 (0.4.1+) makes wrong; they now assert GET / 200 + preflight, and 401 + refusal code + CORS for every method unauthenticated; the RPC-layer cases (-32601, `jsonrpc`, id echo) are SKIPPED (no bash BRC-104 session; a session would write on production) and named with their `json_rpc::tests`. `run_all.sh` PASSED on staging and production (21 pass / 3 skip smoke, 4/4 health).

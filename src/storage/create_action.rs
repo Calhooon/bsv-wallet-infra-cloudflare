@@ -1856,6 +1856,8 @@ fn generate_base64_random() -> String {
 }
 
 #[cfg(test)]
+// The constant assertions pin documented rules (cadence arithmetic, layouts, bounds).
+#[allow(clippy::assertions_on_constants, clippy::identity_op)]
 mod tests {
     use super::*;
     use bsv_sdk::wallet::CreateActionOutput;
@@ -2569,7 +2571,7 @@ mod tests {
         }
 
         let target = 50000u64;
-        let mut utxos = vec![
+        let mut utxos = [
             Utxo { satoshis: 100000 },
             Utxo { satoshis: 55000 },
             Utxo { satoshis: 40000 },
@@ -2625,9 +2627,7 @@ mod tests {
         let total_output_sats: u64 = 50000;
         let fee: u64 = 23; // typical P2PKH fee
 
-        let change = total_available
-            .checked_sub(total_output_sats + fee)
-            .unwrap_or(0);
+        let change = total_available.saturating_sub(total_output_sats + fee);
         assert_eq!(change, 49977);
     }
 
@@ -2638,9 +2638,7 @@ mod tests {
         let total_output_sats: u64 = 50000;
         let fee: u64 = 23;
 
-        let change = total_available
-            .checked_sub(total_output_sats + fee)
-            .unwrap_or(0);
+        let change = total_available.saturating_sub(total_output_sats + fee);
         assert_eq!(change, 0);
     }
 
@@ -2651,9 +2649,7 @@ mod tests {
         let total_output_sats: u64 = 50000;
         let fee: u64 = 23;
 
-        let change = total_available
-            .checked_sub(total_output_sats + fee)
-            .unwrap_or(0);
+        let change = total_available.saturating_sub(total_output_sats + fee);
         assert_eq!(change, 0, "Should default to 0 on underflow, not panic");
     }
 
@@ -2915,8 +2911,8 @@ mod tests {
         // This test pins the semantic: depth-0 is special.
         let direct = 0usize;
         let ancestor = 3usize;
-        assert_eq!(direct == 0, true, "depth 0 triggers hard-error branch");
-        assert_eq!(ancestor == 0, false, "depth >0 triggers warn-and-continue");
+        assert!(direct == 0, "depth 0 triggers hard-error branch");
+        assert!(ancestor != 0, "depth >0 triggers warn-and-continue");
     }
 
     #[test]

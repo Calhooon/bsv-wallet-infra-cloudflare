@@ -9,6 +9,7 @@
 //! then batch writes for atomicity. The batch pattern provides all-or-nothing
 //! semantics for the write phase.
 
+use crate::beef_at_rest::{AtRestBucket, BeefAtRest};
 use crate::d1::Query;
 use crate::entities::{TableOutput, TableTransaction, TransactionStatus};
 use crate::error::{Error, Result};
@@ -96,6 +97,27 @@ const INTERNALIZE_RESTORE_SPENT_BY_SQL: &str = "UPDATE outputs \
 const INTERNALIZE_RESTORE_SPENDABLE_SQL: &str = "UPDATE outputs \
      SET spendable = 1, updated_at = ? \
      WHERE output_id = ? AND spent_by IS NULL AND basket_id IS NOT NULL";
+
+/// The subject of an AtomicBEEF, as the storage needs it.
+struct Subject {
+    txid: String,
+    raw_tx: Vec<u8>,
+    version: u32,
+    lock_time: u32,
+    /// Each output's satoshis and locking script.
+    outputs: Vec<(u64, Vec<u8>)>,
+    /// The BEEF carries a BUMP for the subject itself.
+    has_proof: bool,
+}
+
+/// Where the whole BEEF is: in the argument, or at rest in R2 (NL-7).
+enum BeefBlob<'b> {
+    Inline(&'b [u8]),
+    AtRest {
+        store: &'b AtRestBucket<'b>,
+        reference: &'b BeefAtRest,
+    },
+}
 
 // =============================================================================
 // D1 Row Types
@@ -291,25 +313,104 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
         // Extract ALL data from the transaction before any await points.
         // Transaction contains RefCell which is not Send.
-        let (tx_outputs_count, tx_version, tx_lock_time, raw_tx, extracted_outputs) = {
+        let subject = {
             let tx = beef_tx.tx().ok_or_else(|| {
                 Error::ValidationError(format!("Transaction {} is txid-only in BEEF", txid))
             })?;
 
-            let outputs: Vec<(u64, Vec<u8>)> = tx
-                .outputs
-                .iter()
-                .map(|o| (o.satoshis.unwrap_or(0), o.locking_script.to_binary()))
-                .collect();
-
-            (
-                tx.outputs.len(),
-                tx.version,
-                tx.lock_time,
-                tx.to_binary(),
-                outputs,
-            )
+            Subject {
+                outputs: tx
+                    .outputs
+                    .iter()
+                    .map(|o| (o.satoshis.unwrap_or(0), o.locking_script.to_binary()))
+                    .collect(),
+                version: tx.version,
+                lock_time: tx.lock_time,
+                raw_tx: tx.to_binary(),
+                has_proof: beef.find_bump(&txid).is_some(),
+                txid,
+            }
         };
+        drop(beef);
+
+        self.internalize_subject(user_id, &args, subject, BeefBlob::Inline(&args.tx))
+            .await
+    }
+
+    /// Internalize an AtomicBEEF at rest in R2 (NL-7): the object the
+    /// reference names, held to its bucket, etag and size, is read as a
+    /// stream and verified one element in hand (`crate::beef_at_rest`); the
+    /// storage is handed the subject alone, and the BEEF is stored by a
+    /// streamed copy. The reference form is verified in full whatever
+    /// `BEEF_VERIFICATION` says: the structure, the scripts and every root.
+    pub async fn internalize_action_at_rest(
+        &self,
+        user_id: i64,
+        args: InternalizeActionArgs,
+        reference: BeefAtRest,
+    ) -> Result<StorageInternalizeActionResult> {
+        let store = self.beef_at_rest.ok_or_else(|| {
+            Error::ValidationError(
+                "beefAtRest: no bucket is bound here for bytes at rest (BEEF_AT_REST)".to_string(),
+            )
+        })?;
+        let headers = self.header_provider.ok_or_else(|| {
+            Error::InternalError(
+                "beefAtRest: no header service is configured to verify the roots".to_string(),
+            )
+        })?;
+        let object = crate::beef_at_rest::open(store, &reference).await?;
+        let mut source = crate::beef_at_rest::body_of(&object)?;
+        let reading =
+            crate::beef_at_rest::read_at_rest(&mut source, headers, reference.size).await?;
+        drop(source);
+        drop(object);
+        let subject = Subject {
+            txid: reading.txid,
+            raw_tx: reading.raw_tx,
+            version: reading.version,
+            lock_time: reading.lock_time,
+            outputs: reading.outputs,
+            has_proof: reading.has_proof,
+        };
+        if reference.size <= crate::r2::THRESHOLD as u64 {
+            // Small enough for D1: verified above, stored and broadcast the
+            // inline way.
+            let bytes = crate::beef_at_rest::read_small(store, &reference).await?;
+            return self
+                .internalize_subject(user_id, &args, subject, BeefBlob::Inline(&bytes))
+                .await;
+        }
+        self.internalize_subject(
+            user_id,
+            &args,
+            subject,
+            BeefBlob::AtRest {
+                store,
+                reference: &reference,
+            },
+        )
+        .await
+    }
+
+    /// Steps 2 to 10 of internalizeAction: the subject, verified, into the
+    /// user's storage; `beef` is where the whole BEEF is (inline or at rest).
+    async fn internalize_subject(
+        &self,
+        user_id: i64,
+        args: &InternalizeActionArgs,
+        subject: Subject,
+        beef: BeefBlob<'_>,
+    ) -> Result<StorageInternalizeActionResult> {
+        let Subject {
+            txid,
+            raw_tx,
+            version: tx_version,
+            lock_time: tx_lock_time,
+            outputs: extracted_outputs,
+            has_proof,
+        } = subject;
+        let tx_outputs_count = extracted_outputs.len();
 
         // Step 2: Get the user's default (change) basket
         let change_basket = self.find_or_create_default_basket(user_id).await?;
@@ -414,7 +515,6 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         }
 
         // Step 7: WRITE PHASE — create/update transaction
-        let has_proof = beef.find_bump(&txid).is_some();
         let status = if has_proof { "completed" } else { "unproven" };
         let now = Utc::now();
 
@@ -500,8 +600,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             let (raw_tx_d1, _) = store
                 .put("transactions", new_tx_id, "raw_tx", raw_tx.as_slice())
                 .await?;
-            let (ib_d1, _) = store
-                .put("transactions", new_tx_id, "input_beef", args.tx.as_slice())
+            let ib_d1 = self
+                .put_input_beef("transactions", new_tx_id, &beef)
                 .await?;
             Query::new(
                 "UPDATE transactions SET raw_tx = ?, input_beef = ?, updated_at = ? WHERE transaction_id = ?",
@@ -774,7 +874,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             // watch for confirmation.
             if !linked {
                 let broadcast_failed = self
-                    .create_proven_tx_req(&txid, &raw_tx, &args.tx, has_proof)
+                    .create_proven_tx_req(&txid, &raw_tx, &beef, has_proof)
                     .await?;
 
                 if broadcast_failed && !self.internalize_zero_conf {
@@ -865,6 +965,29 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
     // =========================================================================
     // Helper methods
     // =========================================================================
+
+    /// Store a BEEF as the `input_beef` blob of a row: inline bytes through
+    /// the blob store (D1 up to 4,096 bytes, R2 above), a BEEF at rest by a
+    /// streamed copy into this Worker's bucket at the blob store's key. The
+    /// D1 column's value is returned (`None` when the bytes are in R2).
+    async fn put_input_beef(
+        &self,
+        table: &str,
+        id: i64,
+        beef: &BeefBlob<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        match beef {
+            BeefBlob::Inline(bytes) => {
+                let store = crate::r2::BlobStore::new(self.blobs);
+                Ok(store.put(table, id, "input_beef", bytes).await?.0)
+            }
+            BeefBlob::AtRest { store, reference } => {
+                let key = crate::r2::r2_key(table, id, "input_beef");
+                crate::beef_at_rest::copy_to(store, reference, self.blobs, &key).await?;
+                Ok(None)
+            }
+        }
+    }
 
     async fn find_existing_transaction(
         &self,
@@ -1020,7 +1143,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         &self,
         txid: &str,
         raw_tx: &[u8],
-        input_beef: &[u8],
+        input_beef: &BeefBlob<'_>,
         has_verified_proof: bool,
     ) -> Result<bool> {
         #[derive(Deserialize)]
@@ -1061,7 +1184,6 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         // "missing inputs" (spent by ITSELF, past the cache window), which
         // maps to DoubleSpend/InvalidTx and used to de-credit a genuinely
         // mined payment with no proven_tx_req row for the canary to rescue.
-        let beef_hex = hex::encode(input_beef);
         let broadcast_result = if has_verified_proof {
             Ok(crate::services::BroadcastResult {
                 txid: txid.to_string(),
@@ -1069,7 +1191,31 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 seen_on_network: true,
             })
         } else {
-            self.broadcast.broadcast_beef(&beef_hex).await
+            match input_beef {
+                BeefBlob::Inline(bytes) => self.broadcast.broadcast_beef(&hex::encode(bytes)).await,
+                // A BEEF at rest is never made whole to be posted (NL-7). The
+                // subject the network already holds needs no broadcast; one it
+                // does not is left to the monitor as a transient fault is,
+                // and the caller treats it so (INTERNALIZE_ZERO_CONF decides
+                // whether the outputs stay spendable meanwhile).
+                BeefBlob::AtRest { .. } => {
+                    if self.network_knows_txid(txid).await {
+                        Ok(crate::services::BroadcastResult {
+                            txid: txid.to_string(),
+                            tx_status: "known to the network, broadcast skipped".to_string(),
+                            seen_on_network: true,
+                        })
+                    } else {
+                        worker::console_log!(
+                            "internalize: {} rests in R2 and the network does not know it; the broadcast is the monitor's",
+                            txid
+                        );
+                        Err(crate::services::BroadcastError::ServiceError(
+                            "a BEEF at rest is not posted from the request".to_string(),
+                        ))
+                    }
+                }
+            }
         };
         let broadcast_network_error = match broadcast_result {
             Ok(_result) => {
@@ -1144,9 +1290,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         .await?;
         let req_id = req_meta.last_row_id;
 
-        let store = crate::r2::BlobStore::new(self.blobs);
-        let (ib_d1, _) = store
-            .put("proven_tx_reqs", req_id, "input_beef", input_beef)
+        let ib_d1 = self
+            .put_input_beef("proven_tx_reqs", req_id, input_beef)
             .await?;
         Query::new(
             "UPDATE proven_tx_reqs SET input_beef = ?, updated_at = ? WHERE proven_tx_req_id = ?",

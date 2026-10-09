@@ -2,60 +2,70 @@
 # json_rpc_smoke.sh -- Smoke test all JSON-RPC methods
 #
 # Tests:
-#   1. Unauthenticated methods return valid responses
-#   2. Authenticated methods without auth return proper errors
-#   3. Unknown methods return method_not_found
-#   4. Transaction stub methods return valid responses
+#   1. Every JSON-RPC method, called without auth, gets the middleware's 401
+#   2. An unknown method, called without auth, gets the same 401
+#   3. RPC-layer behaviour (method_not_found, protocol conformance) -- SKIPPED
+#
+# Why this changed (2026-10-09): since bsv-middleware-cloudflare 0.4.1 every
+# unauthenticated call is answered by the middleware's own 401 JSON
+# (`{"status":"error","code":"UNAUTHORIZED"|"ERR_SESSION_NOT_FOUND"|
+# "ERR_INVALID_AUTH"|"ERR_REPLAYED_REQUEST","message":...}`, CORS set) before
+# the JSON-RPC layer sees the body -- including makeAvailable, migrate,
+# findOrInsertUser and the storage-transaction stubs, which used to answer
+# unauthenticated. The old suite looked for JSON-RPC envelopes there and failed
+# identically on 0.4.1 and 0.5.0. A JSON-RPC envelope on an unauthenticated
+# call is now wrong; the 401 is the contract.
+#
+# Section 3 needs a BRC-104 session to reach the RPC layer. There is no bash
+# handshake helper in the repo, and a session against production would write
+# (KV session, resolve_auth auto-creates the user), so those cases are SKIPPED
+# and named with the Rust unit tests that cover them.
+#
+# Read-only: every request here is refused before storage.
 #
 # Usage: ./tests/e2e/json_rpc_smoke.sh [base_url]
 
 set -euo pipefail
 
 BASE_URL="${1:-https://wallet-infra.x402agency.com}"
+BASE_URL="${BASE_URL%/}"
 PASSED=0
 FAILED=0
+SKIPPED=0
 ID=0
 
 pass() { PASSED=$((PASSED + 1)); echo "  PASS: $1"; }
 fail() { FAILED=$((FAILED + 1)); echo "  FAIL: $1"; }
+skip() { SKIPPED=$((SKIPPED + 1)); echo "  SKIPPED: $1"; }
 
-# Send a JSON-RPC call, return the response body
+REFUSAL_CODES='["UNAUTHORIZED","ERR_SESSION_NOT_FOUND","ERR_INVALID_AUTH","ERR_REPLAYED_REQUEST"]'
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+# Send an unauthenticated JSON-RPC call; sets STATUS, CORS, BODY, CODE
 rpc_call() {
     local method="$1"
     local params="$2"
     ID=$((ID + 1))
-    curl -s -X POST "${BASE_URL}" \
+    STATUS=$(curl -s -D "$TMP/h" -o "$TMP/b" -w '%{http_code}' -X POST "${BASE_URL}/" \
         -H "Content-Type: application/json" \
-        -d "{\"jsonrpc\":\"2.0\",\"method\":\"${method}\",\"params\":${params},\"id\":${ID}}"
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"${method}\",\"params\":${params},\"id\":${ID}}" \
+        || echo "000")
+    CORS=$(grep -i '^access-control-allow-origin:' "$TMP/h" || true)
+    BODY=$(cat "$TMP/b")
+    CODE=$(echo "$BODY" | jq -r '.code // empty' 2>/dev/null || true)
 }
 
-# Check that result field exists (no error)
-assert_result() {
+# 401, a refusal code, CORS, and no JSON-RPC envelope
+assert_refused() {
     local method="$1"
-    local response="$2"
-    if echo "$response" | jq -e '.result' > /dev/null 2>&1; then
-        pass "${method} returned result"
+    if [ "$STATUS" = "401" ] && [ -n "$CORS" ] \
+        && echo "$BODY" | jq -e --argjson codes "$REFUSAL_CODES" \
+            '.status == "error" and (.code as $c | $codes | index($c)) and (has("jsonrpc") | not)' \
+            > /dev/null 2>&1; then
+        pass "${method} refused without auth (401 ${CODE})"
     else
-        fail "${method} expected result, got: ${response}"
-    fi
-}
-
-# Check that error field exists with the expected code
-assert_error() {
-    local method="$1"
-    local response="$2"
-    local expected_code="$3"
-    local actual_code
-    actual_code=$(echo "$response" | jq -r '.error.code // empty' 2>/dev/null)
-    if [ -n "$actual_code" ]; then
-        if [ -n "$expected_code" ] && [ "$actual_code" != "$expected_code" ]; then
-            # Some methods may return different error codes; as long as there's an error, it's ok
-            pass "${method} returned error (code ${actual_code})"
-        else
-            pass "${method} returned error code ${actual_code}"
-        fi
-    else
-        fail "${method} expected error, got: ${response}"
+        fail "${method}: POST ${BASE_URL}/ expected 401 refusal with CORS, got status ${STATUS} code '${CODE}' cors '${CORS:+yes}' body ${BODY}"
     fi
 }
 
@@ -63,42 +73,18 @@ echo "=== JSON-RPC Smoke Tests: ${BASE_URL} ==="
 echo ""
 
 # ============================================================================
-# Section 1: Unauthenticated methods -- should return valid results
+# Section 1: Every method without auth -- the middleware's 401
 # ============================================================================
-echo "--- Section 1: Unauthenticated methods (expect success) ---"
+echo "--- Section 1: All methods without auth (expect 401 refusal) ---"
 
-# makeAvailable -- no params needed
-RESP=$(rpc_call "makeAvailable" "[]")
-assert_result "makeAvailable" "$RESP"
-
-# migrate -- expects a storage name
-RESP=$(rpc_call "migrate" '["wallet-infra"]')
-assert_result "migrate" "$RESP"
-
-# findOrInsertUser -- expects an identity key
-# Use a deterministic test key that won't collide with real users
+# Positional params as BSV Toolbox's StorageClient sends them; never reach storage.
 TEST_KEY="02e5bfa1f3b0e3b0e3b0e3b0e3b0e3b0e3b0e3b0e3b0e3b0e3b0e3b0e3b0e3b0e3"
-RESP=$(rpc_call "findOrInsertUser" "[\"${TEST_KEY}\"]")
-assert_result "findOrInsertUser" "$RESP"
-
-# ============================================================================
-# Section 2: Transaction stub methods -- should return valid results (no auth)
-# ============================================================================
-echo "--- Section 2: Transaction stub methods (expect success) ---"
-
-RESP=$(rpc_call "beginStorageTransaction" "[]")
-assert_result "beginStorageTransaction" "$RESP"
-
-RESP=$(rpc_call "commitStorageTransaction" "[]")
-assert_result "commitStorageTransaction" "$RESP"
-
-RESP=$(rpc_call "rollbackStorageTransaction" "[]")
-assert_result "rollbackStorageTransaction" "$RESP"
-
-# ============================================================================
-# Section 3: Authenticated methods WITHOUT auth -- should return errors
-# ============================================================================
-echo "--- Section 3: Authenticated methods without auth (expect error) ---"
+rpc_call "makeAvailable" "[]";                       assert_refused "makeAvailable"
+rpc_call "migrate" '["wallet-infra"]';               assert_refused "migrate"
+rpc_call "findOrInsertUser" "[\"${TEST_KEY}\"]";     assert_refused "findOrInsertUser"
+rpc_call "beginStorageTransaction" "[]";             assert_refused "beginStorageTransaction"
+rpc_call "commitStorageTransaction" "[]";            assert_refused "commitStorageTransaction"
+rpc_call "rollbackStorageTransaction" "[]";          assert_refused "rollbackStorageTransaction"
 
 AUTH_METHODS=(
     "internalizeAction"
@@ -111,64 +97,39 @@ AUTH_METHODS=(
     "createAction"
     "processAction"
     "updateTransactionStatusAfterBroadcast"
+    "relinquishOutput"
+    "reserveOutputs"
+    "unreserveOutputs"
     "reviewStatus"
 )
 
 for METHOD in "${AUTH_METHODS[@]}"; do
-    RESP=$(rpc_call "$METHOD" "{}")
-    # These should return an error because no BRC-31 auth header is provided.
-    # The error could be -32602 (validation) or a different code depending on
-    # where in the pipeline the auth check happens.
-    if echo "$RESP" | jq -e '.error' > /dev/null 2>&1; then
-        ERROR_CODE=$(echo "$RESP" | jq -r '.error.code' 2>/dev/null)
-        pass "${METHOD} rejected without auth (code ${ERROR_CODE})"
-    else
-        fail "${METHOD} should require auth but returned result: ${RESP}"
-    fi
+    rpc_call "$METHOD" "{}"
+    assert_refused "$METHOD"
 done
 
 # ============================================================================
-# Section 4: Unknown method -- should return method_not_found
+# Section 2: Unknown method without auth -- refused before dispatch
 # ============================================================================
-echo "--- Section 4: Unknown method (expect method_not_found) ---"
+echo "--- Section 2: Unknown method without auth (expect 401 refusal) ---"
 
-RESP=$(rpc_call "nonExistentMethod" "[]")
-ERROR_CODE=$(echo "$RESP" | jq -r '.error.code // empty' 2>/dev/null)
-if [ "$ERROR_CODE" = "-32601" ]; then
-    pass "nonExistentMethod returned -32601 (method not found)"
-elif [ -n "$ERROR_CODE" ]; then
-    pass "nonExistentMethod returned error code ${ERROR_CODE}"
-else
-    fail "nonExistentMethod expected error, got: ${RESP}"
-fi
+rpc_call "nonExistentMethod" "[]"
+assert_refused "nonExistentMethod"
 
 # ============================================================================
-# Section 5: JSON-RPC protocol conformance
+# Section 3: RPC layer -- needs a BRC-104 session (see header)
 # ============================================================================
-echo "--- Section 5: Protocol conformance ---"
+echo "--- Section 3: RPC layer (needs an authenticated session) ---"
 
-# Verify response includes jsonrpc version
-RESP=$(rpc_call "makeAvailable" "[]")
-JSONRPC_VER=$(echo "$RESP" | jq -r '.jsonrpc // empty' 2>/dev/null)
-if [ "$JSONRPC_VER" = "2.0" ]; then
-    pass "Response includes jsonrpc: \"2.0\""
-else
-    fail "Response missing jsonrpc version, got: ${JSONRPC_VER}"
-fi
-
-# Verify response id matches request id
-RESP_ID=$(echo "$RESP" | jq -r '.id // empty' 2>/dev/null)
-if [ "$RESP_ID" = "$ID" ]; then
-    pass "Response id matches request id (${ID})"
-else
-    fail "Response id mismatch: expected ${ID}, got ${RESP_ID}"
-fi
+skip "unknown method -> -32601: no bash BRC-104 session; covered by json_rpc::tests::method_not_found_error (the dispatch fallback arm, src/dispatch.rs, has no unit test)"
+skip "response jsonrpc \"2.0\": no bash BRC-104 session; covered by json_rpc::tests::serialize_success_response, serialize_error_response"
+skip "response id echoes request id: no bash BRC-104 session; covered by json_rpc::tests::serialize_success_response, serialize_success_response_with_string_id, method_not_found_error"
 
 # ============================================================================
 # Summary
 # ============================================================================
 echo ""
-echo "=== JSON-RPC Smoke Test Summary: ${PASSED} passed, ${FAILED} failed ==="
+echo "=== JSON-RPC Smoke Test Summary: ${PASSED} passed, ${FAILED} failed, ${SKIPPED} skipped ==="
 if [ "$FAILED" -gt 0 ]; then
     exit 1
 fi

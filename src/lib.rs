@@ -10,6 +10,7 @@
 
 pub mod arcade_callback;
 pub mod audit;
+pub mod beef_at_rest;
 pub mod bench;
 pub mod d1;
 pub mod dispatch;
@@ -107,9 +108,11 @@ fn build_provider(
     ))
 }
 
-/// HTTP status and JSON body for a `process_auth` error, from the crate's own mapping
-/// (`InvalidAuthentication`/`SessionNotFound`/`Unauthorized` → 401; KV/SDK/config → 500).
-fn auth_error_parts(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> (u16, String) {
+/// HTTP status and JSON body for a `process_auth` fault, from the crate's own mapping
+/// (KV/SDK/transport/config → 500; unreadable JSON → 400). Since middleware 0.4.1 an
+/// authentication refusal is never an `Err`: the middleware answers it itself (401,
+/// CORS) as `AuthResult::Response`, which the worker passes through unchanged.
+fn auth_fault_parts(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> (u16, String) {
     (e.status_code(), e.to_json())
 }
 
@@ -383,16 +386,15 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     };
 
     // Process auth (handles BRC-31 handshake + session validation)
-    // A refusal (bad signature, header identity not the session's, replayed or
-    // missing nonce) is the crate's status + error JSON — a 401 tells the client to
-    // re-handshake; an opaque 500 would strand it until the session TTL.
+    // A refusal (no auth headers, bad signature, header identity not the session's,
+    // unknown session, replayed or missing nonce) is the middleware's own 401
+    // `AuthResult::Response` (0.4.1+), passed through below so the client
+    // re-handshakes. An `Err` is a fault only.
     let auth_result = match process_auth(req, &env, &auth_options).await {
         Ok(r) => r,
         Err(e) => {
-            let (status, body) = auth_error_parts(&e);
-            if status >= 500 {
-                console_error!("auth: {}", e);
-            }
+            console_error!("auth: {}", e);
+            let (status, body) = auth_fault_parts(&e);
             let resp = Response::from_bytes(body.into_bytes())?.with_status(status);
             resp.headers().set("Content-Type", "application/json")?;
             return Ok(add_cors_headers(resp));
@@ -498,9 +500,25 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         })
         .unwrap_or(false);
 
+    // NL-7: the bucket a reference to a BEEF at rest may name. The binding
+    // `BEEF_AT_REST` and `BEEF_AT_REST_BUCKET`, the name of the bucket bound
+    // there (a binding does not say it); either missing, the reference form is
+    // refused and the inline form is unchanged.
+    let at_rest_binding = env.bucket("BEEF_AT_REST").ok();
+    let at_rest = match (
+        at_rest_binding.as_ref(),
+        env_value(&env, "BEEF_AT_REST_BUCKET").filter(|s| !s.is_empty()),
+    ) {
+        (Some(bucket), Some(name)) => Some(crate::beef_at_rest::AtRestBucket { bucket, name }),
+        _ => None,
+    };
+
     let mut storage = StorageD1::new(&db, &blobs, &provider)
         .with_beef_verification(beef_mode, &header_provider)
         .with_internalize_zero_conf(internalize_zero_conf);
+    if let Some(at_rest) = at_rest.as_ref() {
+        storage = storage.with_beef_at_rest(at_rest);
+    }
 
     // Build auth ID from BRC-31 context
     let auth = AuthId::new(&auth_context.identity_key);
@@ -577,52 +595,44 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
 
 #[cfg(test)]
 mod tests {
-    use super::auth_error_parts;
+    use super::auth_fault_parts;
     use bsv_middleware_cloudflare::AuthCloudflareError;
 
     fn parts(e: AuthCloudflareError) -> (u16, serde_json::Value) {
-        let (status, body) = auth_error_parts(&e);
+        let (status, body) = auth_fault_parts(&e);
         (
             status,
             serde_json::from_str(&body).expect("error body is JSON"),
         )
     }
 
-    /// The crate's general path refuses a header identity that is not the session's
-    /// with exactly this error (`process_auth_with_storage`, before the signature
-    /// check). It must leave the worker as a 401 so the client re-handshakes.
-    #[test]
-    fn identity_not_the_sessions_is_a_401_with_the_crates_error_json() {
-        let (status, body) = parts(AuthCloudflareError::InvalidAuthentication(
-            "Message identity key is not the session's".into(),
-        ));
-        assert_eq!(status, 401);
-        assert_eq!(body["status"], "error");
-        assert_eq!(body["code"], "ERR_INVALID_AUTH");
-        assert!(body["description"]
-            .as_str()
-            .unwrap()
-            .contains("Message identity key is not the session's"));
+    /// The source of `main` between two markers.
+    fn main_src(from: &str, to: &str) -> &'static str {
+        let src = include_str!("lib.rs");
+        let start = src.find(from).expect("start marker");
+        let len = src[start..].find(to).expect("end marker");
+        &src[start..start + len]
     }
 
+    /// A refusal is the middleware's own 401 answer (`UNAUTHORIZED`,
+    /// `ERR_SESSION_NOT_FOUND`, `ERR_INVALID_AUTH`, `ERR_REPLAYED_REQUEST`, CORS set by
+    /// the middleware): `AuthResult::Response` must reach the client untouched, and the
+    /// fault arm must build no 401 of its own. `worker::Response` needs the JS runtime,
+    /// so this holds the code shape; the bodies are checked live in
+    /// `tests/e2e/auth_refusals.sh`.
     #[test]
-    fn bad_signature_and_unauthenticated_session_are_401() {
-        for msg in ["Invalid message signature", "Session not authenticated"] {
-            let (status, body) = parts(AuthCloudflareError::InvalidAuthentication(msg.into()));
-            assert_eq!(status, 401, "{msg}");
-            assert_eq!(body["code"], "ERR_INVALID_AUTH");
-        }
-    }
-
-    #[test]
-    fn session_not_found_and_unauthorized_are_401() {
-        let (status, body) = parts(AuthCloudflareError::SessionNotFound("n".into()));
-        assert_eq!(
-            (status, body["code"].as_str()),
-            (401, Some("ERR_SESSION_NOT_FOUND"))
+    fn the_middlewares_401_reaches_the_client_unchanged() {
+        let gate = main_src(
+            "let auth_result = match process_auth(",
+            "// Require session for response signing",
         );
-        let (status, body) = parts(AuthCloudflareError::Unauthorized);
-        assert_eq!((status, body["code"].as_str()), (401, Some("UNAUTHORIZED")));
+        assert!(gate.contains("AuthResult::Response(response) => return Ok(response),"));
+        let fault_arm =
+            &gate[gate.find("Err(e) =>").unwrap()..gate.find("let (auth_context").unwrap()];
+        assert!(!fault_arm.contains("401"), "{fault_arm}");
+        assert!(!fault_arm.contains("Unauthorized"), "{fault_arm}");
+        assert!(!fault_arm.contains("InvalidAuthentication"), "{fault_arm}");
+        assert!(!fault_arm.contains("SessionNotFound"), "{fault_arm}");
     }
 
     /// Infrastructure failures stay 5xx: a KV outage must not tell every client
@@ -632,11 +642,20 @@ mod tests {
         for e in [
             AuthCloudflareError::KvError("429".into()),
             AuthCloudflareError::SdkError("x".into()),
+            AuthCloudflareError::TransportError("t".into()),
             AuthCloudflareError::ConfigError("bad key".into()),
         ] {
             let (status, body) = parts(e);
             assert_eq!(status, 500);
             assert_eq!(body["status"], "error");
         }
+    }
+
+    /// Unreadable JSON (the crate's `From<serde_json::Error>`) keeps the crate's 400.
+    #[test]
+    fn unreadable_json_is_400() {
+        let (status, body) = parts(AuthCloudflareError::SerializationError("eof".into()));
+        assert_eq!(status, 400);
+        assert_eq!(body["status"], "error");
     }
 }

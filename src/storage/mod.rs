@@ -13,6 +13,7 @@ pub mod writers;
 
 use worker::{Bucket, D1Database};
 
+use crate::beef_at_rest::AtRestBucket;
 use crate::entities::TableSettings;
 use crate::services::chaintracker::HeaderProvider;
 use crate::services::{BroadcastService, ProofService};
@@ -35,6 +36,10 @@ pub struct StorageD1<'a, B: BroadcastService + ProofService = crate::services::w
     /// fetches the proof and reconciles status later — only the spendable-demotion
     /// on a transient error is skipped.
     internalize_zero_conf: bool,
+    /// The bucket `internalizeAction` may read a BEEF at rest from (NL-7):
+    /// the binding `BEEF_AT_REST` and its bucket's name. `None`: the
+    /// reference form is refused.
+    beef_at_rest: Option<&'a AtRestBucket<'a>>,
 }
 
 impl<'a, B: BroadcastService + ProofService> StorageD1<'a, B> {
@@ -47,12 +52,19 @@ impl<'a, B: BroadcastService + ProofService> StorageD1<'a, B> {
             beef_verification_mode: BeefVerificationMode::default(),
             header_provider: None,
             internalize_zero_conf: false,
+            beef_at_rest: None,
         }
     }
 
     /// Enable/disable 0-conf spendable on internalize (env `INTERNALIZE_ZERO_CONF`).
     pub fn with_internalize_zero_conf(mut self, enabled: bool) -> Self {
         self.internalize_zero_conf = enabled;
+        self
+    }
+
+    /// The bucket a reference to a BEEF at rest may name (NL-7).
+    pub fn with_beef_at_rest(mut self, bucket: &'a AtRestBucket<'a>) -> Self {
+        self.beef_at_rest = Some(bucket);
         self
     }
 

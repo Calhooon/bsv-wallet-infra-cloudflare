@@ -265,27 +265,6 @@ impl ProofService for MultiProvider {
 }
 
 // =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_multi_provider_construction_with_key() {
-        let provider = MultiProvider::new(Some("test-key-123".to_string()), None);
-        assert_eq!(provider.arc.api_key, Some("test-key-123".to_string()));
-    }
-
-    #[test]
-    fn test_multi_provider_construction_without_key() {
-        let provider = MultiProvider::new(None, None);
-        assert_eq!(provider.arc.api_key, None);
-    }
-}
-
-// =============================================================================
 // Chaintracks tip fetch
 // =============================================================================
 
@@ -320,4 +299,25 @@ async fn fetch_chaintracks_height(base_url: &str) -> std::result::Result<u32, St
     }
     resp.value
         .ok_or_else(|| "chaintracks currentHeight: missing value".to_string())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multi_provider_construction_with_key() {
+        let provider = MultiProvider::new(Some("test-key-123".to_string()), None);
+        assert_eq!(provider.arc.api_key, Some("test-key-123".to_string()));
+    }
+
+    #[test]
+    fn test_multi_provider_construction_without_key() {
+        let provider = MultiProvider::new(None, None);
+        assert_eq!(provider.arc.api_key, None);
+    }
 }

@@ -78,7 +78,12 @@ run_suite "Health Check" "${SCRIPT_DIR}/health_check.sh" "${BASE_URL}"
 run_suite "JSON-RPC Smoke" "${SCRIPT_DIR}/json_rpc_smoke.sh" "${BASE_URL}"
 
 # ---------------------------------------------------------------------------
-# Suite 3: Monitor Health (requires CF_* env vars)
+# Suite 3: Auth refusals (the middleware's own 401s, passed through)
+# ---------------------------------------------------------------------------
+run_suite "Auth Refusals" "${SCRIPT_DIR}/auth_refusals.sh" "${BASE_URL}"
+
+# ---------------------------------------------------------------------------
+# Suite 4: Monitor Health (requires CF_* env vars)
 # ---------------------------------------------------------------------------
 if [ -n "${CF_API_TOKEN:-}" ] && [ -n "${CF_ACCOUNT_ID:-}" ] && [ -n "${D1_DATABASE_ID:-}" ]; then
     run_suite "Monitor Health" "${SCRIPT_DIR}/monitor_health.sh"
