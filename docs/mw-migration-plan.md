@@ -199,7 +199,7 @@ Measured against the private 0.1.3 `process_auth_with_storage`. The public crate
 
 - bsv-rs `Peer`/`SimplifiedFetchTransport`, toolbox-rs `StorageClient`, public and legacy `WorkerStorageClient`,
   every fleet agent (kling, veo, reader, whisper, …), `agents/manage`, btc-relay, overlay-cloudflare,
-  rust-message-box, dkls-wallet, bsv-mpc, a private application scripts, and TS `AuthFetch` + wallet-toolbox `StorageClient`:
+  rust-message-box, dkls-wallet, bsv-mpc, a private program scripts, and TS `AuthFetch` + wallet-toolbox `StorageClient`:
   each binds one client to one wallet, signs every general message with a fresh random 32-byte nonce, and
   re-signs on retry. None re-sends pre-signed bytes. **They are not affected by (A), (B) or (C).**
 - **x402 helper** (`~/bsv/x402-skill-repo`): the session file is keyed **only by a hash of the server URL**

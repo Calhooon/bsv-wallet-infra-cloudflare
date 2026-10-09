@@ -23,7 +23,7 @@ BROADCASTER = "arcade"
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
 # Webhook proof delivery: Arcade POSTs status (+ MINED merklePath) here, Bearer-authed
 # with the ARCADE_CALLBACK_TOKEN secret. Both must be set for registration to happen.
-ARCADE_CALLBACK_URL = "https://wallet-infra-arcade-stage.dev-a3e.workers.dev/arcade/callback"
+ARCADE_CALLBACK_URL = "https://your-worker.your-account.workers.dev/arcade/callback"
 
 [build]
 command = "cargo install -q --version ^0.8 worker-build && worker-build --release"
