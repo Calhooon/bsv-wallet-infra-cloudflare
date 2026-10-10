@@ -10,7 +10,7 @@ set -euo pipefail
 
 CF_ACCOUNT="<your-account-id>"
 CF_DB="<your-d1-database-id>"
-CF_TOKEN="61rJhtnCk2IhD04qIPT6-bkC1Io4h-jaGhfMglYS"
+CF_TOKEN="${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN in the environment}"
 WOC_BASE="https://api.whatsonchain.com/v1/bsv/main"
 
 d1_query() {

@@ -6,7 +6,7 @@
 
 const CF_ACCOUNT = '<your-account-id>';
 const CF_DB_ID = '<your-d1-database-id>';
-const CF_TOKEN = '61rJhtnCk2IhD04qIPT6-bkC1Io4h-jaGhfMglYS';
+const CF_TOKEN = process.env.CLOUDFLARE_API_TOKEN; if (!CF_TOKEN) { console.error('set CLOUDFLARE_API_TOKEN in the environment'); process.exit(2); }
 const WOC_BASE = 'https://api.whatsonchain.com/v1/bsv/main';
 
 const { Beef } = await import('/Users/johncalhoun/bsv/ts-sdk/dist/esm/mod.js');
