@@ -1203,6 +1203,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             })
         } else {
             match input_beef {
+                // ARC is handed the BEEF behind the AtomicBEEF's prefix, as
+                // bytes (`arc_beef_request`, bsv-stack-lean #63); Arcade, EF.
                 BeefBlob::Inline(bytes) => self.broadcast.broadcast_beef(&hex::encode(bytes)).await,
                 // A BEEF at rest is never made whole to be posted (NL-7). The
                 // subject the network already holds needs no broadcast; one it

@@ -459,9 +459,39 @@ impl BroadcastService for ArcProvider {
         &self,
         beef_hex: &str,
     ) -> std::result::Result<BroadcastResult, BroadcastError> {
-        let body = serde_json::json!({ "rawTx": beef_hex }).to_string();
-        arc_broadcast_with_failover(self, &body).await
+        let (body, content_type) = arc_beef_request(beef_hex)?;
+        worker::console_log!("BENCH broadcast.arc[beef-bytes,bytes={}]", body.len());
+        let body = &body;
+        arc_race(|base_url| async move {
+            let bytes = js_sys::Uint8Array::from(body.as_slice());
+            self.post_tx(base_url, bytes.into(), content_type).await
+        })
+        .await
     }
+}
+
+/// The body ARC is handed for a BEEF, and its content type (bsv-stack-lean
+/// #63, F1): the BEEF's bytes, `application/octet-stream`, with an AtomicBEEF's
+/// 36-byte BRC-95 prefix sliced off, the same bytes the at-rest stream posts
+/// (`broadcast_at_rest`). ARC tells a BEEF by bytes 2 and 3, `BE EF`
+/// (`[SRC] bitcoin-sv/arc@e7efc5b internal/beef/beef.go:24-34`,
+/// `internal/validator/helpers.go:36-46`); the prefix's are `01 01`, so with
+/// the prefix kept ARC reads the body as raw transactions and answers 400
+/// before any validation (`internal/api/handler/default.go:405-414, 601-640`).
+/// Every caller of `broadcast_beef` reaches ARC here: the inline door of
+/// `internalizeAction` (an AtomicBEEF), the monitor's and `processAction`'s
+/// BEEFs (no prefix, unchanged), and the Arcade outage fallback.
+pub fn arc_beef_request(
+    beef_hex: &str,
+) -> std::result::Result<(Vec<u8>, &'static str), BroadcastError> {
+    use crate::broadcast_at_rest::{atomic_subject, ATOMIC_PREFIX_LEN};
+    let mut bytes = hex::decode(beef_hex)
+        .map_err(|e| BroadcastError::ServiceError(format!("the BEEF is not hex: {e}")))?;
+    let prefix = ATOMIC_PREFIX_LEN as usize;
+    if bytes.len() > prefix && atomic_subject(&bytes[..prefix]).is_some() {
+        bytes.drain(..prefix);
+    }
+    Ok((bytes, "application/octet-stream"))
 }
 
 /// A BEEF at rest posted as its body stream (NL-7c): `application/octet-stream`,

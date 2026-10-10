@@ -4,6 +4,40 @@ rust-wallet-infra is a deployed Worker, not a published crate: the version in
 `Cargo.toml` stays 0.1.0 and an entry here is named by its program and its
 date.
 
+## Broadcast body, 2026-10-09: ARC is handed the plain BEEF, never the AtomicBEEF (bsv-stack-lean #63)
+
+### Fixed
+
+- **The inline door's post to ARC.** `internalizeAction` with an inline `tx`
+  (or an object at rest of at most 4,096 bytes) handed ARC the caller's
+  AtomicBEEF, its 36-byte BRC-95 prefix kept, as `{"rawTx": hex}`. ARC tells a
+  BEEF by bytes 2 and 3, `BE EF` (bitcoin-sv/arc@e7efc5b
+  `internal/beef/beef.go:24-34`, `internal/validator/helpers.go:36-46`); the
+  prefix's are `01 01`, so ARC read the body as a raw transaction and answered
+  400 before any validation, both endpoints alike, and the payment's broadcast
+  waited for the monitor's escalation (three blocks) to re-post it in a form
+  ARC parses (bsv-stack-lean `docs/readings/broadcast-body-forms.md`, F1).
+  ARC's BEEF post (`arc_beef_request`) now slices the prefix off and posts the
+  BEEF's bytes as `application/octet-stream`, the same bytes the monitor's
+  stream of a BEEF at rest posts (NL-7c). Every caller of `broadcast_beef`
+  reaches ARC through it: the inline door, the Arcade outage fallback (which
+  handed ARC the same AtomicBEEF), and the monitor's and `processAction`'s
+  plain BEEFs, whose bytes are unchanged and now go as octet-stream instead
+  of hex in JSON. Arcade still gets EF. A body that is not hex is not posted.
+
+### Added
+
+- `services::arc::arc_beef_request`.
+- Tests: `tests/broadcast_body.rs` against bsv-stack-lean's six replay rows
+  (`corpus/runners/broadcast-body/`, copied under
+  `tests/fixtures/broadcast-body/` with their sha256 checked): the bytes ARC
+  reads from the request are a BEEF for every row, an AtomicBEEF's byte for
+  byte its plain row (the row the replay parses at ARC's pin) still holding
+  its subject, a plain row unchanged; red at `bc4c9ba`'s body on the three
+  AtomicBEEF rows. `tests/worker_beef_at_rest.mjs` gains the inline door's
+  post of an unproven payment, received by ARC as octet-stream, leading
+  `0200beef`, byte for byte the BEEF behind the prefix.
+
 ## NL-7c, 2026-10-09: a BEEF at rest is read only for the caller the object names; the monitor posts it as a stream
 
 The two remaining items of NL-7 (bsv-stack-lean #62), before the binding

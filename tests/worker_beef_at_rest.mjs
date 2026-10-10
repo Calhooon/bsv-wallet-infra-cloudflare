@@ -84,6 +84,7 @@ const outbound = async request => {
       type: request.headers.get('content-type'),
       length: request.headers.get('content-length'),
       bytes: bytes?.length,
+      lead: bytes?.subarray(0, 4).toString('hex'),
       sha: bytes && createHash('sha256').update(bytes).digest('hex'),
     })
     return new Response(JSON.stringify({ txid: '', txStatus: 'SEEN_ON_NETWORK' }),
@@ -193,6 +194,30 @@ print(json.dumps(statements))
     assert.equal(r.result.accepted, true)
     assert.equal(r.result.txid, txid)
     say(`inline, 1 transaction (${beef.length} bytes): accepted ${txid}`)
+  }
+
+  // 1b. bsv-stack-lean #63 (F1): the inline door's post of an unproven
+  // payment is the BEEF behind the AtomicBEEF's prefix, as bytes,
+  // application/octet-stream, the form the monitor's stream posts; never the
+  // prefix, which ARC at e7efc5b reads as a raw transaction and answers 400.
+  {
+    const { beef, txid } = chain(2)
+    const want = { bytes: beef.length - 36, sha: sha256(beef.subarray(36)) }
+    posts.length = 0
+    arcAnswers = true
+    const r = await internalize({ tx: beef.toString('hex') }, 'bb-1 inline, unproven')
+    arcAnswers = false
+    assert.ok(r.result, JSON.stringify(r))
+    assert.equal(r.result.txid, txid)
+    const whole = posts.filter(p => p.bytes !== undefined)
+    assert.ok(whole.length >= 1, `inline: no post was received: ${JSON.stringify(posts)}`)
+    for (const post of whole) {
+      assert.equal(post.type, 'application/octet-stream', `inline: ${JSON.stringify(post)}`)
+      assert.equal(post.lead, '0200beef', `inline: ${JSON.stringify(post)}`)
+      assert.equal(post.bytes, want.bytes, `inline: ${JSON.stringify(post)}`)
+      assert.equal(post.sha, want.sha, `inline: ${JSON.stringify(post)}`)
+    }
+    say(`inline, unproven (${beef.length} bytes): accepted ${txid}; posted to ${whole.map(p => p.host).join(' and ')}: application/octet-stream, leading 0200beef, byte for byte the BEEF behind the prefix (${want.bytes} bytes)`)
   }
 
   // 2 and 3. The relay's two shapes at rest: the 100,000-link payment and the
