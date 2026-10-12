@@ -63,6 +63,7 @@ pub fn script_refusal(tx: &Transaction, sources: &[TransactionOutput]) -> Option
                     input_sequence: input.sequence,
                     lock_time: tx.lock_time,
                     memory_limit: None,
+                    work_limit: None,
                 });
                 spend.set_flags(ScriptFlags::block(era));
                 spend.set_utxo_after_chronicle(after);

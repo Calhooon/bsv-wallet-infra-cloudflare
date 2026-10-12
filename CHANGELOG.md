@@ -4,6 +4,11 @@ rust-wallet-infra is a deployed Worker, not a published crate: the version in
 `Cargo.toml` stays 0.1.0 and an entry here is named by its program and its
 date.
 
+## Unreleased
+
+- bsv-rs 0.4.5: the lone leaf at offset 0 only; the LOCAL work bound; no behavior change under the defaults.
+- Pin bsv-middleware-cloudflare to =0.5.1 (core 0.2.1).
+
 ## L2, 2026-10-11: broadcast refusals are history hints; request history is served (#72, #73)
 
 ### Fixed
