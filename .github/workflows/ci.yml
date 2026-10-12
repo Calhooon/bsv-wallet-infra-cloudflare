@@ -1,60 +1,99 @@
-name: CI
-
-on:
+# Shared Worker gate: PR head, read-only token, pinned Rust, cached cargo.
+# Host clippy covers all targets; wasm clippy covers libraries because SQLite dev tests are native.
+name: ci
+'on':
+  pull_request: null
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
+    branches:
+    - main
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
 jobs:
-  check:
-    name: Check, Lint, Test, Build
+  test:
+    name: test
     runs-on: ubuntu-latest
-
     steps:
-      # Self-contained once bsv-middleware-cloudflare 0.3.6 is on crates.io: until
-      # then Cargo.toml path-deps a local lane worktree (TEMP, M5 #36) and CI cannot resolve it.
-      - name: Checkout rust-wallet-infra
-        uses: actions/checkout@v4
-        with:
-          path: rust-wallet-infra
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target
+    - run: cargo test --no-fail-fast
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target
+    - run: cargo fmt --all -- --check
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target
+    - run: cargo clippy --all-targets -- -D warnings
+    - run: cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
+  wasm32:
+    name: wasm32
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target
+    - run: cargo install worker-build@0.8.4 --locked
+    - run: worker-build --release
+  worker:
+    name: worker
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - run: cargo install worker-build@0.8.4 --locked
+    - run: worker-build --release
+    - run: npm install --prefix "$RUNNER_TEMP/worker-gate-node" --no-save --package-lock=false miniflare@4.20260426.0
+        @bsv/sdk@3.2.0
+    - run: 'export MINIFLARE_MODULE="$RUNNER_TEMP/worker-gate-node/node_modules/miniflare/dist/src/index.js"
 
-      # --- Rust toolchain ---
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          components: rustfmt, clippy
+        export BSV_SDK_MODULE="$RUNNER_TEMP/worker-gate-node/node_modules/@bsv/sdk/dist/esm/mod.js"
 
-      # --- Cache ---
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust-wallet-infra/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-wallet-infra/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      # --- Checks (run from the project directory) ---
-      - name: cargo fmt --check
-        working-directory: rust-wallet-infra
-        run: cargo fmt --check
-
-      - name: cargo clippy
-        working-directory: rust-wallet-infra
-        run: cargo clippy -- -D warnings
-
-      - name: cargo test
-        working-directory: rust-wallet-infra
-        run: cargo test
-
-      # --- WASM build verification ---
-      - name: Install worker-build
-        run: cargo install --version ^0.8 worker-build
-
-      - name: worker-build --release
-        working-directory: rust-wallet-infra
-        run: worker-build --release
+        node tests/worker_beef_at_rest.mjs'

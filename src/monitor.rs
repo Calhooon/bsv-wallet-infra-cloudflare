@@ -4185,22 +4185,22 @@ mod tests {
 
     #[test]
     fn test_unfail_timing_guard_skips_on_5_minute() {
-        assert!(!(5u32 < 5));
+        assert!(5u32 >= 5);
     }
 
     #[test]
     fn test_unfail_timing_guard_skips_on_7_minute() {
-        assert!(!(7u32 < 5));
+        assert!(7u32 >= 5);
     }
 
     #[test]
     fn test_unfail_timing_guard_skips_on_15_minute() {
-        assert!(!(15u32 % 10 < 5));
+        assert!(15u32 % 10 >= 5);
     }
 
     #[test]
     fn test_unfail_timing_guard_skips_on_55_minute() {
-        assert!(!(55u32 % 10 < 5));
+        assert!(55u32 % 10 >= 5);
     }
 
     #[test]
@@ -5032,7 +5032,7 @@ mod tests {
     fn test_nosend_timing_guard_midnight_only() {
         // The guard: hour() == 0 && minute() == 0
         // Should fire only at midnight UTC (00:00)
-        assert!(0u32 == 0 && 0u32 == 0); // 00:00 -> fires
+        assert!(0u32 == 0); // 00:00 -> fires
     }
 
     #[test]
@@ -5259,7 +5259,7 @@ mod tests {
         let current: u32 = 890124;
         let last: u32 = 890123;
         assert!(current > last);
-        assert!(!(current < last));
+        assert!(current >= last);
     }
 
     #[test]
@@ -5267,7 +5267,7 @@ mod tests {
         let current: u32 = 890123;
         let last: u32 = 890123;
         assert!(current == last);
-        assert!(!(current < last));
+        assert!(current >= last);
     }
 
     #[test]
