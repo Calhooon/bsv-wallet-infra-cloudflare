@@ -1,223 +1,66 @@
-# rust-wallet-infra
+# bsv-wallet-infra-cloudflare
 
-Self-hosted BSV wallet storage server running on Cloudflare Workers.
+Self-hosted BSV wallet storage on Cloudflare Workers. JSON-RPC dispatch uses
+D1 for structured wallet state, R2 for blob storage and BRC-31 middleware for
+identity authentication. The public repository is a sanitized release mirror;
+changes are developed on canonical branches and cut by the maintainer.
 
-Built in Rust, compiled to WebAssembly. Backed by D1 (SQLite) for structured data and R2 for blob overflow. Authenticated via [BRC-31](https://brc.dev/31) mutual identity protocol.
+## Version and architecture
 
-Drop-in replacement for `storage.babbage.systems`.
+The source line is **fb8237f**, with **bsv-rs =0.4.5** and
+**bsv-middleware-cloudflare =0.5.1** in [Cargo.toml](Cargo.toml). The local package
+version is 0.1.0; the source revision identifies this Worker release.
 
----
+[src/lib.rs](src/lib.rs) handles HTTP and authentication,
+[src/dispatch.rs](src/dispatch.rs) routes JSON-RPC methods, and
+[src/storage](src/storage) implements wallet reads and writes.
+The dispatch accepts positional arrays and named objects. Authentication and
+ownership requirements belong to each method; a health response is not an
+assertion that every RPC is public or every RPC requires authentication.
 
-## Architecture
+## The server half of tracking
 
-```
-                          POST / (JSON-RPC 2.0)
-                          BRC-31 auth headers
-                                 |
-                                 v
-                    +------------------------+
-                    |   Cloudflare Worker     |
-                    |   (Rust -> WASM)        |
-                    +------------------------+
-                    |  BRC-31 Auth Middleware  |
-                    |  Session via KV          |
-                    +------------------------+
-                    |  JSON-RPC Dispatch       |
-                    +------------------------+
-                         /            \
-                        v              v
-               +------------+   +------------+
-               |  D1 (SQLite)|   |  R2 (Blobs)|
-               |  16 tables  |   |  > 4KB     |
-               +------------+   +------------+
-```
+A broadcaster's refusal is a hint that schedules another check. It does not
+by itself make a transaction invalid, release its inputs or write off its
+change. Attempt counts are not evidence of chain rejection. The monitor keeps
+the transaction pending while recording hints and checking evidence;
+[src/monitor.rs](src/monitor.rs) holds that behavior.
 
-**Stack**: Rust `cdylib` -> `wasm32-unknown-unknown` -> Cloudflare Workers
+The authenticated `findProvenTxReqs` method is served by
+[src/dispatch.rs](src/dispatch.rs), scoped to the caller's user. It lets the
+wallet read its pending proof requests from shared storage. The server and
+local toolbox must preserve the same distinction between hints and proof.
 
-**Storage**: D1 handles all structured data. Blobs larger than 4,096 bytes overflow to R2 with key format `{table}/{id}/{column}`.
+## Bytes at rest
 
-**Auth**: Every request is authenticated via BRC-31 mutual authentication. Sessions are cached in KV with 1-hour TTL. Responses are signed with the server's identity key.
+The `BEEF_AT_REST` R2 binding lets the server read a relay's referenced payment
+object during internalization. The binding must name the bucket holding those
+bytes; the server checks recipient metadata and the referenced object before
+acceptance. Merely declaring the binding does not create the relay's objects.
+This is separate from wallet blob overflow storage. The compiled witness is
+[tests/worker_beef_at_rest.mjs](tests/worker_beef_at_rest.mjs).
 
----
+## Build, gate and deploy
 
-## API
-
-All methods use **JSON-RPC 2.0** over `POST /`.
-
-| Method | Auth | Description |
-|---|---|---|
-| `makeAvailable` | No | Health check — confirms D1 is initialized |
-| `migrate` | No | Initialize settings row, returns chain (`"mainnet"`) |
-| `findOrInsertUser` | No | Find or create user by identity key |
-| `internalizeAction` | Yes | Accept external BSV transactions into the wallet |
-| `listOutputs` | Yes | Query spendable outputs with basket/tag filtering |
-| `listActions` | Yes | Query transactions with label filtering |
-
-**Additional endpoints:**
-
-| Method | Path | Description |
-|---|---|---|
-| `GET /` | — | Health check: `{"status":"ok","service":"wallet-infra"}` |
-| `POST /.well-known/auth` | — | BRC-31 handshake (handled by middleware) |
-
-### Example request
-
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "listOutputs",
-  "params": {
-    "basket": "default",
-    "include": "locking scripts",
-    "limit": 25
-  },
-  "id": 1
-}
+```sh
+cargo build --target wasm32-unknown-unknown --lib
+cargo fmt --all -- --check
 ```
 
----
+[.github/workflows/ci.yml](.github/workflows/ci.yml) defines `test`, `fmt`,
+`clippy`, `wasm32` and `worker` on PR heads and main pushes. It runs host tests,
+host and wasm clippy, builds the Worker with worker-build 0.8.4, and runs the
+Miniflare bytes-at-rest witness with the JavaScript SDK. The Miniflare test
+checks the compiled Worker and its D1/R2/auth behavior; a native build is not
+that proof.
 
-## Data Model
+For deployment, build from a clean release checkout, provision the D1, KV and
+R2 bindings in [wrangler.toml](wrangler.toml), configure credentials privately,
+and apply [migrations](migrations) before serving the Worker. Bind the at-rest
+bucket only when the producer and recipient contract agree. The operator owns
+resource creation, deployment and initialization; no deployment identifiers
+belong in this README.
 
-16 tables in D1 covering the full BSV wallet storage schema:
-
-| Domain | Tables |
-|---|---|
-| **Transactions** | `transactions`, `proven_txs`, `proven_tx_reqs`, `commissions` |
-| **Outputs** | `outputs`, `output_baskets`, `output_tags`, `output_tags_map` |
-| **Labels** | `tx_labels`, `tx_labels_map` |
-| **Identity** | `users`, `certificates`, `certificate_fields` |
-| **System** | `settings`, `sync_states`, `monitor_events` |
-
----
-
-## Setup
-
-### Prerequisites
-
-- Rust toolchain with `wasm32-unknown-unknown` target
-- [wrangler](https://developers.cloudflare.com/workers/wrangler/) CLI v3+
-- Cloudflare account with D1, R2, and KV enabled
-- `bsv-middleware-cloudflare` 0.3.6 (crates.io; a local path until it publishes, see `Cargo.toml`)
-
-### 1. Install dependencies
-
-```bash
-rustup target add wasm32-unknown-unknown
-cargo install --version ^0.8 worker-build   # worker 0.8 needs worker-build ^0.8
-npm install
-```
-
-### 2. Configure Cloudflare resources
-
-Create the D1 database, R2 bucket, and KV namespace, then update `wrangler.toml` with your IDs:
-
-```bash
-npx wrangler d1 create wallet-infra
-npx wrangler r2 bucket create wallet-infra-blobs
-npx wrangler kv namespace create AUTH_SESSIONS
-```
-
-### 3. Set the server private key
-
-```bash
-npx wrangler secret put SERVER_PRIVATE_KEY
-```
-
-### 4. Run migrations
-
-```bash
-npx wrangler d1 migrations apply wallet-infra
-```
-
-### 5. Initialize storage
-
-Call `migrate` via JSON-RPC to create the settings row:
-
-```bash
-curl -X POST https://your-domain.com/ \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"migrate","params":{"storageName":"wallet-infra"},"id":1}'
-```
-
----
-
-## Development
-
-```bash
-# Local dev server with D1/R2 emulation
-npm run dev
-
-# Build WASM (release)
-worker-build --release
-
-# Deploy to Cloudflare
-npm run deploy
-```
-
----
-
-## Project Structure
-
-```
-src/
-  lib.rs                     # Worker entry point, auth, routing
-  dispatch.rs                # JSON-RPC method router
-  json_rpc.rs                # JSON-RPC 2.0 protocol types
-  entities.rs                # Data model structs (16 tables)
-  types.rs                   # Query/result types, auth, sync
-  error.rs                   # Error enum
-  r2.rs                      # R2 blob store (4KB threshold)
-  d1/
-    mod.rs                   # D1 query builder, WhereBuilder
-    batch.rs                 # Atomic batch execution (100-stmt chunks)
-  storage/
-    mod.rs                   # StorageD1 struct
-    writers.rs               # Write ops: migrate, users, baskets, labels
-    readers.rs               # Read ops: listOutputs, listActions
-    internalize_action.rs    # BEEF parsing, tx internalization
-    beef_verification.rs     # Merkle proof verification
-migrations/
-  0001_initial.sql           # D1 schema (16 tables + indexes)
-```
-
----
-
-## Key Design Decisions
-
-**D1 query builder** — Cloudflare D1 uses JsValue bindings, not sqlx. A custom `Query` builder with `WhereBuilder` handles parameterized queries with type-safe value binding.
-
-**Batch atomicity** — D1 has no `BEGIN`/`COMMIT`. Instead, `db.batch()` executes up to 100 statements atomically. `BatchCollector` auto-chunks larger batches.
-
-**Hybrid storage** — Small values (<=4KB) stay inline in D1 columns. Larger blobs (raw transactions, BEEF data) overflow to R2 for cost efficiency.
-
-**Dual param format** — The dispatch layer accepts both positional arrays (from BSV Toolbox StorageClient) and named objects (from direct callers), normalizing them before passing to handlers.
-
----
-
-## Dependencies
-
-| Crate | Purpose |
-|---|---|
-| `bsv-middleware-cloudflare` | BRC-31 auth middleware |
-| `bsv-sdk` (`bsv-rs` 0.3) | BSV primitives (BEEF, transactions, wallet types) |
-| `worker` | Cloudflare Workers Rust SDK |
-| `serde` / `serde_json` | Serialization |
-| `chrono` | Date/time handling |
-| `hex` / `base64` | Encoding |
-
----
-
-## License
-
-Private. All rights reserved.
-
-## internalizeAction result extensions (non-normative)
-
-`mergeResults` / `noop` on the internalizeAction result are NON-NORMATIVE
-debug hints (a guarded merge UPDATE that changed 0 rows). The ecosystem
-protocol expresses merge no-ops by silence; the real client mechanism is a
-read-back (`listOutputs`) after internalize — do not build client behavior
-on these fields. Broadcast-failure demotion is expressed canonically via
-`sendWithResults` (`unproven`) + `notDelayedResults` (`serviceError`), per
-wallet-toolbox `WalletStorage.interfaces.ts`.
+[CHANGELOG.md](CHANGELOG.md) records changes and [tests](tests) contains the
+host and Worker witnesses. [docs/E2E_TEST_HARNESS_DESIGN.md](docs/E2E_TEST_HARNESS_DESIGN.md)
+describes the integration harness. Licensing metadata is in [Cargo.toml](Cargo.toml).
