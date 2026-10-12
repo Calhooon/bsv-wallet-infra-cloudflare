@@ -945,95 +945,28 @@ async fn send_waiting<B: BroadcastService + StreamBroadcast<wasm_bindgen::JsValu
                 let _ = batch.execute().await;
                 sent += 1;
             }
-            Err(crate::services::BroadcastError::DoubleSpend(msg)) => {
-                console_log!("send_waiting: double-spend txid={}: {}", txid, msg);
-                let now = Utc::now().to_rfc3339();
-                let mut batch = BatchCollector::new(db);
-                let _ = batch.add(
-                    "UPDATE proven_tx_reqs SET status = 'doubleSpend', updated_at = ? WHERE proven_tx_req_id = ?",
-                    vec![QVal::Text(now.clone()), QVal::Int(req_id)],
-                );
-                let _ = batch.add(
-                    "UPDATE transactions SET status = 'failed', updated_at = ? WHERE txid = ?",
-                    vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
-                );
-                // Books on a positive ARC fail verdict (audit M1; reference:
-                // Go reviewKnownTxStatuses — RecreateSpentOutputs +
-                // MarkCreatedOutputsAsNotSpendable; same statements as
-                // process_action's inline DoubleSpend branch):
-                //  1. RELEASE the INPUTS this tx had locked (spent_by → this
-                //     transaction) — the tx will never consume them. The
-                //     basket_id IS NOT NULL guard keeps relinquished rows dead.
-                //  2. De-recognize the tx's own CREATED outputs — they will
-                //     never exist on-chain; spendable=1 here would be phantom
-                //     money the coin selector picks and bricks on.
-                // (The old code did the exact inverse: re-enabled the created
-                // outputs and never touched the input locks.)
-                let _ = batch.add(
-                    FAIL_RELEASE_INPUTS_SQL,
-                    vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
-                );
-                let _ = batch.add(
-                    FAIL_DERECOGNIZE_CREATED_SQL,
-                    vec![QVal::Text(now), QVal::Text(txid.clone())],
-                );
-                let _ = batch.execute().await;
-                errors += 1;
-                if error_msgs.len() < 5 {
-                    error_msgs.push(format!(
-                        "doubleSpend({}): {}",
-                        &txid[..8.min(txid.len())],
-                        msg
-                    ));
-                }
-            }
-            Err(crate::services::BroadcastError::InvalidTx(msg)) => {
-                console_log!("send_waiting: invalid tx txid={}: {}", txid, msg);
-                let now = Utc::now().to_rfc3339();
-                let mut batch = BatchCollector::new(db);
-                let _ = batch.add(
-                    "UPDATE proven_tx_reqs SET status = 'invalid', updated_at = ? WHERE proven_tx_req_id = ?",
-                    vec![QVal::Text(now.clone()), QVal::Int(req_id)],
-                );
-                let _ = batch.add(
-                    "UPDATE transactions SET status = 'failed', updated_at = ? WHERE txid = ?",
-                    vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
-                );
-                // Same books correction as the DoubleSpend arm (audit M1):
-                // release the inputs, de-recognize the created outputs.
-                let _ = batch.add(
-                    FAIL_RELEASE_INPUTS_SQL,
-                    vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
-                );
-                let _ = batch.add(
-                    FAIL_DERECOGNIZE_CREATED_SQL,
-                    vec![QVal::Text(now), QVal::Text(txid.clone())],
-                );
-                let _ = batch.execute().await;
-                errors += 1;
-                if error_msgs.len() < 5 {
-                    error_msgs.push(format!(
-                        "invalidTx({}): {}",
-                        &txid[..8.min(txid.len())],
-                        msg
-                    ));
-                }
-            }
-            Err(crate::services::BroadcastError::ServiceError(msg)) => {
-                console_error!("send_waiting: service error txid={}: {}", txid, msg);
-                // Transient — increment attempts, keep status as-is, inputs stay locked.
-                let now = Utc::now().to_rfc3339();
-                let _ = Query::new(
-                    "UPDATE proven_tx_reqs SET attempts = ?, updated_at = ? WHERE proven_tx_req_id = ?",
+            Err(error) => {
+                let outcome = match &error {
+                    crate::services::BroadcastError::DoubleSpend(_) => "doubleSpend",
+                    crate::services::BroadcastError::InvalidTx(_) => "invalidTx",
+                    crate::services::BroadcastError::ServiceError(_) => "serviceError",
+                };
+                crate::storage::tracker_rule::append_note(
+                    db,
+                    &txid,
+                    serde_json::json!({
+                        "when": Utc::now().to_rfc3339(), "what": "monitorBroadcastHint",
+                        "outcome": outcome, "words": [error.to_string()], "nextReaskMinutes": 5,
+                    }),
                 )
-                .bind(attempts + 1)
-                .bind(now.as_str())
-                .bind(req_id)
-                .execute(db)
-                .await;
+                .await
+                .map_err(|e| Error::from(e.to_string()))?;
+                Query::new("UPDATE proven_tx_reqs SET status = 'unsent', attempts = attempts + 1, updated_at = ? WHERE proven_tx_req_id = ? AND status IN ('unsent', 'sending')")
+                    .bind(Utc::now().to_rfc3339()).bind(req_id).execute(db).await
+                    .map_err(|e| Error::from(e.to_string()))?;
                 errors += 1;
                 if error_msgs.len() < 5 {
-                    error_msgs.push(format!("service({}): {}", &txid[..8.min(txid.len())], msg));
+                    error_msgs.push(error.to_string());
                 }
             }
         }

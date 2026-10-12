@@ -4,6 +4,47 @@ rust-wallet-infra is a deployed Worker, not a published crate: the version in
 `Cargo.toml` stays 0.1.0 and an entry here is named by its program and its
 date.
 
+## L2, 2026-10-11: broadcast refusals are history hints; request history is served (#72, #73)
+
+### Fixed
+
+- **The server post and the remote post result.** `processAction` no longer
+  writes `failed`, `invalid` or `doubleSpend`, releases inputs or removes
+  created outputs on a broadcaster's refusal. It records the word in the
+  request's history and queues `unsent` for the existing five-minute monitor
+  cadence. `updateTransactionStatusAfterBroadcast(false)` does the same,
+  including when no status source knows the transaction. The monitor's next
+  post also records a hint and retains the locks; a re-ask cannot turn the
+  same refusal into a failure. Acceptance records a note too.
+- **The local script verdict.** Both immediate paths run bsv-rs's `Spend`
+  against locally stored, hash-matched parent transactions. A script that
+  refuses under every supported block era and both UTXO eras can write
+  `failed` / `invalid` and release inputs in an atomic D1 batch. A completed request blocks every book write. Policy flags
+  are never used. Missing local parent bytes, an unavailable store, missing
+  input context and local resource exhaustion cannot write a verdict.
+  This is a conservative script check, not a complete transaction evaluator.
+- **History writes.** Notes append against the current D1 value, preserve
+  other history keys, mark client notes with their source, and retain the newest 32 notes as toolbox v0.7.4 does.
+  The existing `history` column suffices; no D1 migration.
+
+### Added
+
+- **`findProvenTxReqs`.** Authenticated, scoped through the caller's
+  transactions, with txid/status filters, since, ordering and pagination;
+  named and positional arguments. Rows carry history and inline or R2 bytes.
+- **Client post notes on the write path.** The status method accepts an
+  optional third argument `{notes: [...]}` after `[txid, success]`, or
+  `notes` beside `txid` and `success` in named arguments. Notes use the
+  toolbox's `{when, what, ...}` shape and are read back from the same history.
+  Legacy bool-only clients get a `clientBroadcastHint` recording exactly
+  that bool. Toolbox v0.7.4 sends no detailed notes: the server cannot recover
+  words that never crossed the wire; carrying those words needs a client
+  change outside this lane. No client changed here.
+- Tests: `tests/worker_tracker_rule.mjs`, the compiled Worker in Miniflare
+  through BRC-31 with local D1 and mocked outbound requests, and
+  `tests/tracker_rule.rs`, the pure evaluator's refusal, pass, policy and
+  missing-context witnesses. `npm run test:worker` includes both Worker files.
+
 ## Broadcast body, 2026-10-09: ARC is handed the plain BEEF, never the AtomicBEEF (bsv-stack-lean #63)
 
 ### Fixed

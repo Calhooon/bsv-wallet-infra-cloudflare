@@ -77,6 +77,7 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
         // Phase 2: Reader methods
         "listOutputs" => handle_list_outputs(storage, params, id.clone(), auth).await,
         "listActions" => handle_list_actions(storage, params, id.clone(), auth).await,
+        "findProvenTxReqs" => handle_find_proven_tx_reqs(storage, params, id.clone(), auth).await,
         "getBalance" => handle_get_balance(storage, params, id.clone(), auth).await,
         "getAnalyticsSummary" => {
             handle_get_analytics_summary(storage, params, id.clone(), auth).await
@@ -144,6 +145,25 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
 // =============================================================================
 // Handlers
 // =============================================================================
+
+async fn handle_find_proven_tx_reqs<
+    B: crate::services::BroadcastService + crate::services::ProofService,
+>(
+    storage: &StorageD1<'_, B>,
+    params: Value,
+    id: Value,
+    auth: Option<&AuthId>,
+) -> Result<Value, Error> {
+    let auth = auth
+        .ok_or_else(|| Error::ValidationError("findProvenTxReqs requires authentication".into()))?;
+    let (user_id, _) = storage.resolve_auth(auth).await?;
+    let args = serde_json::from_value(extract_args(&params, true))?;
+    let rows = storage.find_proven_tx_reqs(user_id, args).await?;
+    Ok(serde_json::to_value(JsonRpcResponse::success(
+        id,
+        serde_json::to_value(rows)?,
+    ))?)
+}
 
 async fn handle_make_available<
     B: crate::services::BroadcastService + crate::services::ProofService,
@@ -457,8 +477,15 @@ async fn handle_update_tx_status<
         (txid, success)
     };
 
+    // Additive write-path extension: [txid, bool, {notes: [...]}] or
+    // {txid, success, notes: [...]}. The pinned toolbox's bool still works.
+    let payload = params.as_array().and_then(|a| a.get(2)).unwrap_or(&params);
+    let notes: Vec<Value> = match payload.get("notes") {
+        Some(value) => serde_json::from_value(value.clone())?,
+        None => Vec::new(),
+    };
     storage
-        .update_transaction_status_after_broadcast(user_id, &txid, success)
+        .update_transaction_status_after_broadcast(user_id, &txid, success, &notes)
         .await?;
     Ok(serde_json::to_value(JsonRpcResponse::success(id, Value::Null)).unwrap())
 }

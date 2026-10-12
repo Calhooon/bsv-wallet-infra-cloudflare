@@ -516,6 +516,21 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         }
         bench.lap("write_batch_and_req");
 
+        // A script refusal established here is the only immediate-post failure.
+        // Missing local parent bytes are no verdict; the monitor keeps re-asking.
+        if let Some(reason) = self.local_script_refusal(raw_tx).await? {
+            self.fail_local_script(user_id, provided_txid, &reason)
+                .await?;
+            return Ok(StorageProcessActionResults {
+                send_with_results: Some(vec![SendWithResult {
+                    txid: provided_txid.to_string(),
+                    status: "failed".into(),
+                }]),
+                not_delayed_results: None,
+                log: Some(reason),
+            });
+        }
+
         // =====================================================================
         // Step 11: Broadcast transaction to BSV network
         //
@@ -575,6 +590,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                             provided_txid
                         );
                     }
+                    self.record_hint(
+                        provided_txid,
+                        "immediateBroadcastHint",
+                        "success",
+                        serde_json::json!([result.tx_status]),
+                        false,
+                    )
+                    .await?;
                     // Update to unproven/unmined (broadcast succeeded)
                     let mut bcast_batch = BatchCollector::new(self.db);
                     let _ = bcast_batch.add(
@@ -587,96 +610,20 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     );
                     let _ = bcast_batch.execute().await;
                 }
-                Err(crate::services::BroadcastError::DoubleSpend(msg)) => {
-                    // DOUBLE-SPEND: Input already spent by a competing tx.
-                    // Permanent failure -- mark as failed, release locked inputs.
-                    worker::console_log!(
-                        "processAction: broadcast double-spend for txid={}: {}",
+                Err(error) => {
+                    let outcome = match &error {
+                        crate::services::BroadcastError::InvalidTx(_) => "invalidTx",
+                        crate::services::BroadcastError::DoubleSpend(_) => "doubleSpend",
+                        crate::services::BroadcastError::ServiceError(_) => "serviceError",
+                    };
+                    self.record_hint(
                         provided_txid,
-                        msg
-                    );
-                    let mut fail_batch = BatchCollector::new(self.db);
-                    let _ = fail_batch.add(
-                        "UPDATE transactions SET status = 'failed', updated_at = ? WHERE transaction_id = ?",
-                        vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
-                    );
-                    let _ = fail_batch.add(
-                        "UPDATE proven_tx_reqs SET status = 'doubleSpend', updated_at = ? WHERE txid = ?",
-                        vec![QVal::Text(now_str.clone()), QVal::Text(provided_txid.to_string())],
-                    );
-                    let _ = fail_batch.add(
-                        "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ? AND basket_id IS NOT NULL",
-                        vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
-                    );
-                    // Clean up the outputs this tx was going to create: since the
-                    // tx failed and never hit chain, they're phantoms. Without
-                    // this the coin selector will keep picking them as inputs
-                    // and bricking subsequent consolidation rounds.
-                    let _ = fail_batch.add(
-                        "UPDATE outputs SET spendable = 0, updated_at = ? WHERE transaction_id = ?",
-                        vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
-                    );
-                    let _ = fail_batch.execute().await;
-                }
-                Err(crate::services::BroadcastError::InvalidTx(msg)) => {
-                    // INVALID TX: Malformed transaction, script verification failed, etc.
-                    // Permanent failure -- mark as failed, release locked inputs.
-                    worker::console_log!(
-                        "processAction: broadcast invalid tx for txid={}: {}",
-                        provided_txid,
-                        msg
-                    );
-
-                    let mut fail_batch = BatchCollector::new(self.db);
-                    let _ = fail_batch.add(
-                        "UPDATE transactions SET status = 'failed', updated_at = ? WHERE transaction_id = ?",
-                        vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
-                    );
-                    let _ = fail_batch.add(
-                        "UPDATE proven_tx_reqs SET status = 'invalid', updated_at = ? WHERE txid = ?",
-                        vec![QVal::Text(now_str.clone()), QVal::Text(provided_txid.to_string())],
-                    );
-                    let _ = fail_batch.add(
-                        "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ? AND basket_id IS NOT NULL",
-                        vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
-                    );
-                    // Clean up the outputs this tx was going to create — phantoms
-                    // if we don't (see comment in the DoubleSpend branch above).
-                    let _ = fail_batch.add(
-                        "UPDATE outputs SET spendable = 0, updated_at = ? WHERE transaction_id = ?",
-                        vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
-                    );
-                    let _ = fail_batch.execute().await;
-                }
-                Err(crate::services::BroadcastError::ServiceError(msg)) => {
-                    // SERVICE ERROR: All ARC endpoints returned ambiguous (timeout,
-                    // 5xx, or tx accepted but not SEEN_ON_NETWORK within waitFor).
-                    // The tx may still have propagated — e.g. WoC mempool picks it up
-                    // while ARC takes longer to flip its status. Marking 'failed' +
-                    // releasing inputs here created the phantom-UTXO cascade.
-                    //
-                    // Canonical wallet-toolbox serviceError semantics (TS
-                    // `attemptToPostReqsToNetwork.ts:240-244`): both statuses go to
-                    // 'sending', increment attempts, DO NOT release inputs, DO NOT
-                    // mark future outputs unspendable. Monitor's `check_for_proofs`
-                    // polls `proven_tx_reqs.status='sending'` and reconciles on
-                    // proof arrival. True zombies eventually drain via
-                    // the canary/escalation machinery (never by attempt count).
-                    worker::console_log!(
-                        "processAction: broadcast service error for txid={} — leaving 'sending' for monitor: {}",
-                        provided_txid,
-                        msg
-                    );
-                    let mut retry_batch = BatchCollector::new(self.db);
-                    let _ = retry_batch.add(
-                        "UPDATE transactions SET status = 'sending', updated_at = ? WHERE transaction_id = ?",
-                        vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
-                    );
-                    let _ = retry_batch.add(
-                        "UPDATE proven_tx_reqs SET status = 'sending', attempts = attempts + 1, updated_at = ? WHERE txid = ?",
-                        vec![QVal::Text(now_str.clone()), QVal::Text(provided_txid.to_string())],
-                    );
-                    let _ = retry_batch.execute().await;
+                        "immediateBroadcastHint",
+                        outcome,
+                        serde_json::json!([error.to_string()]),
+                        true,
+                    )
+                    .await?;
                 }
             }
         }
@@ -741,157 +688,81 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         })
     }
 
-    /// Called after a broadcast attempt to update transaction status.
-    ///
-    /// On success: transaction → 'unproven', proven_tx_req → 'unmined'
-    /// On failure: restore inputs (spendable), transaction → 'failed', proven_tx_req → 'invalid'
+    /// A client's post result is a history hint, never a failure verdict.
+    /// Legacy clients carry only a bool; optional notes preserve richer words.
     pub async fn update_transaction_status_after_broadcast(
         &self,
         user_id: i64,
         txid: &str,
         success: bool,
+        notes: &[serde_json::Value],
     ) -> Result<()> {
-        let now = Utc::now();
-        let now_str = now.to_rfc3339();
-
-        if success {
-            // Chain-truth gate (audit minor-2): 'unproven'/'unmined' are
-            // statements that the tx IS on the network — a client claim is
-            // not evidence. Verify with the status service before promoting;
-            // if the network doesn't know the txid (or the check fails),
-            // leave the current status alone — the server's own broadcast
-            // path and the monitor own the truth.
-            let net_status = self
-                .broadcast
-                .get_status_for_txids(&[txid.to_string()])
-                .await
-                .ok()
-                .and_then(|v| v.into_iter().next())
-                .map(|s| s.status)
-                .unwrap_or_else(|| "unavailable".to_string());
-            if net_status != "known" && net_status != "mined" {
-                worker::console_log!(
-                    "update_transaction_status_after_broadcast: client claims success for {} but network says '{}' — not promoting",
-                    txid,
-                    net_status
-                );
-                return Ok(());
-            }
-
-            let mut batch = BatchCollector::new(self.db);
-
-            batch.add(
-                "UPDATE transactions SET status = 'unproven', updated_at = ? WHERE txid = ? AND user_id = ?",
-                vec![
-                    QVal::Text(now_str.clone()),
-                    QVal::Text(txid.to_string()),
-                    QVal::Int(user_id),
-                ],
-            )?;
-
-            batch.add(
-                "UPDATE proven_tx_reqs SET status = 'unmined', updated_at = ? WHERE txid = ?",
-                vec![QVal::Text(now_str), QVal::Text(txid.to_string())],
-            )?;
-
-            batch.execute().await?;
-        } else {
-            // Reconcile guard: the server-side `processAction` broadcasts too,
-            // and the client's re-broadcast can race the server's. If the
-            // server already transitioned this tx to `unproven` / `completed`
-            // (broadcast succeeded) or `sending` (broadcast in flight), do
-            // NOT overwrite to `failed` on the client's say-so — that would
-            // release inputs we may already have consumed on chain, creating
-            // a real double-spend risk. Log a warning and return Ok.
-            #[derive(Deserialize)]
-            struct TxRow {
-                transaction_id: Option<f64>,
-                status: Option<String>,
-            }
-
-            let tx_row: Option<TxRow> = Query::new(
-                "SELECT transaction_id, status FROM transactions WHERE txid = ? AND user_id = ?",
-            )
-            .bind(txid)
-            .bind(user_id)
-            .fetch_optional(self.db)
-            .await?;
-
-            if let Some(row) = tx_row {
-                let tx_id = row.transaction_id.map(|v| v as i64).unwrap_or(0);
-                let current_status = row.status.as_deref().unwrap_or("");
-
-                // Only fail-close when the tx is still in a pre-broadcast or
-                // actively-sending state. After `unproven`/`completed`, the
-                // server owns the truth and the monitor can retry/verify.
-                const FAILABLE_FROM: &[&str] =
-                    &["unsigned", "unprocessed", "nosend", "nonfinal", "sending"];
-                // Chain-truth gate, mirroring the success branch (parity
-                // audit Q1a): a client's failure claim must not fail a tx
-                // the network already knows — the server's own broadcast
-                // may have raced ahead of the client's.
-                let net_status = self
-                    .broadcast
-                    .get_status_for_txids(&[txid.to_string()])
-                    .await
-                    .ok()
-                    .and_then(|v| v.into_iter().next())
-                    .map(|s| s.status)
-                    .unwrap_or_else(|| "unavailable".to_string());
-                if net_status == "known" || net_status == "mined" {
-                    worker::console_log!(
-                        "update_transaction_status_after_broadcast: client claims failure for {} but network says '{}' — refusing to fail",
-                        txid,
-                        net_status
-                    );
-                    return Ok(());
-                }
-                if !FAILABLE_FROM.contains(&current_status) {
-                    worker::console_log!(
-                        "update_transaction_status_after_broadcast: refusing to mark \
-                         tx {} as failed — current server status is '{}'. Trusting server.",
-                        txid,
-                        current_status
-                    );
-                    return Ok(());
-                }
-
-                let mut batch = BatchCollector::new(self.db);
-
-                // Restore locked inputs. All three input-release statements in
-                // this file share two invariants with abort_action/fail_abandoned:
-                //   G4 — never clear `reserved_until` (reserveOutputs
-                //        reservations release only by expiry/unreserveOutputs);
-                //   G5 — `basket_id IS NOT NULL` so relinquished (externally
-                //        spent) outputs are not resurrected to spendable=1.
-                batch.add(
-                    "UPDATE outputs SET spendable = 1, spent_by = NULL, spending_description = NULL, updated_at = ? WHERE spent_by = ? AND basket_id IS NOT NULL",
-                    vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
-                )?;
-
-                // Mark transaction failed
-                batch.add(
-                    "UPDATE transactions SET status = 'failed', updated_at = ? WHERE transaction_id = ?",
-                    vec![QVal::Text(now_str.clone()), QVal::Int(tx_id)],
-                )?;
-
-                // Mark proven_tx_req invalid
-                batch.add(
-                    "UPDATE proven_tx_reqs SET status = 'invalid', updated_at = ? WHERE txid = ?",
-                    vec![QVal::Text(now_str.clone()), QVal::Text(txid.to_string())],
-                )?;
-
-                // Clean up the outputs this tx was going to create — phantoms
-                // if we don't (match the DoubleSpend/InvalidTx branches above).
-                batch.add(
-                    "UPDATE outputs SET spendable = 0, updated_at = ? WHERE transaction_id = ?",
-                    vec![QVal::Text(now_str), QVal::Int(tx_id)],
-                )?;
-
-                batch.execute().await?;
+        #[derive(Deserialize)]
+        struct Row {
+            transaction_id: f64,
+            raw_tx: String,
+        }
+        let row: Option<Row> = Query::new("SELECT transaction_id, hex(raw_tx) AS raw_tx FROM transactions WHERE txid = ? AND user_id = ?")
+            .bind(txid).bind(user_id).fetch_optional(self.db).await?;
+        let Some(row) = row else {
+            return Err(Error::NotFound("transaction not found for caller".into()));
+        };
+        for note in notes {
+            if !note.is_object() {
+                return Err(Error::ValidationError(
+                    "history notes must be objects".into(),
+                ));
             }
         }
-
+        for note in notes {
+            let mut note = note.clone();
+            note.as_object_mut()
+                .expect("notes validated above")
+                .insert("source".into(), serde_json::json!("client"));
+            super::tracker_rule::append_note(self.db, txid, note).await?;
+        }
+        self.record_hint(
+            txid,
+            "clientBroadcastHint",
+            if success { "success" } else { "unknown" },
+            serde_json::json!({"success": success}),
+            !success,
+        )
+        .await?;
+        if !success {
+            let inline =
+                hex::decode(&row.raw_tx).map_err(|e| Error::InternalError(e.to_string()))?;
+            let bytes = if inline.is_empty() {
+                crate::r2::BlobStore::new(self.blobs)
+                    .get("transactions", row.transaction_id as i64, "raw_tx", None)
+                    .await?
+            } else {
+                Some(inline)
+            };
+            if let Some(bytes) = bytes {
+                if compute_txid(&bytes) == txid {
+                    if let Some(reason) = self.local_script_refusal(&bytes).await? {
+                        self.fail_local_script(user_id, txid, &reason).await?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let net_status = self
+            .broadcast
+            .get_status_for_txids(&[txid.to_string()])
+            .await
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .map(|s| s.status);
+        if !matches!(net_status.as_deref(), Some("known" | "mined")) {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut batch = BatchCollector::new(self.db);
+        batch.add("UPDATE transactions SET status = 'unproven', updated_at = ? WHERE txid = ? AND user_id = ? AND status NOT IN ('completed', 'failed')", vec![QVal::Text(now.clone()), QVal::Text(txid.into()), QVal::Int(user_id)])?;
+        batch.add("UPDATE proven_tx_reqs SET status = 'unmined', updated_at = ? WHERE txid = ? AND status NOT IN ('completed', 'invalid', 'doubleSpend')", vec![QVal::Text(now), QVal::Text(txid.into())])?;
+        batch.execute().await?;
         Ok(())
     }
 }
