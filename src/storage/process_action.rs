@@ -101,49 +101,16 @@ fn parse_output_scripts(raw_tx: &[u8]) -> Result<Vec<ScriptInfo>> {
     Ok(scripts)
 }
 
-/// Read a Bitcoin varint from a byte slice at the given position.
+/// Read the canonical varint at `pos`: bsv-rs's `from_var_int`, the node's
+/// `ReadCompactSize` without the `MAX_SIZE` bound (the sibling's `readVarInt`).
+/// A value written wider than it needs is refused, as the node refuses it.
 fn read_varint(data: &[u8], pos: usize) -> Result<(u64, usize)> {
-    if pos >= data.len() {
-        return Err(Error::ValidationError(
-            "Unexpected end of transaction data".to_string(),
-        ));
-    }
-
-    let first = data[pos];
-    match first {
-        0..=0xFC => Ok((first as u64, 1)),
-        0xFD => {
-            if pos + 3 > data.len() {
-                return Err(Error::ValidationError("Truncated varint".to_string()));
-            }
-            let val = u16::from_le_bytes([data[pos + 1], data[pos + 2]]);
-            Ok((val as u64, 3))
-        }
-        0xFE => {
-            if pos + 5 > data.len() {
-                return Err(Error::ValidationError("Truncated varint".to_string()));
-            }
-            let val =
-                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
-            Ok((val as u64, 5))
-        }
-        0xFF => {
-            if pos + 9 > data.len() {
-                return Err(Error::ValidationError("Truncated varint".to_string()));
-            }
-            let val = u64::from_le_bytes([
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-                data[pos + 8],
-            ]);
-            Ok((val, 9))
-        }
-    }
+    let rest = data
+        .get(pos..)
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| Error::ValidationError("Unexpected end of transaction data".to_string()))?;
+    bsv_sdk::primitives::from_var_int(rest)
+        .map_err(|e| Error::ValidationError(format!("varint at {pos}: {e}")))
 }
 
 /// Compute txid from raw transaction bytes: SHA256d, reversed.
@@ -873,6 +840,21 @@ mod tests {
         let data = [0xFF, 0x00, 0x00, 0x00, 0x00];
         let result = read_varint(&data, 0);
         assert!(result.is_err());
+    }
+
+    /// Added with the move onto bsv-rs 0.6.0's canonical varint: the removed
+    /// copy read `fd fc 00` as 252; the node's `ReadCompactSize` refuses a value
+    /// written wider than it needs (bitcoin-sv 6504a3af `src/serialize.h:315-340`),
+    /// and so does this reader now.
+    #[test]
+    fn read_varint_non_canonical_refused() {
+        for data in [
+            &[0xFD, 0xFC, 0x00][..],
+            &[0xFE, 0xFF, 0xFF, 0x00, 0x00][..],
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00][..],
+        ] {
+            assert!(read_varint(data, 0).is_err(), "{data:02x?}");
+        }
     }
 
     // =========================================================================

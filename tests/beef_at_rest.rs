@@ -168,7 +168,14 @@ fn the_payments_at_rest_are_read_one_element_in_hand_and_their_subject_handed_ov
         assert!(!read.has_proof, "the subject is unproven");
         assert_eq!(read.bytes_read, size);
         assert_eq!(headers.asked.get(), 1, "the one root, asked once");
-        assert!(peak < ISOLATE_BYTES / 4, "{n} links: {:.1} MiB", mib(peak));
+        // Amended with the move onto bsv-rs 0.6.0: the bound was a quarter of
+        // the isolate. 0.6.0's stream index keeps a proven coinbase's verified
+        // height on every entry (`coinbase_height: Option<u64>`,
+        // `transaction/beef_stream.rs:1765`), 16 bytes more per transaction,
+        // and the index's table rounds to 262,144 slots here: 135,299 links
+        // read 27.4 MiB on 0.4.5 and 33.4 MiB on 0.6.0 (213 to 259 B per
+        // element). A third of the isolate still holds the claim: never whole.
+        assert!(peak < ISOLATE_BYTES / 3, "{n} links: {:.1} MiB", mib(peak));
         if n > 100_000 {
             assert!(size > DRAIN_INLINE_BYTES);
         }
@@ -233,6 +240,55 @@ fn a_refusal_names_the_offset_and_the_kind_the_library_names() {
         assert!(err.to_string().contains(&format!("offset {offset}")));
         assert!(err.to_string().contains(&format!("{kind:?}")));
     }
+}
+
+/// Added with the move onto bsv-rs 0.6.0: an unproven subject with a nonzero
+/// lock time and a non-final sequence needs the mining tip (the node's
+/// `IsFinalTx`), and none is supplied here. 0.6.0 declines with
+/// `Verdict::Unverifiable`; the Worker names it a decline, never a refusal of
+/// the bytes, and writes nothing (on 0.4.5 this BEEF was accepted).
+#[test]
+fn a_subject_that_needs_the_mining_tip_is_declined_not_refused() {
+    let mut raw = support::beef_chain::spend(&funding_root(), 1);
+    let sequence_at = 4 + 1 + 32 + 4 + 1;
+    raw[sequence_at..sequence_at + 4].copy_from_slice(&0u32.to_le_bytes());
+    let lock_at = raw.len() - 4;
+    raw[lock_at..].copy_from_slice(&500u32.to_le_bytes());
+    let txid = bsv_sdk::primitives::sha256d(&raw);
+    let mut bytes = 0x0101_0101u32.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&txid);
+    bytes.extend_from_slice(&0xEFBE_0002u32.to_le_bytes());
+    bytes.push(1);
+    bytes.extend(support::beef_chain::varint(HEIGHT));
+    bytes.extend_from_slice(&[1, 1, 0, 2]);
+    bytes.extend_from_slice(&funding_root());
+    bytes.push(2);
+    bytes.extend_from_slice(&[1, 0]);
+    bytes.extend(support::beef_chain::funding());
+    bytes.push(0);
+    bytes.extend_from_slice(&raw);
+    assert!(
+        matches!(library_verdict(&bytes), Verdict::Unverifiable { .. }),
+        "the library declines"
+    );
+    let mut source = Chunked {
+        inner: &bytes[..],
+        size: CHUNK,
+    };
+    let err = block_on(read_at_rest(
+        &mut source,
+        &ChainHeaders::honest(),
+        bytes.len() as u64,
+    ))
+    .unwrap_err();
+    println!("{err}");
+    assert!(
+        matches!(&err, AtRestError::Unverifiable { txid: t, check, .. }
+            if *t == display(&txid) && check == "Finality"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("not judged invalid"));
+    assert!(err.reason().is_empty(), "no refusal of the bytes");
 }
 
 #[test]
