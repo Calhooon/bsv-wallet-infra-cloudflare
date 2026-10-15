@@ -1500,41 +1500,12 @@ pub(crate) fn parse_input_outpoints(raw_tx: &[u8]) -> Vec<(String, u32)> {
     result
 }
 
-/// Read a Bitcoin varint at `pos`. Returns (value, new_pos) or None.
+/// Read the canonical varint at `pos` (bsv-rs's `from_var_int`, the node's
+/// `ReadCompactSize` without the `MAX_SIZE` bound). Returns (value, new_pos),
+/// or None when the bytes are short or the varint is not canonical.
 fn read_varint_at(data: &[u8], pos: usize) -> Option<(u64, usize)> {
-    if pos >= data.len() {
-        return None;
-    }
-    match data[pos] {
-        0xFD => {
-            if pos + 3 > data.len() {
-                return None;
-            }
-            Some((
-                u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as u64,
-                pos + 3,
-            ))
-        }
-        0xFE => {
-            if pos + 5 > data.len() {
-                return None;
-            }
-            Some((
-                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
-                    as u64,
-                pos + 5,
-            ))
-        }
-        0xFF => {
-            if pos + 9 > data.len() {
-                return None;
-            }
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&data[pos + 1..pos + 9]);
-            Some((u64::from_le_bytes(b), pos + 9))
-        }
-        n => Some((n as u64, pos + 1)),
-    }
+    let (value, len) = bsv_sdk::primitives::from_var_int(data.get(pos..)?).ok()?;
+    Some((value, pos + len))
 }
 
 /// Store a proof from the ProofService: insert proven_tx, update proven_tx_req and transactions.

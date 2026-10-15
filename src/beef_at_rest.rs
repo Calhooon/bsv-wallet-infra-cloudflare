@@ -155,6 +155,15 @@ pub enum AtRestError {
         input: Option<u32>,
         why: String,
     },
+    /// bsv-rs 0.6.0 declines for want of the mining tip (a non-final lock
+    /// time, a coinbase's maturity): no tip is supplied here, so the spend is
+    /// not judged. Never a verdict on the bytes; nothing is written.
+    Unverifiable {
+        offset: u64,
+        txid: String,
+        input: Option<u32>,
+        check: String,
+    },
     /// No BRC-95 prefix names a subject.
     NotAtomic,
     /// The subject is a txid-only entry: no transaction to internalize.
@@ -201,6 +210,21 @@ impl std::fmt::Display for AtRestError {
                 None => write!(
                     f,
                     "the BEEF at rest is refused at offset {offset}: {txid} does not spend ({why})"
+                ),
+            },
+            AtRestError::Unverifiable {
+                offset,
+                txid,
+                input,
+                check,
+            } => match input {
+                Some(i) => write!(
+                    f,
+                    "the BEEF at rest is declined at offset {offset}: input {i} of {txid} cannot be judged without the mining tip ({check}); not judged invalid"
+                ),
+                None => write!(
+                    f,
+                    "the BEEF at rest is declined at offset {offset}: {txid} cannot be judged without the mining tip ({check}); not judged invalid"
                 ),
             },
             AtRestError::NotAtomic => {
@@ -336,6 +360,19 @@ pub async fn read_at_rest<S: AsyncByteSource, H: HeaderService>(
                 offset,
                 kind: format!("{kind:?}"),
                 reason: format!("{reason:?}"),
+            })
+        }
+        Verdict::Unverifiable {
+            offset,
+            txid,
+            input,
+            check,
+        } => {
+            return Err(AtRestError::Unverifiable {
+                offset,
+                txid: display_hex(&txid),
+                input,
+                check: format!("{check:?}"),
             })
         }
         Verdict::SpendRefused {
