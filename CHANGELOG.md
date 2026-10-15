@@ -4,6 +4,36 @@ rust-wallet-infra is a deployed Worker, not a published crate: the version in
 `Cargo.toml` stays 0.1.0 and an entry here is named by its program and its
 date.
 
+## L2, 2026-10-15: bsv-rs 0.6.0 exact, the deny file (the next tag after `v0.3.1`)
+
+### Changed
+
+- **bsv-rs `=0.6.0`** (from `=0.4.5`) and **bsv-middleware-cloudflare
+  `=0.6.2`** (from `=0.5.1`; its core 0.3.2 is the one middleware line on
+  bsv-rs 0.6, so the graph holds one bsv-rs).
+- **One varint.** `processAction`'s output-script parser and the monitor's
+  input-outpoint parser read bsv-rs's canonical `from_var_int`; the two
+  hand-written decoders are deleted. A varint written wider than its value
+  needs (`fd fc 00` for 252) is now refused, as the node's `ReadCompactSize`
+  refuses it.
+- **A decline at rest.** bsv-rs 0.6.0 checks an unproven subject's finality
+  and a coinbase's maturity, and declines (`Verdict::Unverifiable`) when no
+  mining tip is supplied; none is supplied here. `internalizeAction` with a
+  reference at rest now answers such a BEEF (a nonzero lock time with a
+  non-final sequence) with a validation error that names the decline,
+  "not judged invalid", and writes nothing. 0.4.5 accepted it.
+- **Memory at rest.** 0.6.0's stream index keeps a proven coinbase's height
+  per transaction: the relay's 8 MiB line reads 33.4 MiB at peak where it read
+  27.4 MiB. The test's bound is a third of the 128 MiB isolate, from a
+  quarter.
+
+### Added
+
+- `deny.toml`, the stack's template byte for byte. `cargo deny check` is red
+  on two facts outside this crate's code: `sha2` and `hmac` direct under
+  bsv-middleware-cloudflare and bsv-middleware-core, and no license field on
+  this crate. No local allowance.
+
 ## Unreleased
 
 - bsv-rs 0.4.5: the lone leaf at offset 0 only; the LOCAL work bound; no behavior change under the defaults.
