@@ -1,8 +1,9 @@
-# Shared Worker gate: PR head, read-only token, pinned Rust, cached cargo.
+# Shared Worker gate: PR head, read-only token, pinned Rust, cached cargo; also called by release.yml on a tag.
 # Host clippy covers all targets; wasm clippy covers libraries because SQLite dev tests are native.
 name: ci
 'on':
   pull_request: null
+  workflow_call: null
   push:
     branches:
     - main

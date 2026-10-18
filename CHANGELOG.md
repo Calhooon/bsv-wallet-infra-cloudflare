@@ -1,8 +1,31 @@
 # Changelog
 
-rust-wallet-infra is a deployed Worker, not a published crate: the version in
-`Cargo.toml` stays 0.1.0 and an entry here is named by its program and its
-date.
+The tag is the release of record. From 0.4.2 on, the crate on crates.io,
+`bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
+are named by their program and their date, and the manifest then read 0.1.0.
+
+## 0.4.2, 2026-10-18: published from the tag, the README refreshed
+
+### Added
+
+- `.github/workflows/release.yml`: a `v*` tag push checks the tag against the
+  manifest's version and that the commit is on `main`, runs the gate of
+  `ci.yml` (now callable), verifies the package with `cargo publish --dry-run`
+  on the host, and publishes through crates.io trusted publishing. No token is
+  stored.
+
+### Changed
+
+- The package is named `bsv-wallet-infra-cloudflare` on crates.io (it was
+  `rust-wallet-infra` in the manifest); the library keeps the identifier
+  `rust_wallet_infra`, so no `use` path moves. The manifest carries a
+  description, the repository, the README and an `include` list (the sources,
+  the migrations, `wrangler.toml`, the README, the licence and this file).
+- The README is refreshed to the code at this tag and gains a "Releases"
+  section.
+
+Nothing else changes in the Worker: no route, binding, behaviour or wrangler
+setting.
 
 ## L2, 2026-10-15: bsv-rs 0.6.0 exact, the deny file (the next tag after `v0.3.1`)
 
