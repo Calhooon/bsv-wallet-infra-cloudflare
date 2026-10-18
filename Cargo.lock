@@ -205,6 +205,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsv-wallet-infra-cloudflare"
+version = "0.4.2"
+dependencies = [
+ "base64",
+ "bsv-middleware-cloudflare",
+ "bsv-rs",
+ "chrono",
+ "console_error_panic_hook",
+ "futures-util",
+ "getrandom",
+ "hex",
+ "js-sys",
+ "rusqlite",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "worker",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1100,29 +1123,6 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
-]
-
-[[package]]
-name = "rust-wallet-infra"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bsv-middleware-cloudflare",
- "bsv-rs",
- "chrono",
- "console_error_panic_hook",
- "futures-util",
- "getrandom",
- "hex",
- "js-sys",
- "rusqlite",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "tokio",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "worker",
 ]
 
 [[package]]

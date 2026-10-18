@@ -1,10 +1,25 @@
 [package]
-name = "rust-wallet-infra"
-version = "0.1.0"
+name = "bsv-wallet-infra-cloudflare"
+description = "BSV wallet storage on Cloudflare Workers: JSON-RPC over D1 and R2 behind BRC-31 authentication."
+version = "0.4.2"
 license = "MIT"
 edition = "2021"
+repository = "https://github.com/Calhooon/bsv-wallet-infra-cloudflare"
+readme = "README.md"
+keywords = ["bitcoin", "bsv", "wallet", "cloudflare", "wasm"]
+categories = ["cryptography::cryptocurrencies"]
+include = [
+    "src/**/*.rs",
+    "migrations/*.sql",
+    "wrangler.toml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
 
 [lib]
+# The package is named for the repository; the library keeps its identifier so no `use` path moves.
+name = "rust_wallet_infra"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
