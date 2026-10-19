@@ -4,9 +4,35 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
-## Unreleased
+## Unreleased (0.5.0): the agents' adapter 0.7.0 and bsv-rs 0.7.0
 
 ### Changed
+
+- **bsv-middleware-cloudflare `=0.7.0`** (core 0.4.0, from `=0.6.2` and core
+  0.3.2) and **bsv-rs `=0.7.0`** (from `=0.6.0`); the version is 0.5.0, a
+  dependency minor. The adapter and core now hash and MAC through bsv-rs's
+  `primitives::hash` and no longer depend on `sha2` or `hmac`, so
+  `cargo deny check` is green against `deny.toml` unchanged: no wrapper added,
+  no ignore. `cargo tree -i sha2` names bsv-rs, k256 and p256; `-i hmac`
+  names bsv-rs, pbkdf2 and rfc6979. No source change was needed: the public
+  API this crate calls (`process_auth`, `sign_json_response`, the CORS
+  helpers, `AuthCloudflareError`) did not move.
+- **The signing digest.** bsv-rs 0.7.0 moves `SigningContext::compute_sighash`
+  to the node's dispatch for a hash type without FORKID or with CHRONICLE.
+  The Worker signs no transaction (the client's wallet signs every input), so
+  the change reaches no code here. Its signatures are BRC-103 auth messages
+  (the handshake's and every response's), all made by core's `sign_message`
+  through `ProtoWallet::create_signature` with `data`: ONE SHA-256 of the
+  signing data, for a response its BRC-104 payload. `tests/response_signing_digest.rs` pins it:
+  the signature `sign_http_response` makes equals the same key's signature
+  over `sha256(payload)` given directly and differs from one over the double
+  SHA-256, the client verifies it, and the fixed payload's digest is pinned
+  from bytes built outside the crate.
+- **The payment claims migration does not apply.** The adapter's 0.7.0 line
+  for wallet-infra asks for a `PaymentPrefixStore` and a one-time
+  `payment_claims` migration where a host runs the payment path with storage.
+  This crate enables neither `refund` nor `d1-claims`, calls no payment
+  helper, and has no `payment_claims` table, so there is nothing to migrate.
 
 - `read_varint` in `src/storage/process_action.rs` is deleted: it was a
   wrapper over bsv-rs's `from_var_int`, and the fleet reading counted it by
