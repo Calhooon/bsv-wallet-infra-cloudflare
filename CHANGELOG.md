@@ -4,6 +4,19 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## Unreleased
+
+### Changed
+
+- `read_varint` in `src/storage/process_action.rs` is deleted: it was a
+  wrapper over bsv-rs's `from_var_int`, and the fleet reading counted it by
+  name as a hand-rolled primitive (bsv-stack-lean #105). `parse_output_scripts`
+  now calls `bsv_sdk::primitives::from_var_int` itself; the refusals and the
+  `varint at {pos}` message are unchanged, except that a varint past the end
+  of the bytes now carries bsv-rs's message in place of "Unexpected end of
+  transaction data". The varint tests read the same bytes through the new
+  call, and one test adds the parser's refusal of a wide and a missing count.
+
 ## 0.4.2, 2026-10-18: published from the tag, the README refreshed
 
 ### Added

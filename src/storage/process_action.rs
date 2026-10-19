@@ -17,6 +17,7 @@ use crate::d1::batch::BatchCollector;
 use crate::d1::{QVal, Query};
 use crate::error::{Error, Result};
 use crate::types::{SendWithResult, StorageProcessActionArgs, StorageProcessActionResults};
+use bsv_sdk::primitives::from_var_int;
 use chrono::Utc;
 use serde::Deserialize;
 
@@ -68,28 +69,37 @@ struct ScriptInfo {
 /// - varint: output count
 /// - outputs (each: 8 satoshis + varint script_len + script)
 /// - 4 bytes: locktime
+///
+/// Each varint is bsv-rs's `from_var_int`, the node's `ReadCompactSize`
+/// without the `MAX_SIZE` bound (the sibling's `readVarInt`): a value written
+/// wider than it needs is refused, as the node refuses it, and so is a varint
+/// past the end of the bytes.
 fn parse_output_scripts(raw_tx: &[u8]) -> Result<Vec<ScriptInfo>> {
     let mut pos = 4; // Skip version
 
     // Skip inputs
-    let (input_count, bytes_read) = read_varint(raw_tx, pos)?;
+    let (input_count, bytes_read) =
+        from_var_int(raw_tx.get(pos..).unwrap_or_default()).map_err(varint_error(pos))?;
     pos += bytes_read;
 
     for _ in 0..input_count {
         pos += 32 + 4; // txid + vout
-        let (script_len, bytes_read) = read_varint(raw_tx, pos)?;
+        let (script_len, bytes_read) =
+            from_var_int(raw_tx.get(pos..).unwrap_or_default()).map_err(varint_error(pos))?;
         pos += bytes_read + script_len as usize + 4; // script + sequence
     }
 
     // Parse outputs
-    let (output_count, bytes_read) = read_varint(raw_tx, pos)?;
+    let (output_count, bytes_read) =
+        from_var_int(raw_tx.get(pos..).unwrap_or_default()).map_err(varint_error(pos))?;
     pos += bytes_read;
 
     let mut scripts = Vec::with_capacity(output_count as usize);
 
     for _ in 0..output_count {
         pos += 8; // satoshis
-        let (script_len, bytes_read) = read_varint(raw_tx, pos)?;
+        let (script_len, bytes_read) =
+            from_var_int(raw_tx.get(pos..).unwrap_or_default()).map_err(varint_error(pos))?;
         pos += bytes_read;
         scripts.push(ScriptInfo {
             offset: pos,
@@ -101,16 +111,9 @@ fn parse_output_scripts(raw_tx: &[u8]) -> Result<Vec<ScriptInfo>> {
     Ok(scripts)
 }
 
-/// Read the canonical varint at `pos`: bsv-rs's `from_var_int`, the node's
-/// `ReadCompactSize` without the `MAX_SIZE` bound (the sibling's `readVarInt`).
-/// A value written wider than it needs is refused, as the node refuses it.
-fn read_varint(data: &[u8], pos: usize) -> Result<(u64, usize)> {
-    let rest = data
-        .get(pos..)
-        .filter(|r| !r.is_empty())
-        .ok_or_else(|| Error::ValidationError("Unexpected end of transaction data".to_string()))?;
-    bsv_sdk::primitives::from_var_int(rest)
-        .map_err(|e| Error::ValidationError(format!("varint at {pos}: {e}")))
+/// The error for a varint at `pos` that bsv-rs's `from_var_int` refused.
+fn varint_error(pos: usize) -> impl Fn(bsv_sdk::Error) -> Error {
+    move |e| Error::ValidationError(format!("varint at {pos}: {e}"))
 }
 
 /// Compute txid from raw transaction bytes: SHA256d, reversed.
@@ -739,106 +742,111 @@ mod tests {
     use super::*;
 
     // =========================================================================
-    // read_varint
+    // from_var_int, as parse_output_scripts calls it
     // =========================================================================
 
+    /// The call of `parse_output_scripts`: the bytes from `pos` on.
+    fn varint_at(data: &[u8], pos: usize) -> Result<(u64, usize)> {
+        from_var_int(data.get(pos..).unwrap_or_default()).map_err(varint_error(pos))
+    }
+
     #[test]
-    fn read_varint_single_byte_zero() {
+    fn from_var_int_single_byte_zero() {
         let data = [0x00];
-        let (val, size) = read_varint(&data, 0).unwrap();
+        let (val, size) = varint_at(&data, 0).unwrap();
         assert_eq!(val, 0);
         assert_eq!(size, 1);
     }
 
     #[test]
-    fn read_varint_single_byte_max() {
+    fn from_var_int_single_byte_max() {
         let data = [0xFC];
-        let (val, size) = read_varint(&data, 0).unwrap();
+        let (val, size) = varint_at(&data, 0).unwrap();
         assert_eq!(val, 0xFC);
         assert_eq!(size, 1);
     }
 
     #[test]
-    fn read_varint_single_byte_midrange() {
+    fn from_var_int_single_byte_midrange() {
         let data = [42];
-        let (val, size) = read_varint(&data, 0).unwrap();
+        let (val, size) = varint_at(&data, 0).unwrap();
         assert_eq!(val, 42);
         assert_eq!(size, 1);
     }
 
     #[test]
-    fn read_varint_two_byte() {
+    fn from_var_int_two_byte() {
         // 0xFD prefix + 2 bytes LE
         let data = [0xFD, 0x00, 0x01]; // 256
-        let (val, size) = read_varint(&data, 0).unwrap();
+        let (val, size) = varint_at(&data, 0).unwrap();
         assert_eq!(val, 256);
         assert_eq!(size, 3);
     }
 
     #[test]
-    fn read_varint_two_byte_max() {
+    fn from_var_int_two_byte_max() {
         let data = [0xFD, 0xFF, 0xFF]; // 65535
-        let (val, size) = read_varint(&data, 0).unwrap();
+        let (val, size) = varint_at(&data, 0).unwrap();
         assert_eq!(val, 65535);
         assert_eq!(size, 3);
     }
 
     #[test]
-    fn read_varint_four_byte() {
+    fn from_var_int_four_byte() {
         let data = [0xFE, 0x00, 0x00, 0x01, 0x00]; // 65536
-        let (val, size) = read_varint(&data, 0).unwrap();
+        let (val, size) = varint_at(&data, 0).unwrap();
         assert_eq!(val, 65536);
         assert_eq!(size, 5);
     }
 
     #[test]
-    fn read_varint_eight_byte() {
+    fn from_var_int_eight_byte() {
         let data = [0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]; // 2^32
-        let (val, size) = read_varint(&data, 0).unwrap();
+        let (val, size) = varint_at(&data, 0).unwrap();
         assert_eq!(val, 0x100000000);
         assert_eq!(size, 9);
     }
 
     #[test]
-    fn read_varint_at_offset() {
+    fn from_var_int_at_offset() {
         let data = [0x00, 0x00, 42]; // varint at position 2
-        let (val, size) = read_varint(&data, 2).unwrap();
+        let (val, size) = varint_at(&data, 2).unwrap();
         assert_eq!(val, 42);
         assert_eq!(size, 1);
     }
 
     #[test]
-    fn read_varint_empty_data() {
+    fn from_var_int_empty_data() {
         let data: [u8; 0] = [];
-        let result = read_varint(&data, 0);
+        let result = varint_at(&data, 0);
         assert!(result.is_err());
     }
 
     #[test]
-    fn read_varint_out_of_bounds() {
+    fn from_var_int_out_of_bounds() {
         let data = [0x42];
-        let result = read_varint(&data, 5);
+        let result = varint_at(&data, 5);
         assert!(result.is_err());
     }
 
     #[test]
-    fn read_varint_truncated_two_byte() {
+    fn from_var_int_truncated_two_byte() {
         let data = [0xFD, 0x00];
-        let result = read_varint(&data, 0);
+        let result = varint_at(&data, 0);
         assert!(result.is_err());
     }
 
     #[test]
-    fn read_varint_truncated_four_byte() {
+    fn from_var_int_truncated_four_byte() {
         let data = [0xFE, 0x00, 0x00, 0x01];
-        let result = read_varint(&data, 0);
+        let result = varint_at(&data, 0);
         assert!(result.is_err());
     }
 
     #[test]
-    fn read_varint_truncated_eight_byte() {
+    fn from_var_int_truncated_eight_byte() {
         let data = [0xFF, 0x00, 0x00, 0x00, 0x00];
-        let result = read_varint(&data, 0);
+        let result = varint_at(&data, 0);
         assert!(result.is_err());
     }
 
@@ -847,13 +855,13 @@ mod tests {
     /// written wider than it needs (bitcoin-sv 6504a3af `src/serialize.h:315-340`),
     /// and so does this reader now.
     #[test]
-    fn read_varint_non_canonical_refused() {
+    fn from_var_int_non_canonical_refused() {
         for data in [
             &[0xFD, 0xFC, 0x00][..],
             &[0xFE, 0xFF, 0xFF, 0x00, 0x00][..],
             &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00][..],
         ] {
-            assert!(read_varint(data, 0).is_err(), "{data:02x?}");
+            assert!(varint_at(data, 0).is_err(), "{data:02x?}");
         }
     }
 
@@ -949,6 +957,21 @@ mod tests {
         let scripts = parse_output_scripts(&raw_tx).unwrap();
         assert_eq!(scripts.len(), 1);
         assert_eq!(scripts[0].length, 0);
+    }
+
+    /// Added with the wrapper's removal: the parser refuses through bsv-rs's
+    /// reader, naming the position, for a count written wider than it needs
+    /// and for a count past the end of the bytes.
+    #[test]
+    fn parse_output_scripts_refuses_bad_counts() {
+        let mut wide = 1u32.to_le_bytes().to_vec();
+        wide.extend([0xFD, 0x00, 0x00]); // 0 inputs, written in three bytes
+        let err = parse_output_scripts(&wide).unwrap_err().to_string();
+        assert!(err.contains("varint at 4"), "{err}");
+
+        let short = 1u32.to_le_bytes().to_vec(); // the version and nothing else
+        let err = parse_output_scripts(&short).unwrap_err().to_string();
+        assert!(err.contains("varint at 4"), "{err}");
     }
 
     #[test]
