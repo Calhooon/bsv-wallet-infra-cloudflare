@@ -98,3 +98,9 @@ jobs:
         export BSV_SDK_MODULE="$RUNNER_TEMP/worker-gate-node/node_modules/@bsv/sdk/dist/esm/mod.js"
 
         node tests/worker_beef_at_rest.mjs'
+  scrub:
+    name: scrub
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: tools/scrub.sh
