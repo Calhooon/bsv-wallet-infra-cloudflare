@@ -4,7 +4,21 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
-## Unreleased (0.5.0): the agents' adapter 0.7.0 and bsv-rs 0.7.0
+## Unreleased (0.6.0): bsv-rs 0.8.1 and the agents' adapter 0.7.2
+
+### Changed
+
+- **bsv-rs `0.8.1`** (the caret, from `=0.7.0`) and
+  **bsv-middleware-cloudflare `=0.7.2`** (core 0.4.1, from `=0.7.0`; the
+  adapter is on bsv-rs `^0.8`), so the lock holds one bsv-rs; the version is
+  0.6.0, a dependency minor. bsv-rs 0.8.1 reads an AtomicBEEF by the
+  subject's graph (BRC-95), so the BEEF at rest is accepted or refused by
+  that rule; it types the wallet's busy answer, writes BSC3 stream cursors
+  and marks `Error` non_exhaustive. No source change was needed: no `match`
+  here is over bsv-rs's `Error`, and the Worker keeps no stream cursor. No
+  wire change.
+
+## 0.5.0, 2026-10-19: the agents' adapter 0.7.0 and bsv-rs 0.7.0
 
 ### Changed
 

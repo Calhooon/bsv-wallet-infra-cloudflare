@@ -6,10 +6,10 @@ identity authentication.
 
 ## Version and architecture
 
-The crate is `bsv-wallet-infra-cloudflare` 0.5.0 in [Cargo.toml](Cargo.toml),
-with **bsv-rs =0.7.0** and **bsv-middleware-cloudflare =0.7.0** (core 0.4.0).
-Its library keeps the identifier `rust_wallet_infra`. The newest tag is
-`v0.4.2`; 0.5.0 is released when `v0.5.0` is tagged (see Releases below).
+The crate is `bsv-wallet-infra-cloudflare` 0.6.0 in [Cargo.toml](Cargo.toml),
+with **bsv-rs 0.8.1** (the caret) and **bsv-middleware-cloudflare =0.7.2**
+(core 0.4.1). Its library keeps the identifier `rust_wallet_infra`. The newest
+tag is `v0.5.0`; 0.6.0 is released when `v0.6.0` is tagged (see Releases below).
 
 [src/lib.rs](src/lib.rs) handles HTTP and authentication,
 [src/dispatch.rs](src/dispatch.rs) routes JSON-RPC methods, and
