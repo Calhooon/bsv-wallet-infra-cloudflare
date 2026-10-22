@@ -14,9 +14,17 @@ are named by their program and their date, and the manifest then read 0.1.0.
   0.6.0, a dependency minor. bsv-rs 0.8.1 reads an AtomicBEEF by the
   subject's graph (BRC-95), so the BEEF at rest is accepted or refused by
   that rule; it types the wallet's busy answer, writes BSC3 stream cursors
-  and marks `Error` non_exhaustive. No source change was needed: no `match`
-  here is over bsv-rs's `Error`, and the Worker keeps no stream cursor. No
-  wire change.
+  and marks `Error` non_exhaustive. No `match` here is over bsv-rs's
+  `Error` and the Worker keeps no stream cursor, so the library source is
+  unchanged. No wire change.
+- **Two tests follow the library.** `to_binary_atomic` now writes only the
+  subject's closure, so the inconsistent-atomic case of
+  `ef_batch_prefers_consistent_atomic_and_rejects_inconsistent` frames the
+  whole BEEF under the parent's prefix by hand; `beef_to_ef_batch` still
+  refuses it. The at-rest stream index keeps each raw transaction's input
+  txids for the atomic walk, so 135,299 links read 42.9 MiB (333 B per
+  element, from 259); the bound in `tests/beef_at_rest.rs` moves from a
+  third of the isolate to three eighths.
 
 ## 0.5.0, 2026-10-19: the agents' adapter 0.7.0 and bsv-rs 0.7.0
 

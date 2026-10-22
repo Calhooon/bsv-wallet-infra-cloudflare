@@ -174,8 +174,17 @@ fn the_payments_at_rest_are_read_one_element_in_hand_and_their_subject_handed_ov
         // `transaction/beef_stream.rs:1765`), 16 bytes more per transaction,
         // and the index's table rounds to 262,144 slots here: 135,299 links
         // read 27.4 MiB on 0.4.5 and 33.4 MiB on 0.6.0 (213 to 259 B per
-        // element). A third of the isolate still holds the claim: never whole.
-        assert!(peak < ISOLATE_BYTES / 3, "{n} links: {:.1} MiB", mib(peak));
+        // element). Amended again with the move onto bsv-rs 0.8.1: the index
+        // held to a subject keeps every raw transaction's input txids for the
+        // atomic walk (`prevs: Box<[Hash32]>`, `transaction/beef_stream.rs:1777`),
+        // a boxed slice and one 32-byte hash per link here: 135,299 links read
+        // 42.9 MiB (333 B per element), past a third of the isolate by 0.2 MiB.
+        // Three eighths still holds the claim: never whole.
+        assert!(
+            peak < ISOLATE_BYTES / 8 * 3,
+            "{n} links: {:.1} MiB",
+            mib(peak)
+        );
         if n > 100_000 {
             assert!(size > DRAIN_INLINE_BYTES);
         }
