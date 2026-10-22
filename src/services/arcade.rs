@@ -944,8 +944,15 @@ mod tests {
 
         // ATOMIC framed for the PARENT while a descendant rides the BEEF: the declared
         // subject disagrees with the dependency-order derivation → inconsistent, STOP.
+        // Framed by hand: from bsv-rs 0.8.1 `to_binary_atomic` writes only the subject's
+        // BRC-95 closure, so it drops the descendant and can no longer make these bytes.
         let (mut beef2, parent2, _child2) = beef_with_unmined_parent_child();
-        let atomic_bad = to_hex(&beef2.to_binary_atomic(&parent2).unwrap());
+        let mut framed = 0x0101_0101u32.to_le_bytes().to_vec();
+        let mut subject = bsv_sdk::primitives::from_hex(&parent2).unwrap();
+        subject.reverse();
+        framed.extend_from_slice(&subject);
+        framed.extend_from_slice(&beef2.to_binary());
+        let atomic_bad = to_hex(&framed);
         let err = beef_to_ef_batch(&atomic_bad).expect_err("inconsistent atomic must STOP");
         assert!(err.contains("inconsistent BEEF"), "{err}");
         assert!(err.contains(&parent_txid), "{err}");
