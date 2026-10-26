@@ -317,6 +317,26 @@ print(json.dumps(statements))
     say(`refused, a root the header service does not carry: ${unrooted.error.message.slice(0, 120)}`)
   }
 
+  // 5b. The audit's repair path requires the monitor trigger key.
+  {
+    const before = (await db.prepare('SELECT * FROM outputs ORDER BY output_id').all()).results
+    const response = await fetch(new URL('/monitor/audit', base))
+    const refusal = await response.json()
+    assert.equal(response.status, 401, JSON.stringify(refusal))
+    assert.deepEqual(refusal, { error: 'unauthorized — set MONITOR_TRIGGER_KEY secret and pass ?key=<value>' })
+    assert.deepEqual((await db.prepare('SELECT * FROM outputs ORDER BY output_id').all()).results, before)
+    say('audit, no key: 401; outputs unchanged')
+  }
+
+  // 5c. The trigger key admits the audit and its summary.
+  {
+    const response = await fetch(new URL(`/monitor/audit?key=${MONITOR_KEY}`, base))
+    const report = await response.json()
+    assert.equal(response.status, 200, JSON.stringify(report))
+    assert.ok(report.summary, JSON.stringify(report))
+    say('audit, trigger key: 200; JSON report carries summary')
+  }
+
   // 7. NL-7c: the monitor posts the subject at rest, which has no proof and
   // which the network does not know, as a stream: the stored AtomicBEEF's
   // BEEF behind its 36-byte prefix, application/octet-stream, its length

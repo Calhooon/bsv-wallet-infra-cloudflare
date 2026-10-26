@@ -31,7 +31,7 @@ From the fetch handler in [src/lib.rs](src/lib.rs):
 | `POST /monitor/run` | `?key=<MONITOR_TRIGGER_KEY>` | one monitor run, now |
 | `POST /monitor/reorg-sweep` | `?key=<MONITOR_TRIGGER_KEY>`, `&from=&to=` | a deep reorg sweep over at most 500 heights |
 | `GET /monitor/probe-woc` | `?key=<MONITOR_TRIGGER_KEY>`, `&txid=` | the raw WhatsOnChain proof answer |
-| `GET /monitor/audit` | none | the UTXO audit, `?level=` (default 2) |
+| `GET /monitor/audit` | `?key=<MONITOR_TRIGGER_KEY>` | the UTXO audit, `?level=` (default 2) |
 | `POST /` | BRC-31 session (`SERVER_PRIVATE_KEY`, `AUTH_SESSIONS`) | JSON-RPC, signed responses |
 
 The BRC-31 handshake is answered by the middleware; an authenticated request to any other path is a 404. The
