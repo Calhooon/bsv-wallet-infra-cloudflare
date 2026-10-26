@@ -2,6 +2,20 @@
 
 The captain's record, kept current at every milestone. Re-orient from this file and from `cca runs --project bsv-wallet-infra-cloudflare-public --open` after any restart. The keeper of the stack is `captain-bsv-stack-lean` (message it with SendMessage); the division of captains binds: the crate's day-to-day is the captain's; the stack, the line, the pins, the Cloudflare layer's production and every outward act under the owner's name stay the keeper's; lanes never push, PR, deploy or open secrets; the keeper pushes, opens PRs, merges, tags, deploys. No network except reads. Secrets live in `~/vault/<project>.md`, read in place, never printed. `date -u` before every stamp.
 
+## 2026-10-26 17:08Z: the page merged; the audit route's fix reviewed MERGE and waiting on the keeper's push
+
+**Landed.** PR 34 merged by rebase: the page is `docs/READINESS-2026-10-26.md` at `2869adc`, the issue numbers and this file at `bce393b` on `main`. Local `main` reset to `origin/main` at 16:5xZ; never pushed.
+
+**The red on production, ruled by the keeper at 16:5xZ** (production of this Worker is the keeper's): `GET /monitor/audit` ran the audit and released locked outputs on an unauthenticated route (`src/lib.rs:356-373`; `src/audit.rs:175-257`). The fix is the one item of #22 that goes alone, on the keeper's word; the owner's "no code today" brief was for the readiness work and the keeper carries the ruling in tonight's brief.
+- Branch `fix/audit-behind-key`, worktree `/Volumes/Lanes/targets/wallet-infra/fix-audit-behind-key`, one commit `65ce854eb5e43ff90503049adab83365f83c7c78` rebased onto `main` `bce393b`: the gate copied from `POST /monitor/run` before any binding, the README row, two Worker witness cases (three files, 30 insertions, 2 deletions). Code lane `fix-audit-behind-key` (openai-2), the gate green: fmt, clippy host and wasm32, 850 host tests, both Miniflare witnesses, scrub. Evidence `/Volumes/Lanes/out/bsv-wallet-infra-cloudflare-public/fix-audit-behind-key-20261026T165017Z/`.
+- Cold review lane `fix-audit-behind-key-review` (claude-fable-5-1): VERDICT MERGE, no blocks; the witness proven by a reverted-gate build failing at the 401 assertion with 200. Evidence `/Volumes/Lanes/out/bsv-wallet-infra-cloudflare-public/review-fix-audit-behind-key-20261026/`.
+- Two follow-ups, outside the diff by the keeper's "nothing else in it", noted on #22: `docs/E2E_TEST_HARNESS_DESIGN.md:150, 213` call the audit without a key and go stale at the merge; the outputs-unchanged assertion at `tests/worker_beef_at_rest.mjs:327` is inert on the fixture (nothing to repair) and a later witness plants a row locked by a failed transaction.
+- Next: the keeper pushes the branch and opens the PR (base `main`); the captain sends the sha when the six checks are green; the keeper merges, deploys beta, then production on the owner's word.
+
+**The cadence** (the owner's word of 16:3xZ on the pace): one message an hour from the captain to the keeper, status and readings batched; a stop or a red on production immediate; the keeper batches record landings on the half hour.
+
+**In flight.** No lane. The worktree above holds the fix branch until the merge.
+
 ## 2026-10-26 16:5xZ: the readiness page landed; twelve gaps filed; nothing in flight
 
 **The occasion.** Babbage's post of 2026-10-26 15:45Z: their hosted Wallet Storage server's price rises 40 times; others invited to run Toolbox Storage servers and compete on price. The owner's word of 16:1xZ opened this captain in this folder; the keeper's readings of 15:5xZ and 16:1xZ (`bsv-stack-lean` `docs/RULINGS-2026-10-12.md`) bind: the readiness half is the stack's, the business half is the plan program's, WAB is its own program.
