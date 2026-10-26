@@ -104,6 +104,8 @@ Ranked by what stops a stranger's wallet from using the server safely, then by w
 | 11 | **The finds and the proof update** (section 1 rows 5, 12, 16 to 18, 39): `findOutputBaskets(Auth)`, `findOutputsAuth`, `findCertificatesAuth`, `updateProvenTxReqWithNewProvenTx`, `adminStats` | thin handlers over the existing queries; the admin key list | 3 | yes (a public shape) |
 | 12 | **Binary JSON encoding** | the tag codec and the header on both sides | 2 | no |
 
+Filed 2026-10-26 16:43Z as issues on this repository, one milestone each (milestones 5 to 16): rank 1 #22, rank 2 #23, rank 3 #24, rank 4 #25, rank 5 #26, rank 6 #27, rank 7 #28, rank 8 #29, rank 9 #30, rank 10 #31, rank 11 #32, rank 12 #33; label `readiness`.
+
 The sum is 66 lane-days for parity with the reference at the pin. The smallest public offer is ranks 1 to 4 with the beta line of #14: 17 lane-days, about one week of wall clock on four lanes `[EST]`.
 
 What the open issues already cover: #14 (the beta line), #15 (route fixtures replayed in CI), #16 (ratchets and architecture rules), #17 (mutation and fuzz), #18 (typed config and errors), #19 (the door's statements per call), #20 (the chaos suite); none of them is a gap of this table, and rank 4's harness is the natural home of #15's fixtures.
