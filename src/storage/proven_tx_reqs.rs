@@ -66,9 +66,11 @@ impl<B: crate::services::BroadcastService + crate::services::ProofService> Stora
             " ORDER BY julianday(r.updated_at) {direction}, r.proven_tx_req_id {direction} LIMIT ? OFFSET ?"
         ));
         let paged = args.base.paged.unwrap_or_default();
-        values.push(crate::d1::QVal::Int(
-            paged.limit.map(i64::from).unwrap_or(-1),
-        ));
+        values.push(crate::d1::QVal::Int(i64::from(
+            paged
+                .limit
+                .unwrap_or(crate::door::bounds::DEFAULT_LIST_LIMIT),
+        )));
         values.push(crate::d1::QVal::Int(paged.offset.unwrap_or(0) as i64));
         let mut query = Query::new(sql);
         for value in values {

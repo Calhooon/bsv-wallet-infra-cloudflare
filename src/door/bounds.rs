@@ -17,7 +17,7 @@ pub const MAX_BINARY_BODY_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The largest list limit a caller may ask for (`StorageServer.ts:348-354`).
-pub const MAX_LIST_LIMIT: u64 = 1_000;
+pub const MAX_LIST_LIMIT: u32 = 1_000;
 
 /// The list limit when the caller names none, for the methods whose default
 /// was unbounded (`StorageServer.ts:341-347`); `findProvenTxReqs` is one.
@@ -124,10 +124,10 @@ pub fn check_limit(value: Option<&Value>) -> Result<(), String> {
         return Ok(());
     };
     match value.as_u64() {
-        Some(n) if n >= 1 && n <= MAX_LIST_LIMIT => Ok(()),
-        Some(n) if n > MAX_LIST_LIMIT => Err(format!(
-            "RPC list limits must not exceed {MAX_LIST_LIMIT}"
-        )),
+        Some(n) if n >= 1 && n <= u64::from(MAX_LIST_LIMIT) => Ok(()),
+        Some(n) if n > u64::from(MAX_LIST_LIMIT) => {
+            Err(format!("RPC list limits must not exceed {MAX_LIST_LIMIT}"))
+        }
         _ => Err("RPC list limits must be positive safe integers".to_string()),
     }
 }

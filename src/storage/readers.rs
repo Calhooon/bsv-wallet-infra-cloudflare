@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
-use crate::d1::Query;
 use crate::error::Result;
+use crate::{d1::Query, door::bounds::MAX_LIST_LIMIT};
 use serde::{Deserialize, Serialize};
 
 use super::StorageD1;
@@ -290,7 +290,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         user_id: i64,
         args: ListOutputsArgs,
     ) -> Result<ListOutputsResult> {
-        let limit = args.limit.unwrap_or(10).min(10000);
+        let limit = args.limit.unwrap_or(10).min(MAX_LIST_LIMIT);
         let offset = args.offset.unwrap_or(0);
         let order_by = if offset < 0 { "DESC" } else { "ASC" };
         let actual_offset = if offset < 0 {
@@ -659,7 +659,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         user_id: i64,
         args: ListActionsArgs,
     ) -> Result<ListActionsResult> {
-        let limit = args.limit.unwrap_or(10).min(10000);
+        let limit = args.limit.unwrap_or(10).min(MAX_LIST_LIMIT);
         let offset = args.offset.unwrap_or(0);
         let label_query_mode = args.label_query_mode.as_deref().unwrap_or("any");
         let include_labels = args.include_labels.unwrap_or(false);
@@ -1563,7 +1563,7 @@ mod tests {
     // =========================================================================
 
     fn compute_pagination(limit: Option<u32>, offset: Option<i32>) -> (u32, u32, &'static str) {
-        let limit = limit.unwrap_or(10).min(10000);
+        let limit = limit.unwrap_or(10).min(MAX_LIST_LIMIT);
         let offset_val = offset.unwrap_or(0);
         let order_by = if offset_val < 0 { "DESC" } else { "ASC" };
         let actual_offset = if offset_val < 0 {
@@ -1589,9 +1589,9 @@ mod tests {
     }
 
     #[test]
-    fn pagination_limit_capped_at_10000() {
+    fn pagination_limit_capped_at_the_doors_1000() {
         let (limit, _, _) = compute_pagination(Some(20000), None);
-        assert_eq!(limit, 10000);
+        assert_eq!(limit, 1000);
     }
 
     #[test]

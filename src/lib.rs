@@ -118,6 +118,15 @@ fn auth_fault_parts(e: &bsv_middleware_cloudflare::AuthCloudflareError) -> (u16,
     (e.status_code(), e.to_json())
 }
 
+/// A door refusal answered inside the BRC-31 session, signed like every answer there.
+fn sign_refusal(
+    refusal: &door::Refusal,
+    session: &bsv_middleware_cloudflare::middleware::auth::AuthSession,
+) -> Result<Response> {
+    sign_json_response(&refusal.body, refusal.status, &[], session)
+        .map_err(|e| Error::from(e.to_string()))
+}
+
 #[event(fetch)]
 pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // No `init_panic_hook()`: worker 0.8's `#[wasm_bindgen(start)]` installs a logging
@@ -472,9 +481,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     let identity_key =
         door::rate::identity_key(&auth_context.identity_key, connecting_ip.as_deref());
     if !door::rate::admit(&env, door::rate::IDENTITY_BINDING, identity_key).await {
-        let limited = door::rate::limited();
-        return sign_json_response(&limited.body, limited.status, &[], &session)
-            .map_err(|e| Error::from(e.to_string()));
+        return sign_refusal(&door::rate::limited(), &session);
     }
 
     // Only POST / is valid for JSON-RPC
@@ -492,8 +499,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     if let Err(too_large) =
         door::bounds::check_body(request_body.len() as u64, content_type.as_deref())
     {
-        return sign_json_response(&too_large.body, too_large.status, &[], &session)
-            .map_err(|e| Error::from(e.to_string()));
+        return sign_refusal(&too_large, &session);
     }
 
     // Parse JSON-RPC request
@@ -505,6 +511,13 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
                 .map_err(|e| Error::from(e.to_string()));
         }
     };
+
+    // The request budgets (#22): arrays, nesting, list limits and offsets.
+    if let Err(refusal) =
+        door::policy::check_budgets(&rpc_request.method, &rpc_request.params, &rpc_request.id)
+    {
+        return sign_refusal(&refusal, &session);
+    }
 
     // Get D1 and R2 bindings
     let db = env.d1("DB").map_err(|e| Error::from(e.to_string()))?;
