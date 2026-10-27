@@ -113,6 +113,9 @@ mod tests {
         let r = limited();
         assert_eq!(r.status, 429);
         assert_eq!(r.body["code"], "ERR_RATE_LIMITED");
-        assert_eq!(r.body["description"], "Too many requests. Please retry later.");
+        assert_eq!(
+            r.body["description"],
+            "Too many requests. Please retry later."
+        );
     }
 }
