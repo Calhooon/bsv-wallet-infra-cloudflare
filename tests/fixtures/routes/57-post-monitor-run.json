@@ -1,0 +1,35 @@
+{
+  "case": "post-monitor-run",
+  "request": {
+    "method": "POST",
+    "path": "/monitor/run?key=route-fixtures-monitor",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "abandoned_failed": 0,
+      "beef_compacted": 0,
+      "deep_sweep_checked": 0,
+      "deep_sweep_mismatched": 0,
+      "deep_sweep_repaired": 0,
+      "errors": [],
+      "ext_spends_found": 0,
+      "ext_spends_scanned": 1,
+      "nosend_found": 0,
+      "proofs_checked": 2,
+      "proofs_found": 0,
+      "proofs_reverified": 0,
+      "purged": 0,
+      "reorg_depth": 0,
+      "reorg_detected": false,
+      "send_errors": 0,
+      "sent": 0,
+      "status_synced": 0,
+      "unfail_recovered": 0
+    }
+  }
+}

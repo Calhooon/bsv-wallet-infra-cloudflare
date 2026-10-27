@@ -1,0 +1,22 @@
+{
+  "case": "post-arcade-callback-empty-event",
+  "request": {
+    "method": "POST",
+    "path": "/arcade/callback",
+    "headers": {
+      "authorization": "Bearer route-fixtures-callback",
+      "content-type": "application/json"
+    },
+    "body": "{}"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": null,
+    "body": {
+      "ignored": 0,
+      "ok": true,
+      "processed": 0
+    }
+  }
+}

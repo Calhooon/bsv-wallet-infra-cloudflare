@@ -1,0 +1,34 @@
+{
+  "case": "abortAction-unknown-reference",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 20,
+      "method": "abortAction",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "reference": "cm91dGUtZml4dHVyZXM="
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "error": {
+        "code": -32001,
+        "message": "Transaction with reference 'cm91dGUtZml4dHVyZXM=' not found"
+      },
+      "id": 20,
+      "jsonrpc": "2.0"
+    }
+  }
+}

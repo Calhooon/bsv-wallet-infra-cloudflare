@@ -1,0 +1,19 @@
+{
+  "case": "get-unknown-path-no-session",
+  "request": {
+    "method": "GET",
+    "path": "/nowhere",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "code": "UNAUTHORIZED",
+      "message": "Mutual-authentication failed!",
+      "status": "error"
+    }
+  }
+}

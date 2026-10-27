@@ -1,0 +1,20 @@
+{
+  "case": "get-monitor-status-empty",
+  "request": {
+    "method": "GET",
+    "path": "/monitor/status",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "lastProofAt": "",
+      "lastProofFound": 0,
+      "oldestMinutes": "<duration>",
+      "unproven": 0
+    }
+  }
+}

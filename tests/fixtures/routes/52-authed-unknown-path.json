@@ -1,0 +1,19 @@
+{
+  "case": "authed-unknown-path",
+  "request": {
+    "method": "POST",
+    "path": "/nowhere",
+    "session": "caller",
+    "body": "{}"
+  },
+  "response": {
+    "status": 404,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "code": "NOT_FOUND",
+      "description": "Unknown endpoint. Use POST / for JSON-RPC.",
+      "status": "error"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "case": "post-monitor-reorg-sweep-to-below-from",
+  "request": {
+    "method": "POST",
+    "path": "/monitor/reorg-sweep?key=route-fixtures-monitor&from=10&to=5",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "error": "to must be >= from"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "case": "get-monitor-probe-woc",
+  "request": {
+    "method": "GET",
+    "path": "/monitor/probe-woc?key=route-fixtures-monitor&txid=bba637f5b05332d7279c0cb69e9daec3c3a7954dbd3018696274a15331d27db4",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "api_key_len": null,
+      "body_len": 9,
+      "body_preview": "not found",
+      "has_api_key": false,
+      "status": 404,
+      "url": "https://api.whatsonchain.com/v1/bsv/main/tx/bba637f5b05332d7279c0cb69e9daec3c3a7954dbd3018696274a15331d27db4/proof/tsc"
+    }
+  }
+}

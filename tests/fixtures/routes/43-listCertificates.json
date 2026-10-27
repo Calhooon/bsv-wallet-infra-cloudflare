@@ -1,0 +1,63 @@
+{
+  "case": "listCertificates",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 25,
+      "method": "listCertificates",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "certifiers": [
+            "0211ebfaabfe9b417a9ab1bdb34afc24aca92a936a3e8b89383e2de89ea66bbf11"
+          ],
+          "includeFields": true
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 25,
+      "jsonrpc": "2.0",
+      "result": {
+        "certificates": [
+          {
+            "certType": "cm91dGUtZml4dHVyZS10eXBl",
+            "certificateId": 1,
+            "certifier": "0211ebfaabfe9b417a9ab1bdb34afc24aca92a936a3e8b89383e2de89ea66bbf11",
+            "createdAt": "<time>",
+            "fields": [
+              {
+                "certificateFieldId": 1,
+                "certificateId": 1,
+                "createdAt": "<time>",
+                "fieldName": "name",
+                "fieldValue": "fixture",
+                "masterKey": "a2V5",
+                "updatedAt": "<time>",
+                "userId": 1
+              }
+            ],
+            "revocationOutpoint": "bba637f5b05332d7279c0cb69e9daec3c3a7954dbd3018696274a15331d27db4.0",
+            "serialNumber": "cm91dGUtZml4dHVyZS1zZXJpYWw=",
+            "signature": "3006020101020101",
+            "subject": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf",
+            "updatedAt": "<time>",
+            "userId": 1,
+            "verifier": null
+          }
+        ],
+        "totalCertificates": 1
+      }
+    }
+  }
+}

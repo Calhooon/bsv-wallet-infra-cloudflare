@@ -1,0 +1,26 @@
+{
+  "case": "commitStorageTransaction",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 30,
+      "method": "commitStorageTransaction",
+      "params": [
+        0
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 30,
+      "jsonrpc": "2.0",
+      "result": null
+    }
+  }
+}

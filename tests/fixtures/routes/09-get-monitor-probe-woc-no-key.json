@@ -1,0 +1,17 @@
+{
+  "case": "get-monitor-probe-woc-no-key",
+  "request": {
+    "method": "GET",
+    "path": "/monitor/probe-woc?txid=bba637f5b05332d7279c0cb69e9daec3c3a7954dbd3018696274a15331d27db4",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "error": "unauthorized"
+    }
+  }
+}

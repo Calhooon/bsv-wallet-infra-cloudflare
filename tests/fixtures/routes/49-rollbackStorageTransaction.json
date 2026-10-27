@@ -1,0 +1,26 @@
+{
+  "case": "rollbackStorageTransaction",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 31,
+      "method": "rollbackStorageTransaction",
+      "params": [
+        0
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 31,
+      "jsonrpc": "2.0",
+      "result": null
+    }
+  }
+}

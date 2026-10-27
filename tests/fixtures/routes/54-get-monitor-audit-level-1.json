@@ -1,0 +1,35 @@
+{
+  "case": "get-monitor-audit-level-1",
+  "request": {
+    "method": "GET",
+    "path": "/monitor/audit?level=1&key=route-fixtures-monitor",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "level": 1,
+      "summary": {
+        "totalUtxosChecked": 1,
+        "totalIssues": 0,
+        "lockedByFailed": 0,
+        "orphanedRefs": 0,
+        "spendableContradictions": 0,
+        "strandedOutputs": 0,
+        "missingLockingScript": 0,
+        "missingRawTx": 0,
+        "txidMismatch": 0,
+        "voutOutOfRange": 0,
+        "satoshisMismatch": 0,
+        "beefInvalid": 0,
+        "proofInvalid": 0,
+        "autoRepaired": 0
+      },
+      "issues": [],
+      "executionMs": "<duration>"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "case": "post-monitor-reorg-sweep-no-range",
+  "request": {
+    "method": "POST",
+    "path": "/monitor/reorg-sweep?key=route-fixtures-monitor",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "error": "from and to (block heights) are required"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "case": "post-arcade-callback-wrong-bearer",
+  "request": {
+    "method": "POST",
+    "path": "/arcade/callback",
+    "headers": {
+      "authorization": "Bearer wrong"
+    },
+    "body": "{}"
+  },
+  "response": {
+    "status": 401,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": "unauthorized"
+  }
+}

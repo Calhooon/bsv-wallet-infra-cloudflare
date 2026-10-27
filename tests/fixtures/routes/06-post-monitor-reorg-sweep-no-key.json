@@ -1,0 +1,17 @@
+{
+  "case": "post-monitor-reorg-sweep-no-key",
+  "request": {
+    "method": "POST",
+    "path": "/monitor/reorg-sweep?from=1&to=1",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "error": "unauthorized — set MONITOR_TRIGGER_KEY secret and pass ?key=<value>"
+    }
+  }
+}

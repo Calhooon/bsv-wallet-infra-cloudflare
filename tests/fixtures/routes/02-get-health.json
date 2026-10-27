@@ -1,0 +1,19 @@
+{
+  "case": "get-health",
+  "request": {
+    "method": "GET",
+    "path": "/",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "broadcaster": "arc",
+      "service": "wallet-infra",
+      "status": "ok"
+    }
+  }
+}

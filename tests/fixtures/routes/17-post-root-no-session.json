@@ -1,0 +1,21 @@
+{
+  "case": "post-root-no-session",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"makeAvailable\",\"params\":[]}"
+  },
+  "response": {
+    "status": 401,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "code": "UNAUTHORIZED",
+      "message": "Mutual-authentication failed!",
+      "status": "error"
+    }
+  }
+}

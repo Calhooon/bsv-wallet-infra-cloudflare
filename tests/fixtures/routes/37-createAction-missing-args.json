@@ -1,0 +1,32 @@
+{
+  "case": "createAction-missing-args",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 19,
+      "method": "createAction",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {}
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "error": {
+        "code": -32602,
+        "message": "missing field `description`"
+      },
+      "id": 19,
+      "jsonrpc": "2.0"
+    }
+  }
+}

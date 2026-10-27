@@ -1,0 +1,50 @@
+{
+  "case": "internalizeAction",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 17,
+      "method": "internalizeAction",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "tx": "010101016de3d6d543992871ff27895b5a820bb26056e93baca02c1f687d0f380d53adc30200beef01fe00350c00010100026de3d6d543992871ff27895b5a820bb26056e93baca02c1f687d0f380d53adc30101000100000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff02e8030000000000000151e803000000000000015100000000",
+          "outputs": [
+            {
+              "outputIndex": 0,
+              "protocol": "basket insertion",
+              "insertionRemittance": {
+                "basket": "fixtures"
+              }
+            }
+          ],
+          "description": "route fixture",
+          "labels": [],
+          "seekPermission": false
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 17,
+      "jsonrpc": "2.0",
+      "result": {
+        "accepted": true,
+        "isMerge": false,
+        "notDelayedResults": null,
+        "satoshis": 0,
+        "sendWithResults": null,
+        "txid": "c3ad530d380f7d681f2ca0ac3be95660b20b825a5b8927ff71289943d5d6e36d"
+      }
+    }
+  }
+}

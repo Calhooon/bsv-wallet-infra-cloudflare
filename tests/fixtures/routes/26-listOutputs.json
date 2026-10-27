@@ -1,0 +1,46 @@
+{
+  "case": "listOutputs",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 8,
+      "method": "listOutputs",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "basket": "default",
+          "include": "locking scripts",
+          "limit": 10
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 8,
+      "jsonrpc": "2.0",
+      "result": {
+        "outputs": [
+          {
+            "lockingScript": "51",
+            "outpoint": {
+              "txid": "bba637f5b05332d7279c0cb69e9daec3c3a7954dbd3018696274a15331d27db4",
+              "vout": 0
+            },
+            "satoshis": 1000,
+            "spendable": true
+          }
+        ],
+        "totalOutputs": 1
+      }
+    }
+  }
+}

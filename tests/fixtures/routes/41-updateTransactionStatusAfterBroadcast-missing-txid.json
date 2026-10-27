@@ -1,0 +1,27 @@
+{
+  "case": "updateTransactionStatusAfterBroadcast-missing-txid",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 23,
+      "method": "updateTransactionStatusAfterBroadcast",
+      "params": []
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "error": {
+        "code": -32602,
+        "message": "missing txid"
+      },
+      "id": 23,
+      "jsonrpc": "2.0"
+    }
+  }
+}
