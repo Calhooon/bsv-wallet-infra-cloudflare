@@ -79,7 +79,9 @@ the transaction pending while recording hints and checking evidence;
 Arcade's `400` carrying `status` 460 to 475 is its policy refusal: the
 request's history records the code, the instance and the fee its `/policy`
 asks, the inputs stay held and the monitor announces the transaction again
-([src/services/policy_refusal.rs](src/services/policy_refusal.rs)).
+([src/services/policy_refusal.rs](src/services/policy_refusal.rs)). Its 466
+is a conflict hint, recorded the same way with no fee asked; no word is
+written until a competitor's checked proof.
 
 The authenticated `findProvenTxReqs` method is served by
 [src/dispatch.rs](src/dispatch.rs), scoped to the caller's user. It lets the

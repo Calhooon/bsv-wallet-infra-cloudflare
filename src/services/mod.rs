@@ -43,8 +43,9 @@ pub enum BroadcastError {
     InvalidTx(String),
     /// ARC/network temporarily unavailable -- keep inputs LOCKED for retry.
     ServiceError(String),
-    /// An instance refused the transaction under its own policy (#50, B5):
-    /// a hint, never invalidity; inputs held, the monitor re-announces.
+    /// An instance refused the transaction under its own policy, or answered
+    /// 466, a conflict hint (#50, B5): a hint, never invalidity and never a
+    /// word; inputs held, the monitor re-announces.
     PolicyRefusal(policy_refusal::PolicyRefusal),
 }
 

@@ -526,10 +526,26 @@ impl ArcadeProvider {
                     // B5: the instance's policy answer is a hint, never InvalidTx (#50).
                     return Err(ArcadeFailure::Policy(
                         super::policy_refusal::PolicyRefusal {
+                            kind: super::policy_refusal::HintKind::Policy,
                             code,
                             name,
                             instance: self.instance(),
                             fee_asked: self.policy_fee().await,
+                            text,
+                        },
+                    ));
+                }
+                if super::policy_refusal::arcade_conflict_code(status, &text) {
+                    // B5: 466 is a conflict hint, never a doubleSpend word and never
+                    // InvalidTx; the word comes only from a competitor's checked proof.
+                    let (code, name) = super::policy_refusal::ARCADE_CONFLICT_CODE;
+                    return Err(ArcadeFailure::Policy(
+                        super::policy_refusal::PolicyRefusal {
+                            kind: super::policy_refusal::HintKind::Conflict,
+                            code,
+                            name,
+                            instance: self.instance(),
+                            fee_asked: None,
                             text,
                         },
                     ));

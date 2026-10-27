@@ -950,7 +950,7 @@ async fn send_waiting<B: BroadcastService + StreamBroadcast<wasm_bindgen::JsValu
                     crate::services::BroadcastError::DoubleSpend(_) => "doubleSpend",
                     crate::services::BroadcastError::InvalidTx(_) => "invalidTx",
                     crate::services::BroadcastError::ServiceError(_) => "serviceError",
-                    crate::services::BroadcastError::PolicyRefusal(_) => "policyRefusal",
+                    crate::services::BroadcastError::PolicyRefusal(r) => r.outcome(),
                 };
                 crate::storage::tracker_rule::append_note(
                     db,
