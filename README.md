@@ -82,7 +82,12 @@ cargo fmt --all -- --check
 host and wasm clippy, builds the Worker with worker-build 0.8.4, and runs the
 Miniflare bytes-at-rest witness with the JavaScript SDK. The Miniflare test
 checks the compiled Worker and its D1/R2/auth behavior; a native build is not
-that proof.
+that proof. The same job replays the route fixtures
+([tests/worker_route_fixtures.mjs](tests/worker_route_fixtures.mjs)): every
+HTTP route and JSON-RPC method against its recorded answer under
+[tests/fixtures/routes](tests/fixtures/routes), failing by case name on any
+difference; `UPDATE_FIXTURES=1` re-records them, and a behaviour change commits
+its fixtures' diff on its own.
 
 Dependabot moves the stack's crates twice a day, at 06:00Z and 18:00Z, under
 [.github/dependabot.yml](.github/dependabot.yml).
