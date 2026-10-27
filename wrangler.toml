@@ -79,6 +79,22 @@ bucket_name = "bsv-messagebox-beefs"
 binding = "AUTH_SESSIONS"
 id = "<your-account-id>"
 
+# #22, the door's rate limits (the reference's numbers, StorageServer.ts:477-487, 540-549):
+# 300 a minute per IP before auth, 1,000 a minute per identity after it, 429 beyond.
+# The Workers rate-limit binding counts per location, with no D1 statement; namespace_id is
+# an integer the operator picks, unique on the account. Unbound, the door is not limited.
+[[unsafe.bindings]]
+name = "RATE_LIMIT_IP"
+type = "ratelimit"
+namespace_id = "<your-ratelimit-namespace-id-ip>"
+simple = { limit = 300, period = 60 }
+
+[[unsafe.bindings]]
+name = "RATE_LIMIT_IDENTITY"
+type = "ratelimit"
+namespace_id = "<your-ratelimit-namespace-id-identity>"
+simple = { limit = 1000, period = 60 }
+
 [triggers]
 # 2026-04-15: reverted */2 → */5 after WoC blanket-429'd us. The */2 cadence
 # combined with 5 retries and LIMIT 1000 hammered WoC into rate-limiting.
