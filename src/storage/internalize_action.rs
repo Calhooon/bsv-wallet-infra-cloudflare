@@ -98,6 +98,18 @@ const INTERNALIZE_RESTORE_SPENDABLE_SQL: &str = "UPDATE outputs \
      SET spendable = 1, updated_at = ? \
      WHERE output_id = ? AND spent_by IS NULL AND basket_id IS NOT NULL";
 
+/// What an internalize broadcast left for the caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PostOutcome {
+    /// Accepted, already known, or proven: nothing to hold.
+    Sent,
+    /// A transient fault: outputs demoted, the payer's inputs restored.
+    Transient,
+    /// A policy refusal (B5, #50): outputs demoted, inputs held, the req
+    /// queued `unsent` for the monitor's re-announce.
+    PolicyHeld,
+}
+
 /// The subject of an AtomicBEEF, as the storage needs it.
 struct Subject {
     txid: String,
@@ -880,9 +892,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             // find the already-mined proof. For !has_proof, it will broadcast and
             // watch for confirmation.
             if !linked {
-                let broadcast_failed = self
+                let post = self
                     .create_proven_tx_req(&txid, &raw_tx, &beef, has_proof)
                     .await?;
+                let broadcast_failed = post != PostOutcome::Sent;
 
                 if broadcast_failed && !self.internalize_zero_conf {
                     outputs_demoted = true; // #56 fix 14: canonical fields below
@@ -917,8 +930,12 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     // Touches ONLY the rows this call flipped — a competing
                     // spent_by recorded since is never clobbered, and a
                     // double-restore is harmless (guards in the consts).
-                    self.restore_internalized_inputs(&input_transitions, now)
-                        .await?;
+                    // A policy refusal is re-announced by the monitor: its
+                    // inputs stay held (B5, #50).
+                    if post == PostOutcome::Transient {
+                        self.restore_internalized_inputs(&input_transitions, now)
+                            .await?;
+                    }
                 } else if broadcast_failed && self.internalize_zero_conf {
                     worker::console_log!(
                         "internalize: broadcast ServiceError for {} but INTERNALIZE_ZERO_CONF=true — keeping outputs spendable (0-conf)",
@@ -1148,15 +1165,15 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         Ok(row.and_then(|r| r.proven_tx_id.map(|id| id as i64)))
     }
 
-    /// Returns `true` if broadcast encountered a network error (outputs should
-    /// be marked non-spendable until the monitor confirms the broadcast).
+    /// Returns what the broadcast left: anything but `Sent` marks the outputs
+    /// non-spendable until the monitor confirms the broadcast.
     async fn create_proven_tx_req(
         &self,
         txid: &str,
         raw_tx: &[u8],
         input_beef: &BeefBlob<'_>,
         has_verified_proof: bool,
-    ) -> Result<bool> {
+    ) -> Result<PostOutcome> {
         #[derive(Deserialize)]
         #[allow(dead_code)]
         struct IdRow {
@@ -1170,7 +1187,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .await?;
 
         if existing.is_some() {
-            return Ok(false);
+            return Ok(PostOutcome::Sent);
         }
 
         // Broadcast the FULL BEEF (not just raw_tx) to ensure ARC/TAAL receive
@@ -1230,10 +1247,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 }
             }
         };
-        let broadcast_network_error = match broadcast_result {
+        let mut policy_hint = None;
+        let post = match broadcast_result {
             Ok(_result) => {
                 // Broadcast succeeded (new or already known) -- proceed
-                false
+                PostOutcome::Sent
             }
             Err(crate::services::BroadcastError::DoubleSpend(msg)) => {
                 // Double-spend verdict from ARC. CHAIN-TRUTH GATE first
@@ -1246,7 +1264,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         "internalize: ARC said double-spend for {} but the network knows it — treating as accepted",
                         txid
                     );
-                    false
+                    PostOutcome::Sent
                 } else {
                     // COMPENSATE: the caller already wrote the transaction
                     // row and its spendable=1 outputs (D1 has no rollback;
@@ -1267,7 +1285,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         "internalize: ARC said invalid-tx for {} but the network knows it — treating as accepted",
                         txid
                     );
-                    false
+                    PostOutcome::Sent
                 } else {
                     self.compensate_rejected_internalize(txid, raw_tx).await;
                     return Err(Error::ValidationError(format!(
@@ -1276,13 +1294,21 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     )));
                 }
             }
-            Err(
-                crate::services::BroadcastError::ServiceError(_)
-                | crate::services::BroadcastError::PolicyRefusal(_),
-            ) => {
+            Err(crate::services::BroadcastError::ServiceError(_)) => {
                 // Service error -- proceed cautiously, monitor will retry broadcast.
                 // Caller must mark outputs non-spendable until broadcast is confirmed.
-                true
+                PostOutcome::Transient
+            }
+            Err(error @ crate::services::BroadcastError::PolicyRefusal(_)) => {
+                // B5 (#50): the instance's policy answer is a hint, never invalidity
+                // ("an Arcade REJECTED is not necessarily terminal", ts-stack@edf6e03
+                // e2e/storage/README.md:113). No compensation; the req is queued
+                // `unsent` with the hint so send_waiting re-announces it.
+                policy_hint = Some(serde_json::json!({
+                    "when": Utc::now().to_rfc3339(), "what": "internalizeBroadcastHint",
+                    "outcome": "policyRefusal", "words": error.hint_words(), "nextReaskMinutes": 5,
+                }));
+                PostOutcome::PolicyHeld
             }
         };
 
@@ -1296,9 +1322,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         let req_meta = Query::new(
             r#"INSERT INTO proven_tx_reqs (
                 txid, status, attempts, history, notify, notified, raw_tx, input_beef, created_at, updated_at
-            ) VALUES (?, 'unmined', 0, '{}', '{}', 0, ?, NULL, ?, ?)"#,
+            ) VALUES (?, ?, 0, '{}', '{}', 0, ?, NULL, ?, ?)"#,
         )
         .bind(txid)
+        .bind(if policy_hint.is_some() { "unsent" } else { "unmined" })
         .bind(raw_tx)
         .bind(now)
         .bind(now)
@@ -1317,8 +1344,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         .bind(req_id)
         .execute(self.db)
         .await?;
+        if let Some(note) = policy_hint {
+            super::tracker_rule::append_note(self.db, txid, note).await?;
+        }
 
-        Ok(broadcast_network_error)
+        Ok(post)
     }
 
     /// Compensation for an internalize whose broadcast came back with a
