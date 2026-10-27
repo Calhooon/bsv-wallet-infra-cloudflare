@@ -102,3 +102,11 @@ Speed: the crate measured today's KV session path at p50 404 ms and p90 528 ms o
 ## 4. The keeper's items this needs
 
 The store crate's name and home; the courier crate's name and home; `Storage.lean` (S4 to S9) with the runner's store driver. Asked of the keeper 2026-10-27 12:4xZ.
+
+## 5. Addendum, 2026-10-27 15:11Z: the words of the afternoon
+
+- **13:0xZ, "yes":** the two crates exist from the template, `Calhooon/bsv-courier` (3765dda) and `Calhooon/bsv-wallet-store` (9536364), the names final; the mapping of this repository's asks is on #21.
+- **14:3xZ, "love it...", on the price as the rail.** Three kinds of limit were read: a platform ceiling per unit, a rail we set, a third party's quota. The owner's question, verbatim: "why rate limits at all if we can make money on all this.. but at the same time we dont wanna leave shit open for like infinite cloudflare bills". The answer taken: on paid calls money is the only rail and the quote rises with the caller's rate (#54); the two Workers rate-limit bindings carry production and beta for the unpaid paths only, the handshake, a bad signature and the 402 itself, which are the one shape of an unbounded bill (about half a dollar a million refused requests at the rack rate); the flood stops at the zone with a firewall rule, the keeper's (#56, live, 167 POSTs per 10 seconds per address on the zone's plan); a daily budget switch bounds the worst day by a number the owner chooses (#55); the free onboarding allowance stays.
+- **14:3xZ, "agents I believe probably....":** the agents captain patches the viewer's keyless status call; the keeper routes it.
+- **14:5xZ, "we can do this yes":** the suite's mainnet identity funded with 1,000,000 sats and its key in the vault; the keeper's ratchet template and feed design proceed. **15:0xZ, "you can do it from port 3321":** the payment made from the owner's desktop wallet, txid `d93f713288091c913bd4ffe8a44efb7357d58abb9df7155c355b592693f60319`, the seat funded (#25).
+- **The keeper's closings (14:3xZ):** the fleet measurement on #22 (seven days, 9,847 POSTs over 12 addresses, the worst minute per address 123, so the door's 300 a minute blocks no fleet caller); the zone rule read back on #56; the door policies in production at 15:08:01Z.
