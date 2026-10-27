@@ -895,27 +895,39 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 let post = self
                     .create_proven_tx_req(&txid, &raw_tx, &beef, has_proof)
                     .await?;
-                let broadcast_failed = post != PostOutcome::Sent;
+                // A policy refusal (B5, #50) demotes whatever INTERNALIZE_ZERO_CONF
+                // says: Arcade files a script failure under 461 and an input sum
+                // short of the outputs under 465, so a refused payment is not
+                // credited until the tracker rule's evidence, the broadcaster's
+                // SEEN_ON_NETWORK on a later announce or a checked proof (the
+                // monitor's promotions), makes its outputs spendable.
+                let demote = match post {
+                    PostOutcome::Sent => false,
+                    PostOutcome::Transient => !self.internalize_zero_conf,
+                    PostOutcome::PolicyHeld => true,
+                };
 
-                if broadcast_failed && !self.internalize_zero_conf {
+                if demote {
                     outputs_demoted = true; // #56 fix 14: canonical fields below
-                                            // Broadcast hit a network error (WoC down, DNS failure, timeout).
-                                            // Mark outputs non-spendable to prevent phantom UTXOs from inflating
-                                            // the user's balance. The monitor will retry the broadcast every 5
-                                            // minutes and set spendable = 1 once the transaction is confirmed
+                                            // Broadcast hit a network error (WoC down, DNS failure, timeout)
+                                            // or a policy refusal. Mark outputs non-spendable to prevent
+                                            // phantom UTXOs from inflating the user's balance. The monitor
+                                            // will retry the broadcast every 5 minutes and set spendable = 1
+                                            // once the broadcaster sees the transaction or it is confirmed
                                             // on-chain.
                                             //
                                             // ZERO-CONF dev lever (env INTERNALIZE_ZERO_CONF=true): SKIP this
-                                            // demotion. The operator funds from their own already-broadcast
-                                            // wallet, so the funding tx is genuinely on-network and the only
-                                            // reason it would land here is a transient provider hiccup
-                                            // (ARC/WoC timeout). Keeping spendable = 1 makes the deposit usable
-                                            // immediately (0-conf) instead of waiting ~1 block for the monitor
-                                            // to reconcile. The proven_tx_req still exists, so the monitor
-                                            // fetches the proof and completes the status normally. NOTE: a true
-                                            // DoubleSpend/InvalidTx still hard-rejects upstream in
-                                            // create_proven_tx_req — only the transient ServiceError path is
-                                            // affected here.
+                                            // demotion on a transient fault only. The operator funds from
+                                            // their own already-broadcast wallet, so the funding tx is
+                                            // genuinely on-network and the only reason it would land here is
+                                            // a transient provider hiccup (ARC/WoC timeout). Keeping
+                                            // spendable = 1 makes the deposit usable immediately (0-conf)
+                                            // instead of waiting ~1 block for the monitor to reconcile. The
+                                            // proven_tx_req still exists, so the monitor fetches the proof
+                                            // and completes the status normally. NOTE: a DoubleSpend/InvalidTx
+                                            // hard-rejects upstream in create_proven_tx_req, and a policy
+                                            // refusal is demoted under either setting; only the transient
+                                            // ServiceError path keeps its outputs here.
                     Query::new(
                         "UPDATE outputs SET spendable = 0, updated_at = ? WHERE transaction_id = ? AND user_id = ?",
                     )
@@ -936,7 +948,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         self.restore_internalized_inputs(&input_transitions, now)
                             .await?;
                     }
-                } else if broadcast_failed && self.internalize_zero_conf {
+                } else if post == PostOutcome::Transient {
                     worker::console_log!(
                         "internalize: broadcast ServiceError for {} but INTERNALIZE_ZERO_CONF=true — keeping outputs spendable (0-conf)",
                         txid
