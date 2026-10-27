@@ -8,6 +8,7 @@ pub mod arcade;
 pub mod bitails;
 pub mod chaintracker;
 pub mod multi;
+pub mod policy_refusal;
 pub mod selected;
 pub mod woc;
 
@@ -34,6 +35,7 @@ pub struct BroadcastResult {
 ///
 /// Both `DoubleSpend` and `InvalidTx` are permanent failures that release inputs.
 /// `ServiceError` is transient -- inputs stay locked so the monitor can retry every 5 min.
+/// `PolicyRefusal` is an instance's policy answer (B5): a hint, inputs held, re-announced.
 pub enum BroadcastError {
     /// Input already spent -- permanent failure, release inputs.
     DoubleSpend(String),
@@ -41,6 +43,9 @@ pub enum BroadcastError {
     InvalidTx(String),
     /// ARC/network temporarily unavailable -- keep inputs LOCKED for retry.
     ServiceError(String),
+    /// An instance refused the transaction under its own policy (#50, B5):
+    /// a hint, never invalidity; inputs held, the monitor re-announces.
+    PolicyRefusal(policy_refusal::PolicyRefusal),
 }
 
 impl BroadcastError {
@@ -51,6 +56,15 @@ impl BroadcastError {
             BroadcastError::DoubleSpend(_) | BroadcastError::InvalidTx(_)
         )
     }
+
+    /// The words a history note records for this error: a policy refusal's
+    /// code, instance and fee asked, else the error's text.
+    pub fn hint_words(&self) -> serde_json::Value {
+        match self {
+            BroadcastError::PolicyRefusal(refusal) => refusal.hint_words(),
+            other => serde_json::json!([other.to_string()]),
+        }
+    }
 }
 
 impl std::fmt::Display for BroadcastError {
@@ -59,6 +73,7 @@ impl std::fmt::Display for BroadcastError {
             BroadcastError::DoubleSpend(msg) => write!(f, "Double-spend: {}", msg),
             BroadcastError::InvalidTx(msg) => write!(f, "Invalid tx: {}", msg),
             BroadcastError::ServiceError(msg) => write!(f, "Service error: {}", msg),
+            BroadcastError::PolicyRefusal(refusal) => write!(f, "Policy refusal: {}", refusal),
         }
     }
 }
@@ -74,6 +89,9 @@ impl std::fmt::Debug for BroadcastError {
             }
             BroadcastError::ServiceError(msg) => {
                 write!(f, "BroadcastError::ServiceError({})", msg)
+            }
+            BroadcastError::PolicyRefusal(refusal) => {
+                write!(f, "BroadcastError::PolicyRefusal({})", refusal)
             }
         }
     }

@@ -585,12 +585,13 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         crate::services::BroadcastError::InvalidTx(_) => "invalidTx",
                         crate::services::BroadcastError::DoubleSpend(_) => "doubleSpend",
                         crate::services::BroadcastError::ServiceError(_) => "serviceError",
+                        crate::services::BroadcastError::PolicyRefusal(_) => "policyRefusal",
                     };
                     self.record_hint(
                         provided_txid,
                         "immediateBroadcastHint",
                         outcome,
-                        serde_json::json!([error.to_string()]),
+                        error.hint_words(),
                         true,
                     )
                     .await?;

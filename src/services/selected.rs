@@ -112,6 +112,9 @@ fn fallback_or_error(failure: ArcadeFailure) -> std::result::Result<String, Broa
         // Submitted but unverified: the tx IS at Arcade. Keep inputs locked (ServiceError
         // semantics) and let the monitor re-broadcast — Arcade dedupes and replays status.
         ArcadeFailure::Unverified(msg) => Err(BroadcastError::ServiceError(msg)),
+        // The instance's policy answer (B5, #50): a hint for the caller to record, never
+        // a fallback (the re-announce is the monitor's).
+        ArcadeFailure::Policy(refusal) => Err(BroadcastError::PolicyRefusal(refusal)),
     }
 }
 
@@ -279,5 +282,21 @@ mod tests {
         let msg = fallback_or_error(ArcadeFailure::Outage("unreachable".into()))
             .expect("outage falls back");
         assert_eq!(msg, "unreachable");
+    }
+
+    #[test]
+    fn a_policy_refusal_is_a_hint_never_permanent_never_a_fallback() {
+        let refusal = super::super::policy_refusal::PolicyRefusal {
+            code: 465,
+            name: "Fees",
+            instance: "arcade.test".into(),
+            fee_asked: None,
+            text: "fee too low".into(),
+        };
+        let e = fallback_or_error(ArcadeFailure::Policy(refusal))
+            .expect_err("a policy refusal must not fall back");
+        assert!(!e.is_permanent());
+        assert!(matches!(e, BroadcastError::PolicyRefusal(ref r) if r.code == 465));
+        assert_eq!(e.hint_words()["code"], 465);
     }
 }

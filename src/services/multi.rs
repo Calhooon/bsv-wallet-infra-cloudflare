@@ -83,6 +83,7 @@ impl BroadcastService for MultiProvider {
             Err(BroadcastError::DoubleSpend(_)) => "double_spend",
             Err(BroadcastError::InvalidTx(_)) => "invalid_tx",
             Err(BroadcastError::ServiceError(_)) => "service_error",
+            Err(BroadcastError::PolicyRefusal(_)) => "policy_refusal",
         };
         worker::console_log!(
             "BENCH broadcast.arc[raw,outcome={}]: {:.0} ms",
@@ -93,6 +94,7 @@ impl BroadcastService for MultiProvider {
             Ok(result) => Ok(result),
             Err(BroadcastError::DoubleSpend(msg)) => Err(BroadcastError::DoubleSpend(msg)),
             Err(BroadcastError::InvalidTx(msg)) => Err(BroadcastError::InvalidTx(msg)),
+            Err(BroadcastError::PolicyRefusal(r)) => Err(BroadcastError::PolicyRefusal(r)),
             Err(BroadcastError::ServiceError(_)) => {
                 let woc_t0 = js_sys::Date::now();
                 let r = self.woc.broadcast_raw_tx(raw_hex).await;
@@ -117,6 +119,7 @@ impl BroadcastService for MultiProvider {
             Err(BroadcastError::DoubleSpend(_)) => "double_spend",
             Err(BroadcastError::InvalidTx(_)) => "invalid_tx",
             Err(BroadcastError::ServiceError(_)) => "service_error",
+            Err(BroadcastError::PolicyRefusal(_)) => "policy_refusal",
         };
         worker::console_log!(
             "BENCH broadcast.arc[beef,outcome={},bytes={}]: {:.0} ms",
@@ -128,6 +131,7 @@ impl BroadcastService for MultiProvider {
             Ok(result) => Ok(result),
             Err(BroadcastError::DoubleSpend(msg)) => Err(BroadcastError::DoubleSpend(msg)),
             Err(BroadcastError::InvalidTx(msg)) => Err(BroadcastError::InvalidTx(msg)),
+            Err(BroadcastError::PolicyRefusal(r)) => Err(BroadcastError::PolicyRefusal(r)),
             Err(BroadcastError::ServiceError(_)) => {
                 let woc_t0 = js_sys::Date::now();
                 let r = self.woc.broadcast_beef(beef_hex).await;

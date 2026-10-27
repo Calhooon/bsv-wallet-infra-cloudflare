@@ -1276,7 +1276,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     )));
                 }
             }
-            Err(crate::services::BroadcastError::ServiceError(_)) => {
+            Err(
+                crate::services::BroadcastError::ServiceError(_)
+                | crate::services::BroadcastError::PolicyRefusal(_),
+            ) => {
                 // Service error -- proceed cautiously, monitor will retry broadcast.
                 // Caller must mark outputs non-spendable until broadcast is confirmed.
                 true
