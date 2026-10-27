@@ -36,6 +36,21 @@ From the fetch handler in [src/lib.rs](src/lib.rs):
 | `GET /monitor/audit` | `?key=<MONITOR_TRIGGER_KEY>` | the UTXO audit, `?level=` (default 2) |
 | `POST /` | BRC-31 session (`SERVER_PRIVATE_KEY`, `AUTH_SESSIONS`) | JSON-RPC, signed responses |
 
+The door's policies (#22): an in-flight ceiling of 24 per isolate (503 with
+`Retry-After: 1` beyond it), bodies and responses bounded at 8 MiB (413),
+list limits of 1,000, and two rate limits counted by the platform's
+rate-limit bindings, 300 a minute per address before authentication and
+1,000 a minute per identity after it (429 with the draft-8 `RateLimit`
+headers). The bindings are approximate by the platform's own design: each
+running instance checks a local count and the counts synchronize in the
+background, so a flood can pass the line before they agree (#59). The
+address limit of record is therefore the zone's firewall rule in front of
+the Worker (#56), exact per window and enforced before any invocation; the
+binding is the soft inner rail, and `GET /` names each binding `bound` or
+`absent`. The exact per-identity rail belongs beside the credit in the
+wallet's store (#54, #28), and the daily budget switch (#55) is the hard
+bound.
+
 The BRC-31 handshake is answered by the middleware; an authenticated request to any other path is a 404. The
 cron trigger in [wrangler.toml](wrangler.toml) (`*/5 * * * *`) runs the monitor.
 
