@@ -6,6 +6,7 @@
 //! the reference's order: the in-flight ceiling, the body bound, the rate
 //! limits, the request budgets, the response bound.
 
+pub mod bounds;
 pub mod inflight;
 
 use serde_json::Value;
