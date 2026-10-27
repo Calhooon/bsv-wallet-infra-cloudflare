@@ -128,17 +128,10 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
         }
     };
 
+    // A fault's own text goes to the log, never to the wire (#22, door::errors).
     match result {
         Ok(val) => val,
-        Err(e) => {
-            let (code, msg) = match &e {
-                Error::ValidationError(m) => (-32602, m.clone()),
-                Error::NotFound(m) => (-32001, m.clone()),
-                Error::DatabaseError(m) => (-32603, m.clone()),
-                Error::InternalError(m) => (-32603, m.clone()),
-            };
-            serde_json::to_value(JsonRpcError::new(id, code, msg)).unwrap()
-        }
+        Err(e) => crate::door::errors::rpc_error(id, &e),
     }
 }
 
