@@ -175,6 +175,21 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         return Ok(add_cors_headers(response));
     }
 
+    // The reference's public routes (#22; StorageServer.ts:518-526): a health
+    // answer that names nothing, and a robots.txt that asks crawlers to stay out.
+    if req.path() == "/healthz" && req.method() == Method::Get {
+        let response = Response::from_json(&serde_json::json!({ "status": "ok" }))?;
+        response.headers().set("Cache-Control", "no-store")?;
+        return Ok(add_cors_headers(response));
+    }
+    if req.path() == "/robots.txt" && req.method() == Method::Get {
+        let response = Response::ok("User-agent: *\nDisallow: /")?;
+        response
+            .headers()
+            .set("Content-Type", "text/plain; charset=utf-8")?;
+        return Ok(add_cors_headers(response));
+    }
+
     // Arcade V2 webhook — the push-native proof path. Registered at submit via
     // X-CallbackUrl; Arcade POSTs TransactionStatus JSON authed with
     // `Authorization: Bearer <ARCADE_CALLBACK_TOKEN>`. Fail-closed: no configured
