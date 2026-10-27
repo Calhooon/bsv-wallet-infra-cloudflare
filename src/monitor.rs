@@ -1513,7 +1513,8 @@ fn read_varint_at(data: &[u8], pos: usize) -> Option<(u64, usize)> {
 /// Store-time gate (Task 11): the proof's root is verified for its height via
 /// the ChainTracker BEFORE anything is written. `Ok(false)` = refused (not
 /// canonical / path does not prove the txid) — nothing stored, the req stays
-/// pending and the next cycle re-fetches. Tracker outage → stored as before.
+/// pending and the next cycle re-fetches. Header service down → held the same
+/// way, with one `proof_held` row in `monitor_events` (#49).
 pub(crate) async fn store_proof_result<H: HeaderService>(
     db: &D1Database,
     blobs: &worker::Bucket,
@@ -1523,7 +1524,8 @@ pub(crate) async fn store_proof_result<H: HeaderService>(
     raw_tx_hex: &Option<String>,
     proof_result: &crate::services::ProofResult,
 ) -> Result<bool> {
-    let Some(facts) = gated_proof_facts(headers, txid, proof_result, "store_proof").await else {
+    let Some(facts) = gated_proof_facts(db, headers, txid, proof_result, "store_proof").await
+    else {
         return Ok(false);
     };
     let now = Utc::now().to_rfc3339();
@@ -1642,8 +1644,11 @@ pub(crate) async fn store_proof_result<H: HeaderService>(
 /// Shared store-time gate for both proven_txs INSERT paths. `None` = do not
 /// store (logged once here). Otherwise the path's own height/idx/root, which
 /// are what BEEF verification will recompute — the provider's `merkle_root`
-/// is '' for ARC proofs, so the computed root also fills that gap.
+/// is '' for ARC proofs, so the computed root also fills that gap. When the
+/// header service does not answer the proof is held: nothing is written but
+/// one `proof_held` event row, and the request keeps its state (#49).
 async fn gated_proof_facts<H: HeaderService>(
+    db: &D1Database,
     headers: &H,
     txid: &str,
     proof: &crate::services::ProofResult,
@@ -1651,14 +1656,9 @@ async fn gated_proof_facts<H: HeaderService>(
 ) -> Option<deep_reorg::PathFacts> {
     match deep_reorg::gate_proof_for_store(headers, txid, proof).await {
         deep_reorg::StoreGate::Store(f) => Some(f),
-        deep_reorg::StoreGate::StoreUnverified(f, e) => {
-            console_log!(
-                "{}: root for {} unverified (tracker unavailable: {}) — storing as before",
-                path,
-                txid,
-                e
-            );
-            Some(f)
+        deep_reorg::StoreGate::Hold(e) => {
+            record_proof_hold(db, path, txid, proof.block_height, &e).await;
+            None
         }
         deep_reorg::StoreGate::Reject(why) => {
             console_error!(
@@ -1670,6 +1670,44 @@ async fn gated_proof_facts<H: HeaderService>(
             );
             None
         }
+    }
+}
+
+/// The `monitor_events` row of a held proof (event `proof_held`).
+pub(crate) const PROOF_HOLD_EVENT_SQL: &str =
+    "INSERT INTO monitor_events (event, details, created_at, updated_at) \
+     VALUES ('proof_held', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)";
+
+/// The `details` JSON of a `proof_held` row: the path, the txid, the height
+/// and the header service's reason.
+pub(crate) fn proof_hold_details(path: &str, txid: &str, height: u32, reason: &str) -> String {
+    serde_json::json!({ "path": path, "txid": txid, "height": height, "reason": reason })
+        .to_string()
+}
+
+/// Record a proof held because the header service did not answer: one
+/// `proof_held` row in `monitor_events` and a log line. Writes nothing else;
+/// the next monitor run re-asks. A failed insert is logged, never raised.
+pub(crate) async fn record_proof_hold(
+    db: &D1Database,
+    path: &str,
+    txid: &str,
+    height: u32,
+    reason: &str,
+) {
+    console_log!(
+        "{}: proof for {} at h={} HELD (header service did not answer: {}); re-asked next run",
+        path,
+        txid,
+        height,
+        reason
+    );
+    if let Err(e) = Query::new(PROOF_HOLD_EVENT_SQL)
+        .bind(proof_hold_details(path, txid, height, reason).as_str())
+        .execute(db)
+        .await
+    {
+        console_error!("{}: proof_held event for {} not written: {}", path, txid, e);
     }
 }
 
@@ -2490,7 +2528,8 @@ async fn store_unfail_proof<P: ProofService, H: HeaderService>(
     proof_result: &crate::services::ProofResult,
 ) -> Result<bool> {
     // Store-time gate (Task 11) — same contract as store_proof_result.
-    let Some(facts) = gated_proof_facts(headers, txid, proof_result, "store_unfail_proof").await
+    let Some(facts) =
+        gated_proof_facts(db, headers, txid, proof_result, "store_unfail_proof").await
     else {
         return Ok(false);
     };
@@ -6122,5 +6161,28 @@ mod tests {
         let row: std::result::Result<String, _> =
             conn.query_row(EXT_SPEND_CURSOR_READ_SQL, [], |r| r.get(0));
         assert!(row.is_err()); // no cursor row → scan starts a fresh sweep
+    }
+
+    #[test]
+    fn test_proof_hold_sqlite_one_row_names_txid_and_reason() {
+        let conn = g5_test_db();
+        let txid = "ab".repeat(32);
+        let details =
+            proof_hold_details("store_proof", &txid, 900_001, "ChainTracks API error 503");
+        conn.execute(PROOF_HOLD_EVENT_SQL, rusqlite::params![details])
+            .unwrap();
+        let (count, read): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(details) FROM monitor_events WHERE event = 'proof_held'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let v: serde_json::Value = serde_json::from_str(&read).unwrap();
+        assert_eq!(v["txid"], txid);
+        assert_eq!(v["path"], "store_proof");
+        assert_eq!(v["height"], 900_001);
+        assert_eq!(v["reason"], "ChainTracks API error 503");
     }
 }

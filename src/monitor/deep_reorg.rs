@@ -291,9 +291,10 @@ impl RunRootCache {
 pub(crate) enum StoreGate {
     /// Root verified canonical — store (with the computed root/idx).
     Store(PathFacts),
-    /// Tracker unavailable — store as today (never block proofs on a
-    /// header-service outage). Facts are still the path's own.
-    StoreUnverified(PathFacts, String),
+    /// The header service did not answer: hold. Nothing is stored (a proof
+    /// not checked against our headers is not evidence, T2), the request
+    /// keeps its state and the next run re-asks. Carries the reason.
+    Hold(String),
     /// Do not store; the tx stays pending and is re-checked next cycle.
     Reject(String),
 }
@@ -301,7 +302,8 @@ pub(crate) enum StoreGate {
 /// Decide whether a fetched proof may be persisted. Rejects a path that does
 /// not prove `txid`, a height that disagrees with the provider's, and a root
 /// the ChainTracker says is NOT canonical for its height (proof fetched
-/// during/after a reorg from a lagging provider).
+/// during/after a reorg from a lagging provider). Holds when the header
+/// service does not answer.
 pub(crate) async fn gate_proof_for_store<H: HeaderService>(
     headers: &H,
     txid: &str,
@@ -326,7 +328,7 @@ pub(crate) async fn gate_proof_for_store<H: HeaderService>(
             "root {} is NOT canonical at height {}",
             facts.root, facts.height
         )),
-        Err(e) => StoreGate::StoreUnverified(facts, e),
+        Err(e) => StoreGate::Hold(e),
     }
 }
 
@@ -1025,13 +1027,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_tracker_unavailable_keeps_todays_behaviour() {
-        let (txid, proof, root) = two_leaf_proof(965_771);
+    async fn gate_tracker_unavailable_holds() {
+        let (txid, proof, _) = two_leaf_proof(965_771);
         let t = MapTracker::down();
         match gate_proof_for_store(&t, &txid, &proof).await {
-            StoreGate::StoreUnverified(f, _) => assert_eq!(f.root, root),
-            other => panic!("expected StoreUnverified, got {other:?}"),
+            StoreGate::Hold(why) => assert!(!why.is_empty()),
+            other => panic!("expected Hold, got {other:?}"),
         }
+        assert_eq!(*t.calls.borrow(), 1, "held after one header lookup");
     }
 
     #[tokio::test]
