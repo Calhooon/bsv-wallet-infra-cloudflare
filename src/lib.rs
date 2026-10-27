@@ -437,15 +437,15 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     // The pre-auth rate limit (#22): 300 a minute per IP at the BRC-31 door.
     let connecting_ip = req.headers().get("CF-Connecting-IP")?;
+    let ip_key = door::rate::ip_key(connecting_ip.as_deref());
     if !door::rate::pre_auth_skips(&req.method())
-        && !door::rate::admit(
-            &env,
-            door::rate::IP_BINDING,
-            door::rate::ip_key(connecting_ip.as_deref()),
-        )
-        .await
+        && !door::rate::admit(&env, door::rate::IP_BINDING, ip_key.clone()).await
     {
-        return door::rate::limited().to_response();
+        let response = door::rate::limited().to_response()?;
+        for (name, value) in door::rate::limited_headers(door::rate::IP_BINDING, &ip_key) {
+            response.headers().set(&name, &value)?;
+        }
+        return Ok(response);
     }
 
     // Get server key
@@ -505,8 +505,10 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     // The authenticated rate limit (#22): 1,000 a minute per identity.
     let identity_key =
         door::rate::identity_key(&auth_context.identity_key, connecting_ip.as_deref());
-    if !door::rate::admit(&env, door::rate::IDENTITY_BINDING, identity_key).await {
-        return sign_refusal(&door::rate::limited(), &session);
+    if !door::rate::admit(&env, door::rate::IDENTITY_BINDING, identity_key.clone()).await {
+        let headers = door::rate::limited_headers(door::rate::IDENTITY_BINDING, &identity_key);
+        return sign_json_response(&door::rate::limited().body, 429, &headers, &session)
+            .map_err(|e| Error::from(e.to_string()));
     }
 
     // Only POST / is valid for JSON-RPC
