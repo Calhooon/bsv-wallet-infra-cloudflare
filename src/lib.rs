@@ -206,8 +206,16 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         return Response::from_json(&outcome);
     }
 
-    // Monitor status — aggregate counts only, no PII
+    // Monitor status — aggregate counts only, no PII; behind the trigger key (#22)
     if req.path() == "/monitor/status" && req.method() == Method::Get {
+        let url = req.url().map_err(|e| Error::from(e.to_string()))?;
+        if !monitor_key_ok(&env, &url) {
+            let response = Response::from_json(&serde_json::json!({
+                "error": "unauthorized — set MONITOR_TRIGGER_KEY secret and pass ?key=<value>"
+            }))?
+            .with_status(401);
+            return Ok(add_cors_headers(response));
+        }
         let db = env.d1("DB").map_err(|e| Error::from(e.to_string()))?;
         let response = Response::from_json(&monitor::get_status(&db).await)?;
         return Ok(add_cors_headers(response));

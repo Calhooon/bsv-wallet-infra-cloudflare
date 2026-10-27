@@ -27,7 +27,7 @@ From the fetch handler in [src/lib.rs](src/lib.rs):
 | `OPTIONS` any path | none | CORS preflight |
 | `GET /` | none | health: `status`, `service`, and the `broadcaster` selected by `BROADCASTER` |
 | `POST /arcade/callback` | `Authorization: Bearer <ARCADE_CALLBACK_TOKEN>`; 404 when the secret is unset | Arcade's status webhook |
-| `GET /monitor/status` | none | aggregate monitor counts |
+| `GET /monitor/status` | `?key=<MONITOR_TRIGGER_KEY>` | aggregate monitor counts |
 | `POST /monitor/run` | `?key=<MONITOR_TRIGGER_KEY>` | one monitor run, now |
 | `POST /monitor/reorg-sweep` | `?key=<MONITOR_TRIGGER_KEY>`, `&from=&to=` | a deep reorg sweep over at most 500 heights |
 | `GET /monitor/probe-woc` | `?key=<MONITOR_TRIGGER_KEY>`, `&txid=` | the raw WhatsOnChain proof answer |
