@@ -203,6 +203,9 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
   const A = { identityKey: caller }
 
   await rpc('makeAvailable-before-migrate', 'makeAvailable', [])
+  // The operator initializes the store once, as the README's INSERT (#22): migrate writes nothing.
+  await db.prepare("INSERT INTO settings (storage_identity_key, storage_name, chain, dbtype, max_output_script) VALUES (?, 'route-fixtures', 'mainnet', 'D1', 10000)")
+    .bind(keyOf('route-fixtures server').toPublicKey().toString()).run()
   await rpc('migrate', 'migrate', ['route-fixtures', 'route-fixtures-storage'])
   await rpc('makeAvailable', 'makeAvailable', [])
   await rpc('findOrInsertUser-new', 'findOrInsertUser', [caller])
@@ -251,7 +254,7 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
   await record('authed-unknown-path', { method: 'POST', path: '/nowhere', session: 'caller', body: '{}' }, () => authed('/nowhere', 'POST', '{}'))
 
   // ---- the keyed operator routes, on the state above --------------------------
-  await http('get-monitor-status', 'GET', '/monitor/status')
+  await http('get-monitor-status', 'GET', `/monitor/status?key=${MONITOR_KEY}`)
   await http('get-monitor-audit-level-1', 'GET', `/monitor/audit?level=1&key=${MONITOR_KEY}`)
   await http('get-monitor-probe-woc', 'GET', `/monitor/probe-woc?key=${MONITOR_KEY}&txid=${seededTxid}`)
   await http('post-monitor-reorg-sweep', 'POST', `/monitor/reorg-sweep?key=${MONITOR_KEY}&from=${HEIGHT}&to=${HEIGHT}`)

@@ -24,7 +24,7 @@
         "dbtype": "D1",
         "maxOutputScript": 10000,
         "settingsId": 1,
-        "storageIdentityKey": "",
+        "storageIdentityKey": "03c4b940dc64343eedf6495c82ea4afef26e0bdcbd00e509457d3dc2de07040ebd",
         "storageName": "route-fixtures",
         "updatedAt": "<time>"
       }

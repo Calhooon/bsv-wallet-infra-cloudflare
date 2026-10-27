@@ -18,7 +18,7 @@
     "body": {
       "error": {
         "code": -32001,
-        "message": "Settings not found. Call migrate first."
+        "message": "Settings not found: the operator initializes the store (README)."
       },
       "id": 1,
       "jsonrpc": "2.0"
