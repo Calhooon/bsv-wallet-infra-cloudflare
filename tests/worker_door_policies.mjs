@@ -1,6 +1,7 @@
 // #22, the door's policies for strangers, on the compiled Worker, fully local:
 // the in-flight ceiling, the body bound, the two rate limits (the numbers read
-// from wrangler.toml), the list budgets, findOrInsertUser bound to the session,
+// from wrangler.toml; GET / naming each binding bound or absent; the 429's
+// draft-8 headers), the list budgets, findOrInsertUser bound to the session,
 // migrate without a write, a D1 fault collapsed on the wire, the status route
 // behind the trigger key, healthz and robots.txt. Miniflare with D1, KV, R2
 // and the rate-limit bindings; @bsv/sdk's AuthFetch for the BRC-31 door.
@@ -12,6 +13,7 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import assert from 'node:assert/strict'
 
 const { Miniflare } = await import(process.env.MINIFLARE_MODULE ?? 'miniflare')
@@ -45,7 +47,17 @@ const outbound = async request => {
   return new Response('not found', { status: 404 })
 }
 
-const mf = new Miniflare({
+// express-rate-limit's draft-8 headers on a 429 (`standardHeaders: 'draft-8'`,
+// RateLimitPolicy.ts:16): the policy name, r=0, t and Retry-After the window
+// (the binding gives no reset time), pk by its getPartitionKey.
+const draft8 = ({ limit, period }, key) => {
+  const name = `${limit}-in-${period / 60}min`
+  const pk = Buffer.from(createHash('sha256').update(key).digest('hex').slice(0, 12)).toString('base64')
+  return { ratelimit: `"${name}"; r=0; t=${period}`, 'ratelimit-policy': `"${name}"; q=${limit}; w=${period}; pk=:${pk}:`, 'retry-after': String(period) }
+}
+const headersOf = (headers, names) => Object.fromEntries(names.map(n => [n, headers.get(n)]))
+
+const options = {
   modules: true,
   scriptPath: resolve('build/worker/shim.mjs'),
   modulesRules: [
@@ -68,7 +80,8 @@ const mf = new Miniflare({
     RATE_LIMIT_IDENTITY: { simple: IDENTITY_LIMIT },
   },
   outboundService: outbound,
-})
+}
+const mf = new Miniflare(options)
 
 const say = line => console.log(line)
 
@@ -92,11 +105,16 @@ print(json.dumps(statements))
   }
 
   // Each AuthFetch client sends each request from the address `from()` names then.
+  // AuthFetch's Response carries only the signed headers; `wire` keeps the
+  // headers of the latest HTTP answer as they arrived.
+  let wire = null
   const clientFrom = (key, from) => new AuthFetch(new ProtoWallet(key), undefined, undefined, undefined, {},
-    (url, init = {}) => {
+    async (url, init = {}) => {
       const headers = new Headers(init.headers)
       headers.set('CF-Connecting-IP', from())
-      return fetch(url, { ...init, headers })
+      const response = await fetch(url, { ...init, headers })
+      wire = response.headers
+      return response
     })
   const callerKey = PrivateKey.fromRandom()
   const caller = callerKey.toPublicKey().toString()
@@ -128,6 +146,23 @@ print(json.dumps(statements))
     assert.match(robots.headers.get('content-type'), /^text\/plain/)
     assert.equal(await robots.text(), 'User-agent: *\nDisallow: /')
     say('healthz: 200 {"status":"ok"}, no-store; robots.txt: User-agent: * / Disallow: /')
+  }
+
+  // 1b. GET / names each rate-limit binding: bound here, absent on a Worker without them.
+  {
+    const root = await fetch(new URL('/', base))
+    assert.equal(root.status, 200)
+    assert.deepEqual((await root.json()).rate_limits, { RATE_LIMIT_IP: 'bound', RATE_LIMIT_IDENTITY: 'bound' })
+    const { ratelimits, ...unbound } = options
+    const bare = new Miniflare(unbound)
+    try {
+      const answer = await fetch(new URL('/', await bare.ready))
+      assert.equal(answer.status, 200)
+      assert.deepEqual((await answer.json()).rate_limits, { RATE_LIMIT_IP: 'absent', RATE_LIMIT_IDENTITY: 'absent' })
+    } finally {
+      await bare.dispose()
+    }
+    say('GET /: rate_limits both bound with the bindings, both absent on a Worker without them')
   }
 
   // 2. The status route behind the trigger key.
@@ -258,10 +293,12 @@ print(json.dumps(statements))
     const over = await post('198.51.100.7')
     assert.equal(over.status, 429)
     assert.deepEqual(await over.json(), { status: 'error', code: 'ERR_RATE_LIMITED', description: 'Too many requests. Please retry later.' })
+    const ipHeaders = draft8(IP_LIMIT, '198.51.100.7')
+    assert.deepEqual(headersOf(over.headers, Object.keys(ipHeaders)), ipHeaders)
     const read = await fetch(new URL('/healthz', base), { headers: { 'CF-Connecting-IP': '198.51.100.7' } })
     assert.equal(read.status, 200)
     assert.equal((await post('198.51.100.8')).status, 401)
-    say(`pre-auth: ${IP_LIMIT.limit} POSTs from one address reach the door, the next is 429 ERR_RATE_LIMITED; a GET from it and a POST from another pass`)
+    say(`pre-auth: ${IP_LIMIT.limit} POSTs from one address reach the door, the next is 429 ERR_RATE_LIMITED with RateLimit ${ipHeaders.ratelimit}; a GET from it and a POST from another pass`)
 
     // 9b. One identity from eight addresses (each under the address limit):
     // the limit's calls are served, the next is 429, signed.
@@ -281,12 +318,14 @@ print(json.dumps(statements))
     const limited = await one()
     assert.equal(limited.status, 429, JSON.stringify(limited.body))
     assert.deepEqual(limited.body, { status: 'error', code: 'ERR_RATE_LIMITED', description: 'Too many requests. Please retry later.' })
+    const identityHeaders = draft8(IDENTITY_LIMIT, `identity:${strangerKey.toPublicKey().toString()}`)
+    assert.deepEqual(headersOf(wire, Object.keys(identityHeaders)), identityHeaders)
     const elapsed = Date.now() - windowStart
     assert.ok(elapsed < periodMs - 1000, `the drive left the limiter's window (${elapsed} ms)`)
-    say(`identity: ${served} calls of one identity from ${addresses.length} addresses served, the next is 429 ERR_RATE_LIMITED (signed), in ${elapsed} ms`)
+    say(`identity: ${served} calls of one identity from ${addresses.length} addresses served, the next is 429 ERR_RATE_LIMITED (signed) with RateLimit ${identityHeaders.ratelimit}, in ${elapsed} ms`)
   }
 
-  console.log('Local compiled Worker GREEN (#22): the in-flight ceiling, the body bound, both rate limits, the list budgets, findOrInsertUser bound to the session, migrate without a write, the collapsed fault, the status route behind the key, healthz and robots.txt')
+  console.log('Local compiled Worker GREEN (#22): the in-flight ceiling, the body bound, both rate limits (bound or absent on GET /, draft-8 headers on the 429), the list budgets, findOrInsertUser bound to the session, migrate without a write, the collapsed fault, the status route behind the key, healthz and robots.txt')
 } finally {
   await mf.dispose()
 }
