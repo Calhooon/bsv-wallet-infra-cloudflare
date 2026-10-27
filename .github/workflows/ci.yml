@@ -101,7 +101,9 @@ jobs:
 
         node tests/worker_door_policies.mjs
 
-        node tests/worker_route_fixtures.mjs'
+        node tests/worker_route_fixtures.mjs
+
+        node tests/worker_proof_hold.mjs'
   scrub:
     name: scrub
     runs-on: ubuntu-latest
