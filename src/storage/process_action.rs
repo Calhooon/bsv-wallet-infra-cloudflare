@@ -585,7 +585,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         crate::services::BroadcastError::InvalidTx(_) => "invalidTx",
                         crate::services::BroadcastError::DoubleSpend(_) => "doubleSpend",
                         crate::services::BroadcastError::ServiceError(_) => "serviceError",
-                        crate::services::BroadcastError::PolicyRefusal(_) => "policyRefusal",
+                        crate::services::BroadcastError::PolicyRefusal(r) => r.outcome(),
                     };
                     self.record_hint(
                         provided_txid,

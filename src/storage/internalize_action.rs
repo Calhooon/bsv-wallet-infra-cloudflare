@@ -1329,14 +1329,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 // Caller must mark outputs non-spendable until broadcast is confirmed.
                 PostOutcome::Transient
             }
-            Err(error @ crate::services::BroadcastError::PolicyRefusal(_)) => {
-                // B5 (#50): the instance's policy answer is a hint, never invalidity
-                // ("an Arcade REJECTED is not necessarily terminal", ts-stack@edf6e03
-                // e2e/storage/README.md:113). No compensation; the req is queued
-                // `unsent` with the hint so send_waiting re-announces it.
+            Err(crate::services::BroadcastError::PolicyRefusal(refusal)) => {
+                // B5 (#50): the instance's policy answer or conflict hint is a hint,
+                // never invalidity ("an Arcade REJECTED is not necessarily terminal",
+                // ts-stack@edf6e03 e2e/storage/README.md:113). No compensation; the
+                // req is queued `unsent` with the hint so send_waiting re-announces it.
                 policy_hint = Some(serde_json::json!({
                     "when": Utc::now().to_rfc3339(), "what": "internalizeBroadcastHint",
-                    "outcome": "policyRefusal", "words": error.hint_words(), "nextReaskMinutes": 5,
+                    "outcome": refusal.outcome(), "words": refusal.hint_words(), "nextReaskMinutes": 5,
                 }));
                 PostOutcome::PolicyHeld
             }

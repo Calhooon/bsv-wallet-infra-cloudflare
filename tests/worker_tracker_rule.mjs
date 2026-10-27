@@ -174,10 +174,10 @@ try {
   })
 } finally { await mf.dispose() }
 
-// #50 under BROADCASTER arcade: Arcade's 400 carrying status 460 to 475 is the instance's
-// policy answer (B5). The fixture answers every submission with `arcadeCode` and its
+// #50 under BROADCASTER arcade: Arcade's 400 carrying status 460 to 475 but 466 is the
+// instance's policy answer (B5); 466 is a conflict hint, no word written. The fixture answers every submission with `arcadeCode` and its
 // policy with 100 sats per 1,000 bytes; the header service carries each fixture's root.
-const POLICY_CODES = [460, 461, 462, 463, 464, 465, 466, 467, 468, 469, 471, 472, 473, 474, 475]
+const POLICY_CODES = [460, 461, 462, 463, 464, 465, 467, 468, 469, 471, 472, 473, 474, 475]
 let arcadeCode = 465, arcadePosts = 0, policyReads = 0
 const roots = new Map()
 const arcade = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.test', CHAINTRACKS_URL: 'https://headers.test', BEEF_VERIFICATION: 'strict', INTERNALIZE_ZERO_CONF: 'false' }, async request => {
@@ -234,6 +234,20 @@ try {
         assert.equal(r0.tx_status, 'sending', `code ${code}`); assert.equal(r0.req_status, 'unsent', `code ${code}`); await arcade.locked(s)
         policyHint(r0.history, 'immediateBroadcastHint', code)
       }
+    } finally { arcadeCode = 465 }
+  })
+  await check('q2 arcade 400 status 466: a conflict hint, no fee read, never doubleSpend or failed, inputs held', async () => {
+    try {
+      arcadeCode = 466
+      const s = await arcade.seed(60, false, 'unsigned', true)
+      const reads = policyReads
+      await processTx(s)
+      const r0 = await arcade.row(s)
+      assert.equal(r0.tx_status, 'sending'); assert.equal(r0.req_status, 'unsent'); await arcade.locked(s)
+      assert.equal(policyReads, reads, 'a conflict hint read /policy')
+      const note = JSON.parse(r0.history).notes.filter(n => n.what === 'immediateBroadcastHint').at(-1)
+      assert.equal(note.outcome, 'conflictHint'); assert.equal(note.words.code, 466); assert.equal(note.words.feeAsked, null)
+      assert.match(note.words.verdict, /conflict hint/)
     } finally { arcadeCode = 465 }
   })
   await check('r internalizeAction refused at 465 is not failed; the req is queued with the hint and re-announced', async () => {

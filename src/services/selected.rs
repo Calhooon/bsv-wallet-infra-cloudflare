@@ -287,6 +287,7 @@ mod tests {
     #[test]
     fn a_policy_refusal_is_a_hint_never_permanent_never_a_fallback() {
         let refusal = super::super::policy_refusal::PolicyRefusal {
+            kind: super::super::policy_refusal::HintKind::Policy,
             code: 465,
             name: "Fees",
             instance: "arcade.test".into(),
