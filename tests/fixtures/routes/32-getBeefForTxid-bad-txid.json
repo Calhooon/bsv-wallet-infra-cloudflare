@@ -1,0 +1,34 @@
+{
+  "case": "getBeefForTxid-bad-txid",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 14,
+      "method": "getBeefForTxid",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "txid": "abc"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "error": {
+        "code": -32602,
+        "message": "getBeefForTxid: txid must be 64 hex chars"
+      },
+      "id": 14,
+      "jsonrpc": "2.0"
+    }
+  }
+}

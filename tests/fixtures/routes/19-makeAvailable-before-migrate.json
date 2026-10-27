@@ -1,0 +1,27 @@
+{
+  "case": "makeAvailable-before-migrate",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "makeAvailable",
+      "params": []
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "error": {
+        "code": -32001,
+        "message": "Settings not found. Call migrate first."
+      },
+      "id": 1,
+      "jsonrpc": "2.0"
+    }
+  }
+}

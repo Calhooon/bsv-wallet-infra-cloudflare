@@ -1,0 +1,59 @@
+{
+  "case": "getAnalyticsSummary",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 11,
+      "method": "getAnalyticsSummary",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "nowMs": 1780272000000
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 11,
+      "jsonrpc": "2.0",
+      "result": {
+        "totalActions": 0,
+        "windows": {
+          "24h": {
+            "senders": [],
+            "totalRevenue": 0,
+            "totalTransactions": 0,
+            "uniqueSenders": 0
+          },
+          "30d": {
+            "senders": [],
+            "totalRevenue": 0,
+            "totalTransactions": 0,
+            "uniqueSenders": 0
+          },
+          "7d": {
+            "senders": [],
+            "totalRevenue": 0,
+            "totalTransactions": 0,
+            "uniqueSenders": 0
+          },
+          "allTime": {
+            "senders": [],
+            "totalRevenue": 0,
+            "totalTransactions": 0,
+            "uniqueSenders": 0
+          }
+        }
+      }
+    }
+  }
+}

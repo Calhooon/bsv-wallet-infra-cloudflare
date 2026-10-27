@@ -1,0 +1,22 @@
+{
+  "case": "parse-error",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": "not json"
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "jsonrpc": "2.0",
+      "error": {
+        "code": -32700,
+        "message": "Parse error"
+      },
+      "id": null
+    }
+  }
+}

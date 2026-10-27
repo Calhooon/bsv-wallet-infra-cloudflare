@@ -1,0 +1,111 @@
+{
+  "case": "findProvenTxReqs",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 12,
+      "method": "findProvenTxReqs",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "txids": [
+            "bba637f5b05332d7279c0cb69e9daec3c3a7954dbd3018696274a15331d27db4"
+          ]
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 12,
+      "jsonrpc": "2.0",
+      "result": [
+        {
+          "attempts": 0,
+          "batch": null,
+          "createdAt": "<time>",
+          "history": "{}",
+          "inputBeef": null,
+          "notified": false,
+          "notify": "{}",
+          "provenTxId": null,
+          "provenTxReqId": 1,
+          "rawTx": [
+            1,
+            0,
+            0,
+            0,
+            1,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            187,
+            0,
+            0,
+            0,
+            0,
+            0,
+            255,
+            255,
+            255,
+            255,
+            1,
+            232,
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            81,
+            0,
+            0,
+            0,
+            0
+          ],
+          "status": "unmined",
+          "txid": "bba637f5b05332d7279c0cb69e9daec3c3a7954dbd3018696274a15331d27db4",
+          "updatedAt": "<time>"
+        }
+      ]
+    }
+  }
+}

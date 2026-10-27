@@ -1,0 +1,33 @@
+{
+  "case": "makeAvailable",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "method": "makeAvailable",
+      "params": []
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 3,
+      "jsonrpc": "2.0",
+      "result": {
+        "chain": "mainnet",
+        "createdAt": "<time>",
+        "dbtype": "D1",
+        "maxOutputScript": 10000,
+        "settingsId": 1,
+        "storageIdentityKey": "",
+        "storageName": "route-fixtures",
+        "updatedAt": "<time>"
+      }
+    }
+  }
+}

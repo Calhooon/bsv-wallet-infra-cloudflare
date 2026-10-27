@@ -1,0 +1,17 @@
+{
+  "case": "get-monitor-audit-wrong-key",
+  "request": {
+    "method": "GET",
+    "path": "/monitor/audit?level=1&key=wrong",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "error": "unauthorized — set MONITOR_TRIGGER_KEY secret and pass ?key=<value>"
+    }
+  }
+}

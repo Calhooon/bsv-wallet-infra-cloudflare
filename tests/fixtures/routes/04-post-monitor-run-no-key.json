@@ -1,0 +1,17 @@
+{
+  "case": "post-monitor-run-no-key",
+  "request": {
+    "method": "POST",
+    "path": "/monitor/run",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "error": "unauthorized — set MONITOR_TRIGGER_KEY secret and pass ?key=<value>"
+    }
+  }
+}

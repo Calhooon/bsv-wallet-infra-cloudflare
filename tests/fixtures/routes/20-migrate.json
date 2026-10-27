@@ -1,0 +1,27 @@
+{
+  "case": "migrate",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "method": "migrate",
+      "params": [
+        "route-fixtures",
+        "route-fixtures-storage"
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 2,
+      "jsonrpc": "2.0",
+      "result": "mainnet"
+    }
+  }
+}

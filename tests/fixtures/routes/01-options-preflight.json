@@ -1,0 +1,15 @@
+{
+  "case": "options-preflight",
+  "request": {
+    "method": "OPTIONS",
+    "path": "/",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 204,
+    "contentType": null,
+    "allowOrigin": "*",
+    "body": ""
+  }
+}

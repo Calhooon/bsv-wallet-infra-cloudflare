@@ -1,0 +1,17 @@
+{
+  "case": "get-monitor-probe-woc-bad-txid",
+  "request": {
+    "method": "GET",
+    "path": "/monitor/probe-woc?key=route-fixtures-monitor&txid=abc",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "error": "txid must be 64-char hex"
+    }
+  }
+}

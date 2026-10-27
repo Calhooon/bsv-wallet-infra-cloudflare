@@ -1,0 +1,33 @@
+{
+  "case": "relinquishCertificate",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 26,
+      "method": "relinquishCertificate",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "serialNumber": "cm91dGUtZml4dHVyZS1zZXJpYWw="
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 26,
+      "jsonrpc": "2.0",
+      "result": {
+        "relinquished": true
+      }
+    }
+  }
+}

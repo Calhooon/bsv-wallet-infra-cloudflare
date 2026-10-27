@@ -1,0 +1,34 @@
+{
+  "case": "listOutputs-bad-args",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 9,
+      "method": "listOutputs",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "basket": 7
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "error": {
+        "code": -32602,
+        "message": "invalid type: integer `7`, expected a string"
+      },
+      "id": 9,
+      "jsonrpc": "2.0"
+    }
+  }
+}

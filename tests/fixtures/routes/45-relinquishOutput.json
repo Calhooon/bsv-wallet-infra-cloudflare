@@ -1,0 +1,34 @@
+{
+  "case": "relinquishOutput",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 27,
+      "method": "relinquishOutput",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "basket": "fixtures",
+          "output": "c3ad530d380f7d681f2ca0ac3be95660b20b825a5b8927ff71289943d5d6e36d.0"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 27,
+      "jsonrpc": "2.0",
+      "result": {
+        "relinquished": true
+      }
+    }
+  }
+}

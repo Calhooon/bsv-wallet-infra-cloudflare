@@ -1,0 +1,25 @@
+{
+  "case": "post-monitor-reorg-sweep",
+  "request": {
+    "method": "POST",
+    "path": "/monitor/reorg-sweep?key=route-fixtures-monitor&from=800000&to=800000",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": {
+      "errors": [],
+      "from": 800000,
+      "header_lookups": 0,
+      "heights_checked": 0,
+      "mismatched": 0,
+      "pairs_checked": 0,
+      "repaired": 0,
+      "to": 800000,
+      "unrepaired": []
+    }
+  }
+}

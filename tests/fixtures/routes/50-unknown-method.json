@@ -1,0 +1,27 @@
+{
+  "case": "unknown-method",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 32,
+      "method": "noSuchMethod",
+      "params": []
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found: noSuchMethod"
+      },
+      "id": 32,
+      "jsonrpc": "2.0"
+    }
+  }
+}

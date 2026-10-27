@@ -1,0 +1,30 @@
+{
+  "case": "updateTransactionStatusAfterBroadcast-unknown-txid",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 22,
+      "method": "updateTransactionStatusAfterBroadcast",
+      "params": [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        true
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "error": {
+        "code": -32001,
+        "message": "transaction not found for caller"
+      },
+      "id": 22,
+      "jsonrpc": "2.0"
+    }
+  }
+}

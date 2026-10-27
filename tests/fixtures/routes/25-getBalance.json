@@ -1,0 +1,34 @@
+{
+  "case": "getBalance",
+  "request": {
+    "method": "POST",
+    "path": "/",
+    "session": "caller",
+    "body": {
+      "jsonrpc": "2.0",
+      "id": 7,
+      "method": "getBalance",
+      "params": [
+        {
+          "identityKey": "02c0fd91c68461e3062180c30b69b75333693f51e8ab3b23f6cb2d13243e3e9baf"
+        },
+        {
+          "basket": "default"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "contentType": null,
+    "allowOrigin": null,
+    "body": {
+      "id": 7,
+      "jsonrpc": "2.0",
+      "result": {
+        "balance": 1000,
+        "totalOutputs": 1
+      }
+    }
+  }
+}
