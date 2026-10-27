@@ -6,6 +6,8 @@ The occasion. Babbage's post of 2026-10-26 15:45:08Z (`@ProjectBabbage`, status 
 
 The service in question is the wallet-toolbox's remote storage: `StorageClient` "implements the `WalletStorageProvider` interface which allows it to serve as a BRC-100 wallet's active storage ... JSON-RPC over HTTPS ... Typically this server uses the `StorageServer` class" `[SRC]` `packages/wallet/wallet-toolbox/src/storage/remoting/StorageClient.ts:73-78`; the hosted instance is `https://storage.babbage.systems`, the e2e suite's default target `[SRC]` `e2e/storage/README.md:25,48`, answering today `BRC-100 mainNet Storage Provider` and nothing else (read 16:2xZ; the reference's `GET /` answer, `StorageServer.ts:528-531`).
 
+**2026-10-27 12:34Z.** The owner's words on section 7's inputs and on the courier are recorded in `docs/DECISIONS-2026-10-27.md`. The courier reading of this page's day (ARC kept until the node) is superseded by the owner's word of 2026-10-27, verbatim: "arc is old af... we use arcade now for everything". The audit route's fix `4e293c9` reached production at 12:29:24Z (the keyless 401 read at 12:29:34Z).
+
 ## 1. The method table
 
 The reference serves 39 named methods through one `POST /` (`storageRpcMethods`, `[SRC]` `StorageServer.ts:71-111`, the dispatch at `:891-945`), 6 sync-transfer methods dispatched by suffix (`:644-646, 947-1012`), and two binary `PUT` routes (`:560-606`). Three names map to `...Auth` handlers on the provider (`:900-907`). This server serves 24 methods through one `POST /` (`[SRC]` `src/dispatch.rs:71-129`), behind the BRC-104 door (`src/lib.rs:381-413, 429-538`).
