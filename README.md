@@ -76,6 +76,10 @@ change. Attempt counts are not evidence of chain rejection. The monitor keeps
 the transaction pending while recording hints and checking evidence;
 [src/monitor.rs](src/monitor.rs) and
 [src/storage/tracker_rule.rs](src/storage/tracker_rule.rs) hold that behavior.
+Arcade's `400` carrying `status` 460 to 475 is its policy refusal: the
+request's history records the code, the instance and the fee its `/policy`
+asks, the inputs stay held and the monitor announces the transaction again
+([src/services/policy_refusal.rs](src/services/policy_refusal.rs)).
 
 The authenticated `findProvenTxReqs` method is served by
 [src/dispatch.rs](src/dispatch.rs), scoped to the caller's user. It lets the
