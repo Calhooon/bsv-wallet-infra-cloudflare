@@ -7,8 +7,9 @@
 //! `RATE_LIMIT_IDENTITY` (`wrangler.toml`; the numbers live there, as
 //! `simple = { limit, period }`). A binding counts per Cloudflare location
 //! and needs no D1 statement and no account id. A Worker without the binding
-//! is not limited (the operator's choice); a limiter that faults admits the
-//! request and logs, so an outage of the counter is never an outage of the door.
+//! is not limited (the operator's choice; `GET /` names each binding `bound`
+//! or `absent`); a limiter that faults admits the request and logs, so an
+//! outage of the counter is never an outage of the door.
 
 use std::net::{IpAddr, Ipv6Addr};
 
@@ -62,6 +63,24 @@ pub fn limited() -> Refusal {
         "ERR_RATE_LIMITED",
         "Too many requests. Please retry later.",
     )
+}
+
+/// Whether `binding` is bound on this Worker: `"bound"` or `"absent"`.
+pub fn binding_state(env: &worker::Env, binding: &str) -> &'static str {
+    if env.rate_limiter(binding).is_ok() {
+        "bound"
+    } else {
+        "absent"
+    }
+}
+
+/// The two limits as `GET /` reports them, each `bound` or `absent`, so a
+/// Worker deployed without a binding (and so not limited) shows it.
+pub fn surface(env: &worker::Env) -> serde_json::Value {
+    serde_json::json!({
+        IP_BINDING: binding_state(env, IP_BINDING),
+        IDENTITY_BINDING: binding_state(env, IDENTITY_BINDING),
+    })
 }
 
 /// Count one request under `key` on `binding`: `false` when the limit is
