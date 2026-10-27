@@ -317,24 +317,37 @@ print(json.dumps(statements))
     say(`refused, a root the header service does not carry: ${unrooted.error.message.slice(0, 120)}`)
   }
 
-  // 5b. The audit's repair path requires the monitor trigger key.
+  // 5b. The audit's repair path requires the monitor trigger key. An output is
+  // planted locked by a failed transaction, the row the repair would release,
+  // so "outputs unchanged" holds only if the audit did not run (#22).
+  const planted = {}
   {
+    const user = await db.prepare('SELECT user_id FROM users WHERE identity_key = ?').bind(caller).first('user_id')
+    const failed = await db.prepare("INSERT INTO transactions (user_id, status, reference, is_outgoing, description) VALUES (?, 'failed', 'w24-planted-failed', 1, 'planted: a failed spend') RETURNING transaction_id").bind(user).first('transaction_id')
+    const output = await db.prepare('SELECT output_id FROM outputs WHERE spendable = 1 AND spent_by IS NULL ORDER BY output_id LIMIT 1').first('output_id')
+    assert.ok(failed && output, `planting: transaction ${failed}, output ${output}`)
+    await db.prepare('UPDATE outputs SET spendable = 0, spent_by = ? WHERE output_id = ?').bind(failed, output).run()
+    Object.assign(planted, { failed, output })
     const before = (await db.prepare('SELECT * FROM outputs ORDER BY output_id').all()).results
     const response = await fetch(new URL('/monitor/audit', base))
     const refusal = await response.json()
     assert.equal(response.status, 401, JSON.stringify(refusal))
     assert.deepEqual(refusal, { error: 'unauthorized — set MONITOR_TRIGGER_KEY secret and pass ?key=<value>' })
     assert.deepEqual((await db.prepare('SELECT * FROM outputs ORDER BY output_id').all()).results, before)
-    say('audit, no key: 401; outputs unchanged')
+    say(`audit, no key: 401; outputs unchanged, output ${output} still locked by failed transaction ${failed}`)
   }
 
-  // 5c. The trigger key admits the audit and its summary.
+  // 5c. The trigger key admits the audit and its summary; the repair releases the planted output.
   {
     const response = await fetch(new URL(`/monitor/audit?key=${MONITOR_KEY}`, base))
     const report = await response.json()
     assert.equal(response.status, 200, JSON.stringify(report))
     assert.ok(report.summary, JSON.stringify(report))
-    say('audit, trigger key: 200; JSON report carries summary')
+    assert.ok(report.summary.lockedByFailed >= 1, JSON.stringify(report.summary))
+    const row = await db.prepare('SELECT spendable, spent_by FROM outputs WHERE output_id = ?').bind(planted.output).first()
+    assert.deepEqual([row.spendable, row.spent_by], [1, null])
+    await db.prepare('DELETE FROM transactions WHERE transaction_id = ?').bind(planted.failed).run()
+    say(`audit, trigger key: 200; summary lockedByFailed ${report.summary.lockedByFailed}, output ${planted.output} released`)
   }
 
   // 7. NL-7c: the monitor posts the subject at rest, which has no proof and
