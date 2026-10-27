@@ -250,6 +250,14 @@ try {
       assert.match(note.words.verdict, /conflict hint/)
     } finally { arcadeCode = 465 }
   })
+  await check('q3 a monitor run reads /policy once however many refused rows it re-announces', async () => {
+    const unsent = (await arcade.db.prepare("SELECT COUNT(*) AS n FROM proven_tx_reqs WHERE status = 'unsent'").first()).n
+    assert.ok(unsent >= 10, `only ${unsent} refused rows`)
+    const posts = arcadePosts, reads = policyReads
+    await monitorRun()
+    assert.ok(arcadePosts - posts >= unsent, `re-announced ${arcadePosts - posts} of ${unsent}`)
+    assert.equal(policyReads - reads, 1, `${policyReads - reads} /policy reads in one run`)
+  })
   await check('r internalizeAction refused at 465 is not failed; the req is queued with the hint and re-announced', async () => {
     const funding = raw(Buffer.alloc(32, 0xaa), 0x51, 77)
     const subject = raw(hash(funding), 0x51, 78)
