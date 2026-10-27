@@ -961,10 +961,20 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     // spent_by recorded since is never clobbered, and a
                     // double-restore is harmless (guards in the consts).
                     // A policy refusal is re-announced by the monitor: its
-                    // inputs stay held (B5, #50).
+                    // inputs stay held (B5, #50), and the row reads `sending`
+                    // (`unsent` is the req's word, no transaction status) until
+                    // send_waiting's accepted arm moves it to `unproven`.
                     if post == PostOutcome::Transient {
                         self.restore_internalized_inputs(&input_transitions, now)
                             .await?;
+                    } else {
+                        Query::new(
+                            "UPDATE transactions SET status = 'sending', updated_at = ? WHERE transaction_id = ? AND status = 'unproven'",
+                        )
+                        .bind(now)
+                        .bind(transaction_id)
+                        .execute(self.db)
+                        .await?;
                     }
                 } else if post == PostOutcome::Transient {
                     worker::console_log!(

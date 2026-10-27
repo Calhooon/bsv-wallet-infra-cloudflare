@@ -258,7 +258,7 @@ try {
     const r = await arcade.rpc('internalizeAction', [{ identityKey: '' }, { tx: atomic.toString('hex'), outputs: [{ outputIndex: 0, protocol: 'basket insertion', insertionRemittance: { basket: 'fee' } }], description: 'fee refusal', labels: [], seekPermission: false }])
     assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
     const t = await arcade.db.prepare('SELECT status FROM transactions WHERE txid = ?').bind(txid(subject)).first()
-    assert.notEqual(t.status, 'failed')
+    assert.equal(t.status, 'sending')
     let req = await arcade.db.prepare('SELECT status, history FROM proven_tx_reqs WHERE txid = ?').bind(txid(subject)).first()
     assert.equal(req.status, 'unsent'); policyHint(req.history, 'internalizeBroadcastHint', 465)
     const before = arcadePosts
@@ -266,7 +266,7 @@ try {
     assert.ok(arcadePosts > before, 'the monitor did not re-announce')
     req = await arcade.db.prepare('SELECT status, history FROM proven_tx_reqs WHERE txid = ?').bind(txid(subject)).first()
     assert.equal(req.status, 'unsent'); policyHint(req.history, 'monitorBroadcastHint', 465)
-    assert.notEqual((await arcade.db.prepare('SELECT status FROM transactions WHERE txid = ?').bind(txid(subject)).first()).status, 'failed')
+    assert.equal((await arcade.db.prepare('SELECT status FROM transactions WHERE txid = ?').bind(txid(subject)).first()).status, 'sending')
   })
 } finally { await arcade.mf.dispose() }
 
@@ -318,7 +318,7 @@ try {
       const { r, txid: t } = await inbound(n)
       assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
       const c = await credit(t); assert.equal(c.c, 1); assert.equal(c.n, 0, `code ${code}: the refused payment was credited spendable`)
-      const req = await zeroReq(t); assert.equal(req.status, 'unsent'); assert.notEqual(req.tx_status, 'failed')
+      const req = await zeroReq(t); assert.equal(req.status, 'unsent'); assert.equal(req.tx_status, 'sending')
       const hint = hints(req.history, 'internalizeBroadcastHint').at(-1); assert.ok(hint, req.history); assert.equal(hint.words.code, code)
       if (code === 465) held465 = t
     })
@@ -328,13 +328,13 @@ try {
     const { r, txid: t } = await inbound(140)
     assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
     const c = await credit(t); assert.equal(c.c, 1); assert.equal(c.n, 1)
-    assert.equal((await zeroReq(t)).status, 'unmined')
+    const req = await zeroReq(t); assert.equal(req.status, 'unmined'); assert.equal(req.tx_status, 'unproven')
   })
   await check('u zero-conf: the refused payment becomes spendable when a later announce is seen', async () => {
     assert.ok(held465, 'no held payment from s')
     zeroCode = 465; await zeroMonitor(); assert.equal((await credit(held465)).n, 0)
     zeroCode = 0; await zeroMonitor()
-    assert.equal((await credit(held465)).n, 1); assert.equal((await zeroReq(held465)).status, 'unmined')
+    const req = await zeroReq(held465); assert.equal((await credit(held465)).n, 1); assert.equal(req.status, 'unmined'); assert.equal(req.tx_status, 'unproven')
   })
   await check('v internalize: a script the local check refuses is refused before any write or announce', async () => {
     const before = zeroPosts
