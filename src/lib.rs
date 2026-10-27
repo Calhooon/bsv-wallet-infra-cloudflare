@@ -138,6 +138,16 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         }
     };
 
+    // The body bound (#22): a declared length over 8 MiB is refused unread.
+    let content_type = req.headers().get("Content-Type")?;
+    if let Some(length) = req.headers().get("Content-Length")? {
+        if let Ok(length) = length.trim().parse::<u64>() {
+            if let Err(too_large) = door::bounds::check_body(length, content_type.as_deref()) {
+                return too_large.to_response();
+            }
+        }
+    }
+
     // Health check (no auth). Surfaces the active broadcaster selection so a deploy
     // can be gate-checked (and a BROADCASTER typo is visible here, not just in logs).
     if req.path() == "/" && req.method() == Method::Get {
@@ -453,6 +463,14 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             "description": "Unknown endpoint. Use POST / for JSON-RPC."
         });
         return sign_json_response(&body, 404, &[], &session)
+            .map_err(|e| Error::from(e.to_string()));
+    }
+
+    // The body bound again on the bytes read, for a body that declared no length.
+    if let Err(too_large) =
+        door::bounds::check_body(request_body.len() as u64, content_type.as_deref())
+    {
+        return sign_json_response(&too_large.body, too_large.status, &[], &session)
             .map_err(|e| Error::from(e.to_string()));
     }
 
