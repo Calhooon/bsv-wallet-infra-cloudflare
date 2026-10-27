@@ -65,8 +65,8 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
   }
   return { mf, base, db, rpc, exec, seed, row, locked }
 }
-let failed = 0
-const check = async (name, f) => { try { await f(); console.log(`PASS ${name}`) } catch (e) { failed++; console.log(`FAIL ${name}: ${e.message}`) } }
+let failed = 0, ran = 0
+const check = async (name, f) => { ran++; try { await f(); console.log(`PASS ${name}`) } catch (e) { failed++; console.log(`FAIL ${name}: ${e.message}`) } }
 const { mf, base, db, rpc, exec, seed, row, locked } = await boot({ BROADCASTER: 'arc' }, async request => {
   const url = new URL(request.url)
   if (request.method === 'POST' && url.pathname === '/v1/tx') {
@@ -255,5 +255,72 @@ try {
     assert.notEqual((await arcade.db.prepare('SELECT status FROM transactions WHERE txid = ?').bind(txid(subject)).first()).status, 'failed')
   })
 } finally { await arcade.mf.dispose() }
-console.log(`Tracker Worker witnesses: ${18 - failed} passed; ${failed} failed`)
+
+// #50 under production's settings (INTERNALIZE_ZERO_CONF=true, BROADCASTER=arcade): an
+// inbound payment Arcade refuses is never credited as spendable; one it accepts (202, then
+// SEEN_ON_NETWORK on its event stream) is credited as before, and a refused one becomes
+// spendable when a later announce is seen.
+let zeroCode = 461
+const zero = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.test', CHAINTRACKS_URL: 'https://headers.test', BEEF_VERIFICATION: 'strict', INTERNALIZE_ZERO_CONF: 'true' }, async request => {
+  const url = new URL(request.url)
+  const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+  if (url.host === 'arcade.test' && request.method === 'POST' && ['/tx', '/txs'].includes(url.pathname)) {
+    if (zeroCode === 0) return json({ txStatus: 'RECEIVED' }, 202)
+    return json({ error: 'transaction failed validation', reason: `local fixture refusal ${zeroCode}`, status: zeroCode, title: 'fixture' }, 400)
+  }
+  if (url.host === 'arcade.test' && url.pathname === '/events') {
+    const frame = { txid: url.searchParams.get('callbackToken'), txStatus: 'SEEN_ON_NETWORK' }
+    return new Response(`data: ${JSON.stringify(frame)}\n\n`, { headers: { 'content-type': 'text/event-stream' } })
+  }
+  if (url.host === 'arcade.test' && url.pathname === '/policy') return json({ policy: { miningFee: { satoshis: 100, bytes: 1000 } } })
+  if (url.host === 'headers.test' && url.pathname === '/findHeaderHexForHeight') {
+    const height = Number(url.searchParams.get('height'))
+    return json({ status: 'success', value: { merkleRoot: roots.get(height) ?? '00'.repeat(32), height } })
+  }
+  return new Response('not found', { status: 404 })
+})
+const sender = PrivateKey.fromRandom().toPublicKey().toString()
+// An AtomicBEEF paying output 0 of a fresh subject; its funding is proven at 800000 + n.
+const inbound = async (n, lock = 0x51) => {
+  const funding = raw(Buffer.alloc(32, n), lock, n)
+  const subject = raw(hash(funding), 0x51, n + 1)
+  roots.set(800000 + n, Buffer.from(hash(funding)).reverse().toString('hex'))
+  const atomic = Buffer.concat([u32(0x01010101), hash(subject), bumped(funding, 800000 + n), Buffer.from([2, 1, 0]), funding, Buffer.from([0]), subject])
+  const r = await zero.rpc('internalizeAction', [{ identityKey: '' }, { tx: atomic.toString('hex'), outputs: [{ outputIndex: 0, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: 'cHJlZml4', derivationSuffix: Buffer.from(`s${n}`).toString('base64'), senderIdentityKey: sender } }], description: 'zero-conf payment', labels: [], seekPermission: false }])
+  return { r, txid: txid(subject) }
+}
+const credit = async t => (await zero.db.prepare('SELECT COALESCE(SUM(spendable), 0) AS n, COUNT(*) AS c FROM outputs WHERE txid = ?').bind(t).first())
+const zeroReq = t => zero.db.prepare('SELECT r.status, r.history, t.status AS tx_status FROM proven_tx_reqs r JOIN transactions t ON t.txid = r.txid WHERE r.txid = ?').bind(t).first()
+const zeroMonitor = async () => {
+  const response = await zero.mf.dispatchFetch(new URL('/monitor/run?key=fixture-monitor', zero.base), { method: 'POST' })
+  assert.equal(response.status, 200, await response.text())
+}
+let held465
+try {
+  for (const [n, code] of [[120, 461], [130, 465]]) {
+    await check(`s zero-conf: a payment refused with ${code} leaves no spendable output, the req unsent with the hint`, async () => {
+      zeroCode = code
+      const { r, txid: t } = await inbound(n)
+      assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+      const c = await credit(t); assert.equal(c.c, 1); assert.equal(c.n, 0, `code ${code}: the refused payment was credited spendable`)
+      const req = await zeroReq(t); assert.equal(req.status, 'unsent'); assert.notEqual(req.tx_status, 'failed')
+      const hint = hints(req.history, 'internalizeBroadcastHint').at(-1); assert.ok(hint, req.history); assert.equal(hint.words.code, code)
+      if (code === 465) held465 = t
+    })
+  }
+  await check('t zero-conf: a payment Arcade accepts is credited spendable as before', async () => {
+    zeroCode = 0
+    const { r, txid: t } = await inbound(140)
+    assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+    const c = await credit(t); assert.equal(c.c, 1); assert.equal(c.n, 1)
+    assert.equal((await zeroReq(t)).status, 'unmined')
+  })
+  await check('u zero-conf: the refused payment becomes spendable when a later announce is seen', async () => {
+    assert.ok(held465, 'no held payment from s')
+    zeroCode = 465; await zeroMonitor(); assert.equal((await credit(held465)).n, 0)
+    zeroCode = 0; await zeroMonitor()
+    assert.equal((await credit(held465)).n, 1); assert.equal((await zeroReq(held465)).status, 'unmined')
+  })
+} finally { await zero.mf.dispose() }
+console.log(`Tracker Worker witnesses: ${ran - failed} passed; ${failed} failed`)
 if (failed) process.exitCode = 1
