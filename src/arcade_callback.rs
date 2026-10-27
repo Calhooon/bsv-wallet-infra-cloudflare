@@ -239,10 +239,16 @@ async fn handle_one(
     let root = mp
         .compute_root(Some(&ev.txid))
         .map_err(|e| format!("BUMP root for {}: {e:?}", ev.txid))?;
-    let valid = headers
-        .is_valid_root_for_height(&root, height)
-        .await
-        .map_err(|e| format!("root verification unavailable: {e}"))?;
+    // The header service did not answer: hold (#49). Nothing is stored and the
+    // pushed bytes are not kept; the request keeps its state and the monitor's
+    // `check_for_proofs` re-asks the proof on its next run.
+    let valid = match headers.is_valid_root_for_height(&root, height).await {
+        Ok(v) => v,
+        Err(e) => {
+            crate::monitor::record_proof_hold(db, "arcade_callback", &ev.txid, height, &e).await;
+            return Err(format!("proof held, root verification unavailable: {e}"));
+        }
+    };
     if !valid {
         return Err(format!(
             "BUMP root {root} is NOT canonical at height {height} — discarding pushed proof"
