@@ -147,7 +147,7 @@ Purpose: Every agent including async video/image generation
 ```
 1. balance_before = getBalance(test-wallet)
 2. utxo_count = listOutputs(test-wallet).totalOutputs
-3. GET /monitor/audit?level=2 → assert 0 issues
+3. GET /monitor/audit?level=2&key=<MONITOR_TRIGGER_KEY> → assert 0 issues
 4. Verify sufficient balance for selected tier
 5. Split UTXOs if needed (manage split for concurrency)
 ```
@@ -210,7 +210,7 @@ Test C — No Refund Expected:
 3. total_refunded = sum(refund_sats for each refund)
 4. expected_balance = balance_before - total_agent_costs
 5. Assert: |balance_after - expected_balance| < 2000 (fee tolerance)
-6. GET /monitor/audit?level=1 → assert 0 issues
+6. GET /monitor/audit?level=1&key=<MONITOR_TRIGGER_KEY> → assert 0 issues
 7. Print report:
    - Sats spent on agents: X
    - Sats refunded: Y
