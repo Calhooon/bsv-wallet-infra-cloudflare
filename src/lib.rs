@@ -221,7 +221,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         return Response::from_json(&outcome);
     }
 
-    // Monitor status — aggregate counts only, no PII; behind the trigger key (#22)
+    // Monitor status: aggregate counts only, no PII; behind the trigger key (#22)
     if req.path() == "/monitor/status" && req.method() == Method::Get {
         let url = req.url().map_err(|e| Error::from(e.to_string()))?;
         if !monitor_key_ok(&env, &url) {
