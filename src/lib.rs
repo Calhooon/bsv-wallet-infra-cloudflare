@@ -158,7 +158,8 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     }
 
     // Health check (no auth). Surfaces the active broadcaster selection so a deploy
-    // can be gate-checked (and a BROADCASTER typo is visible here, not just in logs).
+    // can be gate-checked (and a BROADCASTER typo is visible here, not just in logs),
+    // and each rate-limit binding as `bound` or `absent` (#22).
     if req.path() == "/" && req.method() == Method::Get {
         let broadcaster = match crate::services::selected::BroadcasterChoice::parse(
             env_value(&env, "BROADCASTER").as_deref(),
@@ -170,7 +171,8 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         let response = Response::from_json(&serde_json::json!({
             "status": "ok",
             "service": "wallet-infra",
-            "broadcaster": broadcaster
+            "broadcaster": broadcaster,
+            "rate_limits": door::rate::surface(&env)
         }))?;
         return Ok(add_cors_headers(response));
     }
