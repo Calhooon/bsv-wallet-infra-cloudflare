@@ -512,10 +512,13 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         }
     };
 
-    // The request budgets (#22): arrays, nesting, list limits and offsets.
-    if let Err(refusal) =
-        door::policy::check_budgets(&rpc_request.method, &rpc_request.params, &rpc_request.id)
-    {
+    // The request budgets and the session's own user (#22).
+    if let Err(refusal) = door::policy::check_request(
+        &rpc_request.method,
+        &rpc_request.params,
+        &auth_context.identity_key,
+        &rpc_request.id,
+    ) {
         return sign_refusal(&refusal, &session);
     }
 
