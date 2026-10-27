@@ -99,6 +99,8 @@ jobs:
 
         node tests/worker_beef_at_rest.mjs
 
+        node tests/worker_door_policies.mjs
+
         node tests/worker_route_fixtures.mjs'
   scrub:
     name: scrub
