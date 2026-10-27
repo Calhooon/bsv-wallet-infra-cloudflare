@@ -330,6 +330,9 @@ pub struct ArcadeProvider {
     /// The secret token doubles as the SSE scope token (the scanner filters by txid,
     /// so a shared token only means more frames on the stream, never a wrong verdict).
     callback: Option<(String, String)>,
+    /// The `/policy` answer, read once for this provider's life: one request,
+    /// or one monitor run, however many refused rows it re-announces (#50).
+    policy: std::cell::OnceCell<Option<super::policy_refusal::MiningFee>>,
 }
 
 impl ArcadeProvider {
@@ -342,6 +345,7 @@ impl ArcadeProvider {
                 .trim_end_matches('/')
                 .to_string(),
             callback: None,
+            policy: std::cell::OnceCell::new(),
         }
     }
 
@@ -371,8 +375,18 @@ impl ArcadeProvider {
         rest.split('/').next().unwrap_or(rest).to_string()
     }
 
-    /// One `GET /policy` read after a refusal (B2); `None` when it does not answer.
+    /// One `GET /policy` read after a refusal (B2), kept for the provider's
+    /// life; `None` when it does not answer.
     async fn policy_fee(&self) -> Option<super::policy_refusal::MiningFee> {
+        if let Some(fee) = self.policy.get() {
+            return *fee;
+        }
+        let fee = self.read_policy_fee().await;
+        *self.policy.get_or_init(|| fee)
+    }
+
+    /// The `GET /policy` read itself.
+    async fn read_policy_fee(&self) -> Option<super::policy_refusal::MiningFee> {
         let url = format!("{}/policy", self.base_url);
         let mut response = worker::Fetch::Url(url.parse().ok()?).send().await.ok()?;
         if response.status_code() != 200 {
