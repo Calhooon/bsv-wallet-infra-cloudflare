@@ -597,6 +597,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     let auth = AuthId::new(&auth_context.identity_key);
 
     // Dispatch
+    let rpc_id = rpc_request.id.clone();
     let result = dispatch::dispatch(
         &mut storage,
         &rpc_request.method,
@@ -606,8 +607,9 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     )
     .await;
 
-    // Return signed JSON-RPC response
-    sign_json_response(&result, 200, &[], &session).map_err(|e| Error::from(e.to_string()))
+    // Return signed JSON-RPC response, within the response bound (#22): 413 -32005 beyond 8 MiB.
+    let (status, result) = door::bounds::bound_response(result, &rpc_id);
+    sign_json_response(&result, status, &[], &session).map_err(|e| Error::from(e.to_string()))
 }
 
 #[event(scheduled)]
