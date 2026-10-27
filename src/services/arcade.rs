@@ -92,10 +92,15 @@ pub fn arcade_status_rank(status: &str) -> u8 {
 ///   the status poll was inconclusive. The tx IS at Arcade; the caller must keep
 ///   inputs locked and let the monitor re-broadcast (Arcade dedupes + replays status).
 ///   No fallback: a second submission path would race the verdict.
+///
+/// - `Policy`: a sync `400` carrying `status` 460 to 475: the instance's own policy
+///   answer (B5, #50). A hint, never invalidity and never a fallback: the selector hands
+///   it on as `BroadcastError::PolicyRefusal`, inputs held, the monitor re-announces.
 pub enum ArcadeFailure {
     Outage(String),
     Permanent(BroadcastError),
     Unverified(String),
+    Policy(super::policy_refusal::PolicyRefusal),
 }
 
 // =============================================================================
@@ -357,6 +362,25 @@ impl ArcadeProvider {
         }
     }
 
+    /// The instance a hint names: the host of `base_url`.
+    fn instance(&self) -> String {
+        let rest = self
+            .base_url
+            .split_once("://")
+            .map_or(self.base_url.as_str(), |(_, r)| r);
+        rest.split('/').next().unwrap_or(rest).to_string()
+    }
+
+    /// One `GET /policy` read after a refusal (B2); `None` when it does not answer.
+    async fn policy_fee(&self) -> Option<super::policy_refusal::MiningFee> {
+        let url = format!("{}/policy", self.base_url);
+        let mut response = worker::Fetch::Url(url.parse().ok()?).send().await.ok()?;
+        if response.status_code() != 200 {
+            return None;
+        }
+        super::policy_refusal::parse_policy_fee(&response.text().await.ok()?)
+    }
+
     /// Broadcast a BEEF via Arcade: convert every unproven tx to EF, batch-submit, gate on
     /// the SSE SEEN_ON_NETWORK verdict.
     pub async fn broadcast_beef_arcade(
@@ -417,6 +441,7 @@ impl ArcadeProvider {
                 Err(ArcadeFailure::Permanent(_)) => "fatal",
                 Err(ArcadeFailure::Unverified(_)) => "unverified",
                 Err(ArcadeFailure::Outage(_)) => "outage",
+                Err(ArcadeFailure::Policy(_)) => "policy",
             },
             js_sys::Date::now() - t1
         );
@@ -495,9 +520,24 @@ impl ArcadeProvider {
                 return Ok(());
             }
             last_error = format!("Arcade submit HTTP {status}: {text}");
+            if beef_path {
+                if let Some((code, name)) = super::policy_refusal::arcade_policy_code(status, &text)
+                {
+                    // B5: the instance's policy answer is a hint, never InvalidTx (#50).
+                    return Err(ArcadeFailure::Policy(
+                        super::policy_refusal::PolicyRefusal {
+                            code,
+                            name,
+                            instance: self.instance(),
+                            fee_asked: self.policy_fee().await,
+                            text,
+                        },
+                    ));
+                }
+            }
             if is_structural_reject(status) {
-                // Sync 4xx = a STRUCTURAL reject (parse/EF/script/fee) — definitive on the
-                // BEEF path (a reject is a verdict, never retried elsewhere).
+                // Sync 4xx without a policy code (decode, EF, empty body): definitive on the
+                // BEEF path (never retried elsewhere); a policy code is a hint, above.
                 if beef_path {
                     return Err(ArcadeFailure::Permanent(BroadcastError::InvalidTx(
                         last_error,

@@ -950,13 +950,14 @@ async fn send_waiting<B: BroadcastService + StreamBroadcast<wasm_bindgen::JsValu
                     crate::services::BroadcastError::DoubleSpend(_) => "doubleSpend",
                     crate::services::BroadcastError::InvalidTx(_) => "invalidTx",
                     crate::services::BroadcastError::ServiceError(_) => "serviceError",
+                    crate::services::BroadcastError::PolicyRefusal(_) => "policyRefusal",
                 };
                 crate::storage::tracker_rule::append_note(
                     db,
                     &txid,
                     serde_json::json!({
                         "when": Utc::now().to_rfc3339(), "what": "monitorBroadcastHint",
-                        "outcome": outcome, "words": [error.to_string()], "nextReaskMinutes": 5,
+                        "outcome": outcome, "words": error.hint_words(), "nextReaskMinutes": 5,
                     }),
                 )
                 .await
