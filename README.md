@@ -46,6 +46,11 @@ and KV `AUTH_SESSIONS`. Its `[vars]` are `CHAINTRACKS_URL`,
 `ARCADE_URL`, `WOC_API_KEY`, `ARCADE_CALLBACK_TOKEN`, `MONITOR_TRIGGER_KEY` and
 `SERVER_PRIVATE_KEY` when they are set as secrets.
 
+The JSON-RPC `migrate` writes nothing: it answers the stored chain, as the
+reference ignores it. The operator initializes the `settings` row once, after
+the migrations, with the server's identity key:
+`INSERT INTO settings (storage_identity_key, storage_name, chain, dbtype, max_output_script) VALUES ('<server-identity-key>', 'wallet-infra', 'mainnet', 'D1', 10000);`
+
 ## The server half of tracking
 
 A broadcaster's refusal is a hint that schedules another check. It does not

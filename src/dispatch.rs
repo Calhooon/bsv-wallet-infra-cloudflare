@@ -70,7 +70,7 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
     let result = match method {
         // Phase 1: Core methods
         "makeAvailable" => handle_make_available(storage, id.clone()).await,
-        "migrate" => handle_migrate(storage, params, id.clone()).await,
+        "migrate" => handle_migrate(storage, id.clone()).await,
         "findOrInsertUser" => handle_find_or_insert_user(storage, params, id.clone()).await,
         "internalizeAction" => handle_internalize_action(storage, params, id.clone(), auth).await,
 
@@ -176,35 +176,18 @@ async fn handle_make_available<
     Ok(serde_json::to_value(JsonRpcResponse::success(id, result)).unwrap())
 }
 
+/// `migrate` is answered without a write, as the reference ignores it
+/// (`StorageServer.ts:1040-1043`): the stored chain, or the refusal of a store
+/// the operator has not initialized (README, "Bindings and settings").
 async fn handle_migrate<B: crate::services::BroadcastService + crate::services::ProofService>(
     storage: &mut StorageD1<'_, B>,
-    params: Value,
     id: Value,
 ) -> Result<Value, Error> {
-    let args = extract_args(&params, false);
-
-    // Positional: ["storage_name"] → just a string
-    // Named: {"storageName": "...", "storageIdentityKey": "..."}
-    let (storage_name, storage_identity_key) = if let Some(s) = args.as_str() {
-        (s.to_string(), String::new())
-    } else {
-        let name = args
-            .get("storageName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("wallet-infra")
-            .to_string();
-        let key = args
-            .get("storageIdentityKey")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        (name, key)
-    };
-
-    let chain = storage
-        .migrate(&storage_name, &storage_identity_key)
-        .await?;
-    Ok(serde_json::to_value(JsonRpcResponse::success(id, serde_json::json!(chain))).unwrap())
+    let settings = storage.make_available().await?;
+    Ok(serde_json::to_value(JsonRpcResponse::success(
+        id,
+        serde_json::json!(settings.chain),
+    ))?)
 }
 
 async fn handle_find_or_insert_user<

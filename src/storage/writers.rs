@@ -134,7 +134,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
         // No settings yet — this is a fresh database
         Err(Error::NotFound(
-            "Settings not found. Call migrate first.".to_string(),
+            "Settings not found: the operator initializes the store (README).".to_string(),
         ))
     }
 
