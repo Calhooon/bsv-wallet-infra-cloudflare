@@ -15,6 +15,7 @@ pub mod bench;
 pub mod broadcast_at_rest;
 pub mod d1;
 pub mod dispatch;
+pub mod door;
 pub mod entities;
 pub mod error;
 pub mod json_rpc;
@@ -126,6 +127,16 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     if req.method() == Method::Options {
         return handle_cors_preflight();
     }
+
+    // The in-flight ceiling (#22): held until this request's answer is built.
+    let _slot = match door::inflight::enter(Date::now().as_millis() as f64) {
+        Ok(slot) => slot,
+        Err(busy) => {
+            let response = busy.to_response()?;
+            response.headers().set("Retry-After", "1")?;
+            return Ok(response);
+        }
+    };
 
     // Health check (no auth). Surfaces the active broadcaster selection so a deploy
     // can be gate-checked (and a BROADCASTER typo is visible here, not just in logs).
