@@ -332,6 +332,24 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 Error::ValidationError(format!("Transaction {} is txid-only in BEEF", txid))
             })?;
 
+            // The local script check (#72, #50): each input against its parent
+            // in this BEEF. A script that fails under every era is refused here,
+            // before any write and any broadcast; a missing parent is no verdict.
+            // The at-rest form checks the scripts as it streams.
+            let sources: Vec<_> = tx
+                .inputs
+                .iter()
+                .map_while(|i| {
+                    let parent = beef.find_txid(&i.get_source_txid().ok()?)?.tx()?;
+                    parent.outputs.get(i.source_output_index as usize).cloned()
+                })
+                .collect();
+            if let Some(reason) = super::tracker_rule::script_refusal(tx, &sources) {
+                return Err(Error::ValidationError(format!(
+                    "internalize: the local script check refuses {txid}: {reason}"
+                )));
+            }
+
             Subject {
                 outputs: tx
                     .outputs

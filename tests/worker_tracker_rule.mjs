@@ -260,11 +260,12 @@ try {
 // inbound payment Arcade refuses is never credited as spendable; one it accepts (202, then
 // SEEN_ON_NETWORK on its event stream) is credited as before, and a refused one becomes
 // spendable when a later announce is seen.
-let zeroCode = 461
+let zeroCode = 461, zeroPosts = 0
 const zero = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.test', CHAINTRACKS_URL: 'https://headers.test', BEEF_VERIFICATION: 'strict', INTERNALIZE_ZERO_CONF: 'true' }, async request => {
   const url = new URL(request.url)
   const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
   if (url.host === 'arcade.test' && request.method === 'POST' && ['/tx', '/txs'].includes(url.pathname)) {
+    zeroPosts++
     if (zeroCode === 0) return json({ txStatus: 'RECEIVED' }, 202)
     return json({ error: 'transaction failed validation', reason: `local fixture refusal ${zeroCode}`, status: zeroCode, title: 'fixture' }, 400)
   }
@@ -320,6 +321,13 @@ try {
     zeroCode = 465; await zeroMonitor(); assert.equal((await credit(held465)).n, 0)
     zeroCode = 0; await zeroMonitor()
     assert.equal((await credit(held465)).n, 1); assert.equal((await zeroReq(held465)).status, 'unmined')
+  })
+  await check('v internalize: a script the local check refuses is refused before any write or announce', async () => {
+    const before = zeroPosts
+    const { r, txid: t } = await inbound(150, 0x00)
+    assert.ok(r.error, JSON.stringify(r)); assert.match(JSON.stringify(r.error), /local script check/)
+    assert.equal(zeroPosts, before); assert.equal((await credit(t)).c, 0)
+    assert.equal(await zero.db.prepare('SELECT 1 FROM proven_tx_reqs WHERE txid = ?').bind(t).first(), null)
   })
 } finally { await zero.mf.dispose() }
 console.log(`Tracker Worker witnesses: ${ran - failed} passed; ${failed} failed`)
