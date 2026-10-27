@@ -7,6 +7,7 @@
 //! limits, the request budgets, the response bound.
 
 pub mod bounds;
+pub mod errors;
 pub mod inflight;
 pub mod policy;
 pub mod rate;
