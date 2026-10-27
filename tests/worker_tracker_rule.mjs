@@ -1,4 +1,5 @@
-// Local compiled-Worker witnesses for bsv-stack-lean #72 and #73.
+// Local compiled-Worker witnesses for bsv-stack-lean #72 and #73, and #50: Arcade's 400
+// carrying status 460 to 475 is a policy refusal, a hint, never invalidity (B5).
 import { readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -11,23 +12,16 @@ const hash = b => sha(sha(b))
 const txid = b => Buffer.from(hash(b)).reverse().toString('hex')
 const u32 = n => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b }
 const raw = (prev, script, marker) => Buffer.concat([u32(1), Buffer.from([1]), prev, u32(0), Buffer.from([0]), u32(0xffffffff), Buffer.from([1]), Buffer.from('e803000000000000', 'hex'), Buffer.from([1, script]), u32(marker)])
+// A BEEF V2 head with one bump: `parent` alone in a block at `height` (its root is its txid).
+const bumped = (parent, height) => Buffer.concat([u32(0xefbe0002), Buffer.from([1, 0xfe]), u32(height), Buffer.from([1, 1, 0, 2]), hash(parent)])
+const provenBeef = (parent, height) => Buffer.concat([bumped(parent, height), Buffer.from([1, 1, 0]), parent])
 let posts = 0
-const mf = new Miniflare({ modules: true, scriptPath: resolve('build/worker/shim.mjs'),
-  modulesRules: [{ type: 'ESModule', include: ['**/*.js', '**/*.mjs'] }, { type: 'CompiledWasm', include: ['**/*.wasm'] }],
-  compatibilityDate: '2024-01-01', host: '127.0.0.1', port: 0,
-  bindings: { SERVER_PRIVATE_KEY: PrivateKey.fromRandom().toHex(), BROADCASTER: 'arc', MONITOR_TRIGGER_KEY: 'fixture-monitor' },
-  d1Databases: ['DB'], kvNamespaces: ['AUTH_SESSIONS'], r2Buckets: ['BLOBS'],
-  outboundService: async request => {
-    const url = new URL(request.url)
-    if (request.method === 'POST' && url.pathname === '/v1/tx') {
-      posts++
-      return new Response(JSON.stringify({ status: 465, detail: 'local fixture policy refusal: non-mandatory-script-verify-flag' }), { status: 465, headers: { 'content-type': 'application/json' } })
-    }
-    return new Response('not found', { status: 404 })
-  },
-})
-let failed = 0
-try {
+const boot = async (bindings, outboundService) => {
+  const mf = new Miniflare({ modules: true, scriptPath: resolve('build/worker/shim.mjs'),
+    modulesRules: [{ type: 'ESModule', include: ['**/*.js', '**/*.mjs'] }, { type: 'CompiledWasm', include: ['**/*.wasm'] }],
+    compatibilityDate: '2024-01-01', host: '127.0.0.1', port: 0,
+    bindings: { SERVER_PRIVATE_KEY: PrivateKey.fromRandom().toHex(), MONITOR_TRIGGER_KEY: 'fixture-monitor', ...bindings },
+    d1Databases: ['DB'], kvNamespaces: ['AUTH_SESSIONS'], r2Buckets: ['BLOBS'], outboundService })
   const base = await mf.ready
   const db = await mf.getD1Database('DB')
   for (const name of readdirSync('migrations').filter(n => n.endsWith('.sql')).sort()) {
@@ -53,12 +47,12 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
   const exec = (sql, ...args) => db.prepare(sql).bind(...args.map(a => Buffer.isBuffer(a) ? new Uint8Array(a) : a)).run()
   await exec("INSERT INTO output_baskets (user_id, name) VALUES (?, 'default')", user)
   const basket = (await db.prepare('SELECT basket_id FROM output_baskets WHERE user_id = ?').bind(user).first()).basket_id
-  const seed = async (n, invalid = false, status = 'unsigned') => {
+  const seed = async (n, invalid = false, status = 'unsigned', beef = null) => {
     const parent = raw(Buffer.alloc(32, n), invalid ? 0x00 : 0x51, n)
     const child = raw(hash(parent), 0x51, n + 100)
     await exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx) VALUES (?, ?, 'completed', 0, 'fixture', ?, ?)", user, `parent-${n}`, txid(parent), parent)
     const parentId = (await db.prepare('SELECT transaction_id FROM transactions WHERE reference = ?').bind(`parent-${n}`).first()).transaction_id
-    await exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx) VALUES (?, ?, ?, 1, 'fixture', ?, ?)", user, `child-${n}`, status, txid(child), child)
+    await exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx, input_beef) VALUES (?, ?, ?, 1, 'fixture', ?, ?, ?)", user, `child-${n}`, status, txid(child), child, beef && provenBeef(parent, 800000 + n))
     const childId = (await db.prepare('SELECT transaction_id FROM transactions WHERE reference = ?').bind(`child-${n}`).first()).transaction_id
     await exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, spent_by) VALUES (?, ?, ?, 0, 1000, 'storage', 'fixture', 'custom', ?, ?, 0, ?)", user, parentId, basket, txid(parent), Buffer.from([invalid ? 0x00 : 0x51]), childId)
     await exec("INSERT INTO proven_tx_reqs (txid, raw_tx, status) VALUES (?, ?, 'unprocessed')", txid(child), child)
@@ -69,7 +63,19 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
     const o = await db.prepare('SELECT spendable, spent_by FROM outputs WHERE spent_by = ?').bind(s.childId).first()
     assert.ok(o, 'input was released'); assert.equal(o.spendable, 0)
   }
-  const check = async (name, f) => { try { await f(); console.log(`PASS ${name}`) } catch (e) { failed++; console.log(`FAIL ${name}: ${e.message}`) } }
+  return { mf, base, db, rpc, exec, seed, row, locked }
+}
+let failed = 0
+const check = async (name, f) => { try { await f(); console.log(`PASS ${name}`) } catch (e) { failed++; console.log(`FAIL ${name}: ${e.message}`) } }
+const { mf, base, db, rpc, exec, seed, row, locked } = await boot({ BROADCASTER: 'arc' }, async request => {
+  const url = new URL(request.url)
+  if (request.method === 'POST' && url.pathname === '/v1/tx') {
+    posts++
+    return new Response(JSON.stringify({ status: 465, detail: 'local fixture policy refusal: non-mandatory-script-verify-flag' }), { status: 465, headers: { 'content-type': 'application/json' } })
+  }
+  return new Response('not found', { status: 404 })
+})
+try {
   const server = await seed(1)
   await check('a server refusal keeps status and inputs, records word, schedules re-ask', async () => {
     const r = await rpc('processAction', [{ identityKey: '' }, { isNewTx: true, isSendWith: false, isNoSend: false, isDelayed: false, reference: server.reference, txid: server.txid, rawTx: [...server.child], sendWith: [] }])
@@ -166,6 +172,88 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
     await bucket.put(`proven_tx_reqs/${req.proven_tx_req_id}/input_beef`, bytes)
     const r = await rpc('findProvenTxReqs', { txids: [pending.txid] }); assert.deepEqual(r.result[0].rawTx, [...pending.child]); assert.deepEqual(r.result[0].inputBeef, [...bytes])
   })
-  console.log(`Tracker Worker witnesses: ${14 - failed} passed; ${failed} failed`)
 } finally { await mf.dispose() }
+
+// #50 under BROADCASTER arcade: Arcade's 400 carrying status 460 to 475 is the instance's
+// policy answer (B5). The fixture answers every submission with `arcadeCode` and its
+// policy with 100 sats per 1,000 bytes; the header service carries each fixture's root.
+const POLICY_CODES = [460, 461, 462, 463, 464, 465, 466, 467, 468, 469, 471, 472, 473, 474, 475]
+let arcadeCode = 465, arcadePosts = 0, policyReads = 0
+const roots = new Map()
+const arcade = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.test', CHAINTRACKS_URL: 'https://headers.test', BEEF_VERIFICATION: 'strict', INTERNALIZE_ZERO_CONF: 'false' }, async request => {
+  const url = new URL(request.url)
+  const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+  if (url.host === 'arcade.test' && request.method === 'POST' && ['/tx', '/txs'].includes(url.pathname)) {
+    arcadePosts++
+    return json({ error: 'transaction failed validation', reason: `local fixture policy refusal ${arcadeCode}`, status: arcadeCode, title: 'fixture' }, 400)
+  }
+  if (url.host === 'arcade.test' && url.pathname === '/policy') {
+    policyReads++
+    return json({ policy: { miningFee: { satoshis: 100, bytes: 1000 }, maxtxsizepolicy: 10485760 }, timestamp: '2026-10-27T00:00:00Z' })
+  }
+  if (url.host === 'headers.test' && url.pathname === '/findHeaderHexForHeight') {
+    const height = Number(url.searchParams.get('height'))
+    return json({ status: 'success', value: { merkleRoot: roots.get(height) ?? '00'.repeat(32), height } })
+  }
+  return new Response('not found', { status: 404 })
+})
+const hints = (history, what) => JSON.parse(history).notes.filter(n => n.what === what && n.outcome === 'policyRefusal')
+const policyHint = (history, what, code) => {
+  const found = hints(history, what).at(-1)
+  assert.ok(found, `no ${what} policyRefusal note: ${history}`)
+  assert.equal(found.words.code, code); assert.equal(found.words.instance, 'arcade.test')
+  assert.deepEqual(found.words.feeAsked, { satoshis: 100, bytes: 1000 })
+  assert.equal(found.words.verdict, 'retry at the fee asked')
+}
+const processTx = s => arcade.rpc('processAction', [{}, { isNewTx: true, isSendWith: false, isNoSend: false, isDelayed: false, reference: s.reference, txid: s.txid, rawTx: [...s.child], sendWith: [] }])
+const monitorRun = async () => {
+  const response = await arcade.mf.dispatchFetch(new URL('/monitor/run?key=fixture-monitor', arcade.base), { method: 'POST' })
+  assert.equal(response.status, 200, await response.text())
+}
+try {
+  const fee = await arcade.seed(21, false, 'unsigned', true)
+  await check('o arcade 400 status 465: a hint with the code and the fee asked, status and inputs kept', async () => {
+    const r = await processTx(fee); assert.ok('result' in r, JSON.stringify(r)); assert.ok(arcadePosts > 0); assert.ok(policyReads > 0)
+    const r0 = await arcade.row(fee); assert.equal(r0.tx_status, 'sending'); assert.equal(r0.req_status, 'unsent'); await arcade.locked(fee)
+    policyHint(r0.history, 'immediateBroadcastHint', 465)
+  })
+  await check('p the next monitor run re-announces the refused transaction', async () => {
+    const before = arcadePosts
+    await monitorRun()
+    assert.ok(arcadePosts > before, 'the monitor did not re-announce')
+    const r0 = await arcade.row(fee); assert.equal(r0.tx_status, 'sending'); assert.equal(r0.req_status, 'unsent'); await arcade.locked(fee)
+    policyHint(r0.history, 'monitorBroadcastHint', 465)
+  })
+  await check('q the codes 460 to 475 as a table: never failed, inputs held, the code recorded', async () => {
+    try {
+      for (const [i, code] of POLICY_CODES.entries()) {
+        arcadeCode = code
+        const s = await arcade.seed(40 + i, false, 'unsigned', true)
+        await processTx(s)
+        const r0 = await arcade.row(s)
+        assert.equal(r0.tx_status, 'sending', `code ${code}`); assert.equal(r0.req_status, 'unsent', `code ${code}`); await arcade.locked(s)
+        policyHint(r0.history, 'immediateBroadcastHint', code)
+      }
+    } finally { arcadeCode = 465 }
+  })
+  await check('r internalizeAction refused at 465 is not failed; the req is queued with the hint and re-announced', async () => {
+    const funding = raw(Buffer.alloc(32, 0xaa), 0x51, 77)
+    const subject = raw(hash(funding), 0x51, 78)
+    roots.set(800077, Buffer.from(hash(funding)).reverse().toString('hex'))
+    const atomic = Buffer.concat([u32(0x01010101), hash(subject), bumped(funding, 800077), Buffer.from([2, 1, 0]), funding, Buffer.from([0]), subject])
+    const r = await arcade.rpc('internalizeAction', [{ identityKey: '' }, { tx: atomic.toString('hex'), outputs: [{ outputIndex: 0, protocol: 'basket insertion', insertionRemittance: { basket: 'fee' } }], description: 'fee refusal', labels: [], seekPermission: false }])
+    assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+    const t = await arcade.db.prepare('SELECT status FROM transactions WHERE txid = ?').bind(txid(subject)).first()
+    assert.notEqual(t.status, 'failed')
+    let req = await arcade.db.prepare('SELECT status, history FROM proven_tx_reqs WHERE txid = ?').bind(txid(subject)).first()
+    assert.equal(req.status, 'unsent'); policyHint(req.history, 'internalizeBroadcastHint', 465)
+    const before = arcadePosts
+    await monitorRun()
+    assert.ok(arcadePosts > before, 'the monitor did not re-announce')
+    req = await arcade.db.prepare('SELECT status, history FROM proven_tx_reqs WHERE txid = ?').bind(txid(subject)).first()
+    assert.equal(req.status, 'unsent'); policyHint(req.history, 'monitorBroadcastHint', 465)
+    assert.notEqual((await arcade.db.prepare('SELECT status FROM transactions WHERE txid = ?').bind(txid(subject)).first()).status, 'failed')
+  })
+} finally { await arcade.mf.dispose() }
+console.log(`Tracker Worker witnesses: ${18 - failed} passed; ${failed} failed`)
 if (failed) process.exitCode = 1
