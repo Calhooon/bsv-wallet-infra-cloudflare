@@ -12,6 +12,10 @@
     "allowOrigin": "*",
     "body": {
       "broadcaster": "arc",
+      "rate_limits": {
+        "RATE_LIMIT_IDENTITY": "absent",
+        "RATE_LIMIT_IP": "absent"
+      },
       "service": "wallet-infra",
       "status": "ok"
     }

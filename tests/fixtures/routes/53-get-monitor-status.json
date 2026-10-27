@@ -2,7 +2,7 @@
   "case": "get-monitor-status",
   "request": {
     "method": "GET",
-    "path": "/monitor/status",
+    "path": "/monitor/status?key=route-fixtures-monitor",
     "headers": {},
     "body": null
   },

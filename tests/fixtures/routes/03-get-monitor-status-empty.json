@@ -7,14 +7,11 @@
     "body": null
   },
   "response": {
-    "status": 200,
+    "status": 401,
     "contentType": "application/json",
     "allowOrigin": "*",
     "body": {
-      "lastProofAt": "",
-      "lastProofFound": 0,
-      "oldestMinutes": "<duration>",
-      "unproven": 0
+      "error": "unauthorized — set MONITOR_TRIGGER_KEY secret and pass ?key=<value>"
     }
   }
 }
