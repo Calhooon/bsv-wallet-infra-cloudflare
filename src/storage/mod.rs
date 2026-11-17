@@ -13,6 +13,9 @@ pub mod reserve_outputs;
 pub mod tracker_rule;
 pub mod writers;
 
+#[cfg(test)]
+mod list_binds;
+
 use worker::{Bucket, D1Database};
 
 use crate::beef_at_rest::AtRestBucket;
