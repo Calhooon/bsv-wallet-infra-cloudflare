@@ -286,6 +286,16 @@ struct OutputData {
     existing_is_change: bool,
 }
 
+/// The inline door's parse of a caller's AtomicBEEF: measured before it is
+/// parsed (`crate::door::beef_measure`), so a BEEF whose parse would pass the
+/// budget is refused as too large; one the measure cannot read meets the
+/// parser's own refusal.
+pub fn parse_inline_beef(tx: &[u8]) -> Result<Beef> {
+    crate::door::beef_measure::admit_beef(tx)?;
+    Beef::from_binary(tx)
+        .map_err(|e| Error::ValidationError(format!("Failed to parse AtomicBEEF: {}", e)))
+}
+
 // =============================================================================
 // Main Implementation
 // =============================================================================
@@ -297,9 +307,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         user_id: i64,
         args: InternalizeActionArgs,
     ) -> Result<StorageInternalizeActionResult> {
-        // Step 1: Parse and validate the AtomicBEEF
-        let beef = Beef::from_binary(&args.tx)
-            .map_err(|e| Error::ValidationError(format!("Failed to parse AtomicBEEF: {}", e)))?;
+        // Step 1: Parse and validate the AtomicBEEF (measured first).
+        let beef = parse_inline_beef(&args.tx)?;
 
         let txid = beef.atomic_txid.clone().ok_or_else(|| {
             Error::ValidationError("BEEF is not AtomicBEEF (missing atomic_txid)".to_string())

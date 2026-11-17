@@ -4,6 +4,32 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.2, 2026-11-17: a BEEF is measured before it is parsed
+
+### Added
+
+- **A BEEF is measured before it is parsed** (`door::beef_measure`). One pass
+  over the bytes in the BEEF layout (V1, V2 and the AtomicBEEF prefix: each
+  BUMP with its levels and leaves, each entry with its format byte, its inputs
+  and outputs by their varints) counts what bsv-rs's `Beef::from_binary` and
+  `sort_txs` spend heap on, holding nothing per element; an estimate from the
+  counts bounds the parse's heap, and a BEEF whose estimate is over the budget,
+  24 MiB, is refused before it is parsed. The constants are measured on bsv-rs
+  0.8.11 under a counting allocator, and `tests/beef_measure.rs` holds the
+  estimate at or over the measured heap on every shape it builds and on random
+  BEEFs. Bytes the walk cannot read go to the parser and its refusal, as
+  before, unless what was read is already over the budget.
+- **`internalizeAction`** measures the AtomicBEEF (`tx`, hex or bytes) before
+  its parse (`storage::internalize_action::parse_inline_beef`) and answers one
+  over the budget `-32602` "the BEEF is too large to process", the code and
+  shape of a BEEF the parser refuses; nothing is written. The BEEF at rest
+  (`beefAtRest`) is read as before.
+- **`processAction`** measures the signed transaction with the stored BEEF it
+  is merged into, before anything is written
+  (`storage::process_action::admit_signed_tx`), and answers a pair over the
+  budget `-32602` "the transaction is too large to process"; the action stays
+  as `createAction` left it.
+
 ## 0.7.1, 2026-11-17: the Extended Format conversion writes from the spent output; /healthz serves the build
 
 ### Changed

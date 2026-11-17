@@ -4,8 +4,10 @@
 //!
 //! Each policy is its own module; the fetch handler in `lib.rs` calls them in
 //! the reference's order: the in-flight ceiling, the body bound, the rate
-//! limits, the request budgets, the response bound.
+//! limits, the request budgets, the response bound. A caller's BEEF is
+//! measured before the storage parses it (`beef_measure`).
 
+pub mod beef_measure;
 pub mod bounds;
 pub mod errors;
 pub mod inflight;

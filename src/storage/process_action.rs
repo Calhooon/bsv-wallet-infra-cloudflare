@@ -116,6 +116,16 @@ fn varint_error(pos: usize) -> impl Fn(bsv_sdk::Error) -> Error {
     move |e| Error::ValidationError(format!("varint at {pos}: {e}"))
 }
 
+/// Measure a signed transaction with the stored BEEF it is merged into (when
+/// one is stored; of one the measure cannot read, what it read): refused as
+/// too large when the pair's parse would pass the budget
+/// (`crate::door::beef_measure`).
+pub fn admit_signed_tx(raw_tx: &[u8], input_beef: Option<&[u8]>) -> Result<()> {
+    use crate::door::beef_measure::{admit_tx, measure};
+    let stored = input_beef.map(|b| measure(b).counts);
+    admit_tx(raw_tx, stored.as_ref())
+}
+
 /// Compute txid from raw transaction bytes: SHA256d, reversed.
 fn compute_txid(raw_tx: &[u8]) -> String {
     use bsv_sdk::sha256d;
@@ -245,6 +255,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     .flatten()
             }
         };
+
+        // The signed transaction is merged into the stored BEEF and parsed with
+        // it, here and by the monitor: both are measured before anything is
+        // written, and a pair over the budget is refused as too large.
+        admit_signed_tx(raw_tx, input_beef_bytes.as_deref())?;
 
         // =====================================================================
         // Step 7: Determine target status
