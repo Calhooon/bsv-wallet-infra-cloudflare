@@ -18,6 +18,7 @@ pub mod dispatch;
 pub mod door;
 pub mod entities;
 pub mod error;
+pub mod health;
 pub mod json_rpc;
 pub mod monitor;
 pub mod r2;
@@ -178,9 +179,10 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     }
 
     // The reference's public routes (#22; StorageServer.ts:518-526): a health
-    // answer that names nothing, and a robots.txt that asks crawlers to stay out.
+    // answer, and a robots.txt that asks crawlers to stay out. The health answer
+    // carries the build object (`health::build`): what this Worker runs.
     if req.path() == "/healthz" && req.method() == Method::Get {
-        let response = Response::from_json(&serde_json::json!({ "status": "ok" }))?;
+        let response = Response::from_json(&health::healthz())?;
         response.headers().set("Cache-Control", "no-store")?;
         return Ok(add_cors_headers(response));
     }

@@ -4,6 +4,30 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.1, 2026-11-17: the Extended Format conversion writes from the spent output; /healthz serves the build
+
+### Changed
+
+- **The Extended Format conversion** (`services::arcade::beef_to_ef_batch`,
+  the Arcade broadcast) writes each input from its own fields and the
+  satoshis and locking script of the one output it spends, read in place
+  from the source transaction the BEEF holds; it no longer copies source
+  transactions. Each transaction's bytes are unchanged: the tests pin them
+  against bsv-rs `Transaction::to_ef` over the linked transaction, for every
+  BEEF fixture in the tree and 600 generated graphs. A transaction the BEEF
+  carries twice is written once, and a batch whose transactions spend one
+  outpoint twice is refused (`inconsistent BEEF`); every other refusal keeps
+  its words.
+
+### Added
+
+- **`GET /healthz` serves the build object** beside its status:
+  `build: { lib_rev, built_at, dirty, crates }`, the crates being bsv-rs,
+  bsv-middleware-cloudflare, bsv-middleware-core and this crate, at the
+  versions the lock names, as the stack's other Workers serve it. Captured at
+  build time by `build.rs` through `bsv-worker-build-info` `=0.4.0` (new;
+  the lock adds that package only). `GET /` is unchanged.
+
 ## 0.7.0, 2026-11-17: bsv-rs 0.8.11, and the work main carried past 0.6.0
 
 ### Changed

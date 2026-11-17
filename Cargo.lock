@@ -204,11 +204,12 @@ dependencies = [
 
 [[package]]
 name = "bsv-wallet-infra-cloudflare"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64",
  "bsv-middleware-cloudflare",
  "bsv-rs",
+ "bsv-worker-build-info",
  "chrono",
  "console_error_panic_hook",
  "futures-util",
@@ -223,6 +224,15 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "worker",
+]
+
+[[package]]
+name = "bsv-worker-build-info"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eda242bfaa1d8f58df5c253b7184a83ccdde93490f1f3b9ea0014d41486da3e4"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
