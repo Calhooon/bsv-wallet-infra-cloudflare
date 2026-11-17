@@ -38,7 +38,9 @@ From the fetch handler in [src/lib.rs](src/lib.rs):
 
 The door's policies (#22): an in-flight ceiling of 24 per isolate (503 with
 `Retry-After: 1` beyond it), bodies and responses bounded at 8 MiB (413),
-list limits of 1,000, and two rate limits counted by the platform's
+list limits of 1,000, a caller's BEEF measured before it is parsed (one over
+the parse's budget, 24 MiB of heap, answered `-32602` as too large to process;
+`door::beef_measure`), and two rate limits counted by the platform's
 rate-limit bindings, 300 a minute per address before authentication and
 1,000 a minute per identity after it (429 with the draft-8 `RateLimit`
 headers). The bindings are approximate by the platform's own design: each

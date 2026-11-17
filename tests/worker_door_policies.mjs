@@ -3,7 +3,8 @@
 // from wrangler.toml; GET / naming each binding bound or absent; the 429's
 // draft-8 headers), the list budgets, findOrInsertUser bound to the session,
 // migrate without a write, a D1 fault collapsed on the wire, the status route
-// behind the trigger key, healthz (with the build object) and robots.txt.
+// behind the trigger key, healthz (with the build object) and robots.txt, and
+// a BEEF measured before it is parsed (internalizeAction, processAction).
 // Miniflare with D1, KV, R2 and the rate-limit bindings; @bsv/sdk's AuthFetch
 // for the BRC-31 door.
 // Nothing leaves this process. No deploy.
@@ -290,6 +291,63 @@ print(json.dumps(statements))
     say('in flight: 30 at once, 24 served, 6 answered 503 ERR_SERVER_BUSY with Retry-After 1; the slots given back')
   }
 
+  // 8b. A BEEF is measured before it is parsed: internalizeAction's AtomicBEEF
+  // and processAction's signed transaction over the measure's budget are
+  // refused with the storage's refusal of a BEEF (-32602, as a BEEF the parser
+  // refuses), and nothing is written: every table holds the rows it held.
+  {
+    const counts = async () => {
+      const tables = (await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'").all()).results.map(r => r.name)
+      const out = {}
+      for (const t of tables.sort()) out[t] = await db.prepare(`SELECT COUNT(*) AS n FROM "${t}"`).first('n')
+      return out
+    }
+    const varint = n => n < 0xfd ? [n] : [0xfd, n & 0xff, n >> 8]
+    const le32 = n => [n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, n >>> 24]
+    await rpc('findOrInsertUser', [caller])
+    const userId = await db.prepare('SELECT user_id FROM users WHERE identity_key = ?').bind(caller).first('user_id')
+
+    // internalizeAction: an AtomicBEEF of 10,000 txid-only entries (330 KB).
+    const n = 10000
+    const beef = [...le32(0x01010101), ...new Array(32).fill(0x11), ...le32(0xefbe0002), 0, ...varint(n)]
+    for (let k = 0; k < n; k++) beef.push(2, ...le32(k), ...new Array(28).fill(0x22))
+    const internalize = tx => rpc('internalizeAction', [{ identityKey: caller }, {
+      tx, outputs: [{ outputIndex: 0, protocol: 'basket insertion', insertionRemittance: { basket: 'measure' } }],
+      description: 'a payment over the measure',
+    }])
+    const before = await counts()
+    const refused = await internalize(Buffer.from(beef).toString('hex'))
+    assert.deepEqual(refused.error, { code: -32602, message: 'the BEEF is too large to process' }, JSON.stringify(refused))
+    assert.deepEqual(Object.keys(refused).sort(), ['error', 'id', 'jsonrpc'])
+    const asArray = await internalize(beef)
+    assert.deepEqual(asArray.error, refused.error)
+    const malformed = await internalize('0100beef01')
+    assert.equal(malformed.error.code, refused.error.code)
+    assert.match(malformed.error.message, /^Failed to parse AtomicBEEF/)
+    assert.deepEqual(Object.keys(malformed).sort(), Object.keys(refused).sort())
+    assert.deepEqual(await counts(), before)
+
+    // processAction: a signed transaction of 110,000 empty outputs (990 KB),
+    // its action as createAction leaves it.
+    const reference = 'measure-reference'
+    await db.prepare("INSERT INTO transactions (user_id, status, reference, is_outgoing, description) VALUES (?, 'unsigned', ?, 1, 'an action')").bind(userId, reference).run()
+    const outputs = 110000
+    const raw = [...le32(1), 1, ...new Array(36).fill(0x33), 0, ...le32(0xffffffff), 0xfe, ...le32(outputs)]
+    for (let k = 0; k < outputs; k++) raw.push(1, 0, 0, 0, 0, 0, 0, 0, 0)
+    raw.push(...le32(0))
+    const sha = b => createHash('sha256').update(b).digest()
+    const txid = Buffer.from(sha(sha(Buffer.from(raw)))).reverse().toString('hex')
+    const beforeProcess = await counts()
+    const processRefused = await rpc('processAction', [{ identityKey: caller }, {
+      isNewTx: true, isSendWith: false, isNoSend: false, isDelayed: false, reference, txid, rawTx: raw, sendWith: [],
+    }])
+    assert.deepEqual(processRefused.error, { code: -32602, message: 'the transaction is too large to process' }, JSON.stringify(processRefused))
+    assert.deepEqual(await counts(), beforeProcess)
+    const row = await db.prepare('SELECT status, txid, raw_tx FROM transactions WHERE reference = ?').bind(reference).first()
+    assert.deepEqual(row, { status: 'unsigned', txid: null, raw_tx: null })
+    say(`measure: internalizeAction's AtomicBEEF of ${n} txid-only entries (hex and array) -32602 "${refused.error.message}", as a malformed BEEF is (-32602 "${malformed.error.message.slice(0, 26)}..."); processAction's ${raw.length}-byte transaction -32602 "${processRefused.error.message}"; no table gained or lost a row, the action stays unsigned`)
+  }
+
   // 9. The two rate limits, in one window of the limiter (aligned to its period).
   {
     const periodMs = IP_LIMIT.period * 1000
@@ -344,7 +402,7 @@ print(json.dumps(statements))
     say(`identity: ${served} calls of one identity from ${addresses.length} addresses served, the next is 429 ERR_RATE_LIMITED (signed) with RateLimit ${identityHeaders.ratelimit}, in ${elapsed} ms`)
   }
 
-  console.log('Local compiled Worker GREEN (#22): the in-flight ceiling, the body bound, both rate limits (bound or absent on GET /, draft-8 headers on the 429), the list budgets, findOrInsertUser bound to the session, migrate without a write, the collapsed fault, the status route behind the key, healthz and robots.txt')
+  console.log('Local compiled Worker GREEN (#22): the in-flight ceiling, the body bound, both rate limits (bound or absent on GET /, draft-8 headers on the 429), the list budgets, findOrInsertUser bound to the session, migrate without a write, the collapsed fault, the status route behind the key, healthz and robots.txt, a BEEF measured before it is parsed')
 } finally {
   await mf.dispose()
 }
