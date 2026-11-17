@@ -1,7 +1,7 @@
 [package]
 name = "bsv-wallet-infra-cloudflare"
 description = "BSV wallet storage on Cloudflare Workers: JSON-RPC over D1 and R2 behind BRC-31 authentication."
-version = "0.7.2"
+version = "0.7.3"
 license = "MIT"
 edition = "2021"
 repository = "https://github.com/Calhooon/bsv-wallet-infra-cloudflare"
@@ -53,4 +53,4 @@ tokio = { version = "1", features = ["rt", "macros"] }
 # the ACTUAL migrations + the ACTUAL candidate/guard SQL consts against an
 # in-memory DB (D1 is SQLite, so semantics match). "bundled" compiles its own
 # libsqlite3 (no system dependency). Dev-only: does not touch the wasm build.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "limits"] }

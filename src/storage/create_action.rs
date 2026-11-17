@@ -104,6 +104,16 @@ struct ProvenTxReqInputBeefRow {
     input_beef_hex: Option<String>,
 }
 
+/// The proofs `proven_txs` holds for `n` txids, a slice of a stored BEEF's
+/// unproven transactions.
+pub(crate) fn proven_proofs_sql(n: usize) -> String {
+    format!(
+        "SELECT proven_tx_id, txid, hex(merkle_path) as merkle_path_hex \
+         FROM proven_txs WHERE txid IN ({})",
+        crate::d1::chunks::placeholders(n)
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct ProvenTxProofRow {
     proven_tx_id: Option<f64>,
@@ -1494,9 +1504,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
     /// Upgrade unproven txs in a stored BEEF with proofs from `proven_txs`.
     ///
     /// Ported from reference `compact_stored_beef` (lines 2441-2493). Batches
-    /// proven_txs lookups in chunks of 400 to stay well under SQLite's 999 bind
-    /// limit. For each unproven tx whose txid appears in proven_txs, merges the
-    /// merkle path and links the tx to the new bump index.
+    /// proven_txs lookups in slices within D1's 100 bound parameters a
+    /// statement (`crate::d1::chunks`). For each unproven tx whose txid
+    /// appears in proven_txs, merges the merkle path and links the tx to the
+    /// new bump index.
     async fn compact_stored_beef(&self, beef: &mut Beef) -> Result<()> {
         let unproven_txids: Vec<String> = beef
             .txs
@@ -1512,38 +1523,26 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
         let store = crate::r2::BlobStore::new(self.blobs);
 
-        for chunk in unproven_txids.chunks(400) {
-            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "SELECT proven_tx_id, txid, hex(merkle_path) as merkle_path_hex \
-                 FROM proven_txs WHERE txid IN ({})",
-                placeholders
-            );
-
-            let mut q = Query::new(&sql);
-            for txid in chunk {
-                q = q.bind(txid.as_str());
-            }
-
-            let rows: Vec<ProvenTxProofRow> = q.fetch_all(self.db).await?;
-
-            for row in rows {
-                let id = row.proven_tx_id.map(|v| v as i64).unwrap_or(0);
-                let mp_bytes = decode_blob_with_r2(
-                    &store,
-                    "proven_txs",
-                    id,
-                    "merkle_path",
-                    row.merkle_path_hex.as_deref(),
-                )
+        let rows: Vec<ProvenTxProofRow> =
+            crate::d1::chunks::fetch_all_chunked(self.db, &unproven_txids, proven_proofs_sql)
                 .await?;
 
-                if let (Some(txid_str), Some(bytes)) = (row.txid.as_deref(), mp_bytes) {
-                    if let Ok(path) = MerklePath::from_binary(&bytes) {
-                        let bump_index = beef.merge_bump(path);
-                        if let Some(tx) = beef.find_txid_mut(txid_str) {
-                            tx.set_bump_index(Some(bump_index));
-                        }
+        for row in rows {
+            let id = row.proven_tx_id.map(|v| v as i64).unwrap_or(0);
+            let mp_bytes = decode_blob_with_r2(
+                &store,
+                "proven_txs",
+                id,
+                "merkle_path",
+                row.merkle_path_hex.as_deref(),
+            )
+            .await?;
+
+            if let (Some(txid_str), Some(bytes)) = (row.txid.as_deref(), mp_bytes) {
+                if let Ok(path) = MerklePath::from_binary(&bytes) {
+                    let bump_index = beef.merge_bump(path);
+                    if let Some(tx) = beef.find_txid_mut(txid_str) {
+                        tx.set_bump_index(Some(bump_index));
                     }
                 }
             }
@@ -3111,65 +3110,29 @@ mod tests {
     }
 
     // =========================================================================
-    // Task #16 — compact_stored_beef chunking invariants
-    //
-    // The batched query uses chunks of 400 because SQLite's bind-param limit
-    // is 999. These tests pin the chunking math so an accidental change to
-    // the chunk size gets caught.
+    // compact_stored_beef: the proven_txs lookup in slices within D1's 100
+    // bound parameters a statement (crate::d1::chunks).
     // =========================================================================
 
     #[test]
-    fn chunk_size_is_400_well_under_sqlite_limit() {
-        // SQLite parameter limit default is 999; we use 400 to leave headroom
-        // for the IN() clause plus any other bindings we'd add later.
-        const CHUNK_SIZE: usize = 400;
-        assert!(CHUNK_SIZE < 999);
-    }
-
-    #[test]
-    fn chunking_splits_small_collection_into_one_query() {
-        let unproven_txids: Vec<String> = (0..100).map(|i| format!("txid{:02}", i)).collect();
-        let n_chunks = unproven_txids.chunks(400).count();
-        assert_eq!(n_chunks, 1, "100 txids should be one chunk");
-    }
-
-    #[test]
-    fn chunking_splits_500_into_two_queries() {
-        let unproven_txids: Vec<String> = (0..500).map(|i| format!("txid{:04}", i)).collect();
-        let n_chunks = unproven_txids.chunks(400).count();
+    fn proven_proofs_slices_within_d1s_bound_parameters() {
+        use crate::d1::chunks::{chunked_queries, MAX_BOUND_PARAMS};
+        let unproven_txids: Vec<String> = (0..250).map(|i| format!("txid{:04}", i)).collect();
+        let parts: Vec<_> = chunked_queries(&unproven_txids, proven_proofs_sql)
+            .into_iter()
+            .map(crate::d1::Query::into_parts)
+            .collect();
+        let sizes: Vec<usize> = parts.iter().map(|(_, p)| p.len()).collect();
+        assert_eq!(sizes, vec![100, 100, 50]);
+        for (sql, params) in &parts {
+            assert!(params.len() <= MAX_BOUND_PARAMS);
+            assert_eq!(sql.matches('?').count(), params.len());
+        }
         assert_eq!(
-            n_chunks, 2,
-            "500 txids: one chunk of 400 + one chunk of 100"
+            chunked_queries(&unproven_txids[..100], proven_proofs_sql).len(),
+            1
         );
-
-        let sizes: Vec<usize> = unproven_txids.chunks(400).map(|c| c.len()).collect();
-        assert_eq!(sizes, vec![400, 100]);
-    }
-
-    #[test]
-    fn chunking_handles_exactly_400() {
-        let unproven_txids: Vec<String> = (0..400).map(|i| format!("txid{:04}", i)).collect();
-        let n_chunks = unproven_txids.chunks(400).count();
-        assert_eq!(n_chunks, 1);
-    }
-
-    #[test]
-    fn chunking_handles_empty_input() {
-        // compact_stored_beef early-returns on empty unproven_txids — verify
-        // the iterator math agrees (zero chunks, no queries issued).
-        let unproven_txids: Vec<String> = Vec::new();
-        let n_chunks = unproven_txids.chunks(400).count();
-        assert_eq!(n_chunks, 0);
-    }
-
-    #[test]
-    fn chunking_placeholders_string_matches_chunk_len() {
-        // The SQL builder does `chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",")`.
-        // Verify placeholder count == chunk size, no off-by-one.
-        let chunk: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
-        let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        assert_eq!(placeholders, "?,?,?");
-        assert_eq!(placeholders.split(',').count(), chunk.len());
+        assert!(chunked_queries(&unproven_txids[..0], proven_proofs_sql).is_empty());
     }
 
     // =========================================================================

@@ -4,6 +4,47 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.3, 2026-11-17: a list page of more than 100 rows is served
+
+### Fixed
+
+- **A page of more than 100 rows** of `listActions`, `listOutputs` and
+  `listCertificates` is served. D1 binds at most 100 parameters a statement
+  and answered `too many SQL variables` (the call `-32603`) when a page's
+  labels, tags or certificate fields were fetched with every row's key bound
+  in one statement; the door admits limits up to 1,000. Those fetches now run
+  a statement a slice of at most 100 keys (`d1::chunks`), each key once
+  across the slices; a page of 100 rows or fewer is the one statement it was,
+  and its answer is the same bytes.
+- **`listActions` with `includeOutputs`** fetches the page's outputs and
+  their tags for the whole page, a statement a slice, where it ran one
+  statement for each action and one for each output: a page of 1,000 actions
+  with everything included makes about forty D1 statements, within the
+  thousand a Worker invocation may make. Each action's outputs are in `vout`
+  order with their own tags, as before.
+- **A filter list** (the `labels` of `listActions`, the `tags` of
+  `listOutputs`, the `certifiers` and `types` of `listCertificates`, the
+  `txids` and `status` of `findProvenTxReqs`) binds as one JSON array read
+  with `json_each`, so a filter of any length is one parameter and the paged,
+  counted statement it filters stays one statement.
+- **The stored BEEF's proof lookup** (`compact_stored_beef`) slices its txids
+  at 100 a statement, not 400.
+
+### Tests
+
+- `storage::list_binds`: each of those statements on SQLite with the
+  variable limit set to D1's 100 on the connection, over the actual
+  migrations and 250 rows; the one-statement form is refused, the sliced
+  rows are the one statement's rows, each once, in the same order within a
+  key.
+- `tests/worker_list_pages.mjs` (the `worker` check): the compiled Worker on
+  workerd's D1, a wallet of 250 actions and 250 outputs with labels, tags and
+  custom instructions, `listActions` and `listOutputs` at limits 100, 101,
+  250 and 1,000 with and without each include, label and tag filters of 150
+  names, `listCertificates` and `findProvenTxReqs` over filters of 260 names:
+  every row once, the stated total, each row's labels, tags and outputs its
+  own; a limit of 1,001 still `-32602`.
+
 ## 0.7.2, 2026-11-17: a BEEF is measured before it is parsed
 
 ### Added

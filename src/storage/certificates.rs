@@ -129,6 +129,14 @@ pub struct RelinquishCertificateArgs {
     pub certificate_id: Option<i64>,
 }
 
+/// The fields of `n` certificates, a slice of a page's certificate ids.
+pub(crate) fn certificate_fields_sql(n: usize) -> String {
+    format!(
+        "SELECT * FROM certificate_fields WHERE certificate_id IN ({})",
+        crate::d1::chunks::placeholders(n)
+    )
+}
+
 // =============================================================================
 // Storage methods
 // =============================================================================
@@ -248,18 +256,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             return Ok(HashMap::new());
         }
 
-        let placeholders: Vec<&str> = cert_ids.iter().map(|_| "?").collect();
-        let sql = format!(
-            "SELECT * FROM certificate_fields WHERE certificate_id IN ({})",
-            placeholders.join(", ")
-        );
-
-        let mut query = Query::new(&sql);
-        for id in cert_ids {
-            query = query.bind(*id);
-        }
-
-        let rows: Vec<CertificateFieldRow> = query.fetch_all(self.db).await?;
+        let rows: Vec<CertificateFieldRow> =
+            crate::d1::chunks::fetch_all_chunked(self.db, cert_ids, certificate_fields_sql).await?;
         let mut map: HashMap<i64, Vec<TableCertificateField>> = HashMap::new();
         for row in rows {
             let field = row.into_table();

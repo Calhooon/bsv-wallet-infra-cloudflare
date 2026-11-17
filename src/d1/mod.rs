@@ -4,6 +4,7 @@
 //! helpers that bridge worker::D1 to our entity types.
 
 pub mod batch;
+pub mod chunks;
 
 use crate::error::{Error, Result};
 use serde::de::DeserializeOwned;
@@ -253,16 +254,17 @@ impl WhereBuilder {
         self
     }
 
-    /// Add `column IN (?, ?, ...)` condition from a list of values.
+    /// Add a `column IN (...)` condition from a list of values, bound as one
+    /// JSON array so a list of any length is one parameter (D1 binds at most
+    /// 100 a statement).
     pub fn in_list(mut self, column: &str, vals: Vec<QVal>) -> Self {
         if vals.is_empty() {
             // Impossible condition - nothing matches
             self.clauses.push("1 = 0".to_string());
         } else {
-            let placeholders: Vec<&str> = vals.iter().map(|_| "?").collect();
-            self.clauses
-                .push(format!("{} IN ({})", column, placeholders.join(", ")));
-            self.params.extend(vals);
+            let (clause, param) = chunks::json_in(column, &vals);
+            self.clauses.push(clause);
+            self.params.push(param);
         }
         self
     }

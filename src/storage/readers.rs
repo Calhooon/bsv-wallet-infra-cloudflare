@@ -5,8 +5,12 @@
 
 use std::collections::HashMap;
 
+use crate::d1::chunks::{fetch_all_chunked, json_in, placeholders};
 use crate::error::Result;
-use crate::{d1::Query, door::bounds::MAX_LIST_LIMIT};
+use crate::{
+    d1::{QVal, Query},
+    door::bounds::MAX_LIST_LIMIT,
+};
 use serde::{Deserialize, Serialize};
 
 use super::StorageD1;
@@ -40,11 +44,6 @@ struct BasketIdRow {
 #[derive(Debug, Deserialize)]
 struct TagIdRow {
     output_tag_id: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TagRow {
-    tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +90,7 @@ struct BatchTagRow {
 
 #[derive(Debug, Deserialize)]
 struct ActionOutputRow {
+    transaction_id: Option<f64>,
     output_id: Option<f64>,
     vout: Option<f64>,
     satoshis: Option<f64>,
@@ -487,18 +487,12 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             _ => return Ok(vec![]),
         };
 
-        let placeholders: Vec<&str> = tags.iter().map(|_| "?").collect();
-        let sql = format!(
-            "SELECT output_tag_id FROM output_tags WHERE user_id = ? AND is_deleted = 0 AND tag IN ({})",
-            placeholders.join(",")
-        );
-
-        let mut query = Query::new(&sql).bind(user_id);
-        for tag in tags {
-            query = query.bind(tag.as_str());
-        }
-
-        let rows: Vec<TagIdRow> = query.fetch_all(self.db).await?;
+        let (sql, tags) = resolve_tag_ids_sql(tags);
+        let rows: Vec<TagIdRow> = Query::new(sql)
+            .bind(user_id)
+            .bind(tags)
+            .fetch_all(self.db)
+            .await?;
         Ok(rows
             .iter()
             .map(|r| r.output_tag_id.map(|v| v as i64).unwrap_or(0))
@@ -636,19 +630,6 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         Ok((rows, total))
     }
 
-    async fn get_output_tags(&self, output_id: i64) -> Result<Vec<String>> {
-        let rows: Vec<TagRow> = Query::new(
-            "SELECT t.tag FROM output_tags t \
-             JOIN output_tags_map m ON t.output_tag_id = m.output_tag_id \
-             WHERE m.output_id = ? AND m.is_deleted = 0 AND t.is_deleted = 0",
-        )
-        .bind(output_id)
-        .fetch_all(self.db)
-        .await?;
-
-        Ok(rows.into_iter().filter_map(|r| r.tag).collect())
-    }
-
     // =========================================================================
     // listActions
     // =========================================================================
@@ -717,6 +698,12 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         } else {
             HashMap::new()
         };
+        let mut outputs_map = if include_outputs {
+            self.batch_get_action_outputs(&action_tx_ids, include_output_locking_scripts)
+                .await?
+        } else {
+            HashMap::new()
+        };
 
         // Convert to result items
         let mut actions = Vec::with_capacity(tx_rows.len());
@@ -740,10 +727,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             };
 
             let outputs = if include_outputs {
-                Some(
-                    self.get_action_outputs(transaction_id, include_output_locking_scripts)
-                        .await?,
-                )
+                Some(outputs_map.remove(&transaction_id).unwrap_or_default())
             } else {
                 None
             };
@@ -778,18 +762,12 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             return Ok(vec![]);
         }
 
-        let placeholders: Vec<&str> = labels.iter().map(|_| "?").collect();
-        let sql = format!(
-            "SELECT tx_label_id FROM tx_labels WHERE user_id = ? AND is_deleted = 0 AND label IN ({})",
-            placeholders.join(",")
-        );
-
-        let mut query = Query::new(&sql).bind(user_id);
-        for label in labels {
-            query = query.bind(label.as_str());
-        }
-
-        let rows: Vec<LabelIdRow> = query.fetch_all(self.db).await?;
+        let (sql, labels) = resolve_label_ids_sql(labels);
+        let rows: Vec<LabelIdRow> = Query::new(sql)
+            .bind(user_id)
+            .bind(labels)
+            .fetch_all(self.db)
+            .await?;
         Ok(rows
             .iter()
             .map(|r| r.tx_label_id.map(|v| v as i64).unwrap_or(0))
@@ -1072,20 +1050,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             return Ok(HashMap::new());
         }
 
-        let placeholders: Vec<&str> = transaction_ids.iter().map(|_| "?").collect();
-        let sql = format!(
-            "SELECT m.transaction_id, l.label FROM tx_labels l \
-             JOIN tx_labels_map m ON l.tx_label_id = m.tx_label_id \
-             WHERE m.transaction_id IN ({}) AND m.is_deleted = 0 AND l.is_deleted = 0",
-            placeholders.join(",")
-        );
-
-        let mut query = Query::new(&sql);
-        for id in transaction_ids {
-            query = query.bind(*id);
-        }
-
-        let rows: Vec<BatchLabelRow> = query.fetch_all(self.db).await?;
+        let rows: Vec<BatchLabelRow> =
+            fetch_all_chunked(self.db, transaction_ids, transaction_labels_sql).await?;
 
         let mut map: HashMap<i64, Vec<String>> = HashMap::new();
         for row in rows {
@@ -1102,20 +1068,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             return Ok(HashMap::new());
         }
 
-        let placeholders: Vec<&str> = output_ids.iter().map(|_| "?").collect();
-        let sql = format!(
-            "SELECT m.output_id, t.tag FROM output_tags t \
-             JOIN output_tags_map m ON t.output_tag_id = m.output_tag_id \
-             WHERE m.output_id IN ({}) AND m.is_deleted = 0 AND t.is_deleted = 0",
-            placeholders.join(",")
-        );
-
-        let mut query = Query::new(&sql);
-        for id in output_ids {
-            query = query.bind(*id);
-        }
-
-        let rows: Vec<BatchTagRow> = query.fetch_all(self.db).await?;
+        let rows: Vec<BatchTagRow> =
+            fetch_all_chunked(self.db, output_ids, output_tags_sql).await?;
 
         let mut map: HashMap<i64, Vec<String>> = HashMap::new();
         for row in rows {
@@ -1126,54 +1080,118 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         Ok(map)
     }
 
-    async fn get_action_outputs(
+    /// The outputs of a page's actions, each action's in `vout` order with
+    /// its own tags: the outputs and their tags fetched for the whole page, a
+    /// statement a slice of the keys.
+    async fn batch_get_action_outputs(
         &self,
-        transaction_id: i64,
+        transaction_ids: &[i64],
         include_locking_scripts: bool,
-    ) -> Result<Vec<ActionOutputItem>> {
-        // Use hex() for blob columns so D1 returns them as strings, not binary
-        let locking_col = if include_locking_scripts {
-            "hex(o.locking_script) as locking_script"
-        } else {
-            "NULL as locking_script"
-        };
-        let sql = format!(
-            "SELECT o.output_id, o.vout, o.satoshis, o.spendable, {}, \
-             o.custom_instructions, o.output_description, ob.name as basket_name \
-             FROM outputs o \
-             LEFT JOIN output_baskets ob ON o.basket_id = ob.basket_id \
-             WHERE o.transaction_id = ? \
-             ORDER BY o.vout ASC",
-            locking_col
-        );
-        let rows: Vec<ActionOutputRow> = Query::new(&sql)
-            .bind(transaction_id)
-            .fetch_all(self.db)
-            .await?;
-
-        let mut result = Vec::with_capacity(rows.len());
-        for row in rows {
-            let output_id = row.output_id.map(|v| v as i64).unwrap_or(0);
-            let tags = self.get_output_tags(output_id).await?;
-
-            result.push(ActionOutputItem {
-                satoshis: row.satoshis.map(|v| v as u64).unwrap_or(0),
-                spendable: row.spendable.map(|v| v as i32 != 0).unwrap_or(false),
-                output_index: row.vout.map(|v| v as u32).unwrap_or(0),
-                output_description: row.output_description.unwrap_or_default(),
-                basket: row.basket_name.unwrap_or_default(),
-                tags,
-                locking_script: if include_locking_scripts {
-                    row.locking_script
-                } else {
-                    None
-                },
-                custom_instructions: row.custom_instructions,
-            });
+    ) -> Result<HashMap<i64, Vec<ActionOutputItem>>> {
+        if transaction_ids.is_empty() {
+            return Ok(HashMap::new());
         }
+        let rows: Vec<ActionOutputRow> = fetch_all_chunked(self.db, transaction_ids, |n| {
+            action_outputs_sql(n, include_locking_scripts)
+        })
+        .await?;
+        let output_ids: Vec<i64> = rows
+            .iter()
+            .map(|r| r.output_id.map(|v| v as i64).unwrap_or(0))
+            .collect();
+        let tags_map = self.batch_get_output_tags(&output_ids).await?;
 
-        Ok(result)
+        let mut map: HashMap<i64, Vec<ActionOutputItem>> = HashMap::new();
+        for row in rows {
+            let transaction_id = row.transaction_id.map(|v| v as i64).unwrap_or(0);
+            let output_id = row.output_id.map(|v| v as i64).unwrap_or(0);
+            map.entry(transaction_id)
+                .or_default()
+                .push(ActionOutputItem {
+                    satoshis: row.satoshis.map(|v| v as u64).unwrap_or(0),
+                    spendable: row.spendable.map(|v| v as i32 != 0).unwrap_or(false),
+                    output_index: row.vout.map(|v| v as u32).unwrap_or(0),
+                    output_description: row.output_description.unwrap_or_default(),
+                    basket: row.basket_name.unwrap_or_default(),
+                    tags: tags_map.get(&output_id).cloned().unwrap_or_default(),
+                    locking_script: if include_locking_scripts {
+                        row.locking_script
+                    } else {
+                        None
+                    },
+                    custom_instructions: row.custom_instructions,
+                });
+        }
+        Ok(map)
     }
+}
+
+// =============================================================================
+// The statements over a list (D1 binds at most 100 parameters a statement)
+// =============================================================================
+
+/// The ids of the caller's tags named in `tags`: the statement and the tags
+/// as one parameter, its second after `user_id`.
+pub(crate) fn resolve_tag_ids_sql(tags: &[String]) -> (String, QVal) {
+    let tags: Vec<QVal> = tags.iter().map(|t| QVal::Text(t.clone())).collect();
+    let (clause, param) = json_in("tag", &tags);
+    (
+        format!("SELECT output_tag_id FROM output_tags WHERE user_id = ? AND is_deleted = 0 AND {clause}"),
+        param,
+    )
+}
+
+/// The ids of the caller's labels named in `labels`: the statement and the
+/// labels as one parameter, its second after `user_id`.
+pub(crate) fn resolve_label_ids_sql(labels: &[String]) -> (String, QVal) {
+    let labels: Vec<QVal> = labels.iter().map(|l| QVal::Text(l.clone())).collect();
+    let (clause, param) = json_in("label", &labels);
+    (
+        format!(
+            "SELECT tx_label_id FROM tx_labels WHERE user_id = ? AND is_deleted = 0 AND {clause}"
+        ),
+        param,
+    )
+}
+
+/// The labels of `n` transactions.
+pub(crate) fn transaction_labels_sql(n: usize) -> String {
+    format!(
+        "SELECT m.transaction_id, l.label FROM tx_labels l \
+         JOIN tx_labels_map m ON l.tx_label_id = m.tx_label_id \
+         WHERE m.transaction_id IN ({}) AND m.is_deleted = 0 AND l.is_deleted = 0",
+        placeholders(n)
+    )
+}
+
+/// The tags of `n` outputs.
+pub(crate) fn output_tags_sql(n: usize) -> String {
+    format!(
+        "SELECT m.output_id, t.tag FROM output_tags t \
+         JOIN output_tags_map m ON t.output_tag_id = m.output_tag_id \
+         WHERE m.output_id IN ({}) AND m.is_deleted = 0 AND t.is_deleted = 0",
+        placeholders(n)
+    )
+}
+
+/// The outputs of `n` transactions, each transaction's in `vout` order.
+pub(crate) fn action_outputs_sql(n: usize, include_locking_scripts: bool) -> String {
+    // Use hex() for blob columns so D1 returns them as strings, not binary
+    let locking_col = if include_locking_scripts {
+        "hex(o.locking_script) as locking_script"
+    } else {
+        "NULL as locking_script"
+    };
+    format!(
+        "SELECT o.transaction_id, o.output_id, o.vout, o.satoshis, o.spendable, {}, \
+         o.custom_instructions, o.output_description, ob.name as basket_name \
+         FROM outputs o \
+         LEFT JOIN output_baskets ob ON o.basket_id = ob.basket_id \
+         WHERE o.transaction_id IN ({}) \
+         ORDER BY o.transaction_id ASC, o.vout ASC",
+        locking_col,
+        placeholders(n)
+    )
 }
 
 #[cfg(test)]

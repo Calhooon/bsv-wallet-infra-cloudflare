@@ -32,46 +32,7 @@ impl<B: crate::services::BroadcastService + crate::services::ProofService> Stora
         user_id: i64,
         args: FindProvenTxReqsArgs,
     ) -> Result<Vec<TableProvenTxReq>> {
-        let mut sql = String::from("SELECT r.proven_tx_req_id, r.txid, r.status, r.attempts, r.history, r.notified, r.notify, hex(r.raw_tx) AS raw_tx, hex(r.input_beef) AS input_beef, r.proven_tx_id, r.batch, r.created_at, r.updated_at FROM proven_tx_reqs r WHERE EXISTS (SELECT 1 FROM transactions t WHERE t.txid = r.txid AND t.user_id = ?)");
-        let mut values = vec![crate::d1::QVal::Int(user_id)];
-        for (column, filter) in [
-            ("r.txid", args.txids),
-            (
-                "r.status",
-                args.status
-                    .map(|s| s.into_iter().map(|s| s.as_str().to_string()).collect()),
-            ),
-        ] {
-            if let Some(filter) = filter {
-                if filter.is_empty() {
-                    continue;
-                }
-                sql.push_str(&format!(
-                    " AND {column} IN ({})",
-                    vec!["?"; filter.len()].join(",")
-                ));
-                values.extend(filter.into_iter().map(crate::d1::QVal::Text));
-            }
-        }
-        if let Some(since) = args.base.since {
-            sql.push_str(" AND julianday(r.updated_at) > julianday(?)");
-            values.push(crate::d1::QVal::Text(since.to_rfc3339()));
-        }
-        let direction = if args.base.order_descending.unwrap_or(false) {
-            "DESC"
-        } else {
-            "ASC"
-        };
-        sql.push_str(&format!(
-            " ORDER BY julianday(r.updated_at) {direction}, r.proven_tx_req_id {direction} LIMIT ? OFFSET ?"
-        ));
-        let paged = args.base.paged.unwrap_or_default();
-        values.push(crate::d1::QVal::Int(i64::from(
-            paged
-                .limit
-                .unwrap_or(crate::door::bounds::DEFAULT_LIST_LIMIT),
-        )));
-        values.push(crate::d1::QVal::Int(paged.offset.unwrap_or(0) as i64));
+        let (sql, values) = find_sql(user_id, &args);
         let mut query = Query::new(sql);
         for value in values {
             query = query.bind(value);
@@ -112,4 +73,55 @@ impl<B: crate::services::BroadcastService + crate::services::ProofService> Stora
         }
         Ok(result)
     }
+}
+
+/// The statement of `find_proven_tx_reqs` and its parameters: a filter list
+/// of any length binds as one JSON array.
+pub(crate) fn find_sql(
+    user_id: i64,
+    args: &FindProvenTxReqsArgs,
+) -> (String, Vec<crate::d1::QVal>) {
+    let mut sql = String::from("SELECT r.proven_tx_req_id, r.txid, r.status, r.attempts, r.history, r.notified, r.notify, hex(r.raw_tx) AS raw_tx, hex(r.input_beef) AS input_beef, r.proven_tx_id, r.batch, r.created_at, r.updated_at FROM proven_tx_reqs r WHERE EXISTS (SELECT 1 FROM transactions t WHERE t.txid = r.txid AND t.user_id = ?)");
+    let mut values = vec![crate::d1::QVal::Int(user_id)];
+    for (column, filter) in [
+        ("r.txid", args.txids.clone()),
+        (
+            "r.status",
+            args.status
+                .as_ref()
+                .map(|s| s.iter().map(|s| s.as_str().to_string()).collect()),
+        ),
+    ] {
+        if let Some(filter) = filter {
+            if filter.is_empty() {
+                continue;
+            }
+            // One JSON array, one parameter: a filter of any length (D1 binds 100).
+            let filter: Vec<crate::d1::QVal> =
+                filter.into_iter().map(crate::d1::QVal::Text).collect();
+            let (clause, param) = crate::d1::chunks::json_in(column, &filter);
+            sql.push_str(&format!(" AND {clause}"));
+            values.push(param);
+        }
+    }
+    if let Some(since) = args.base.since {
+        sql.push_str(" AND julianday(r.updated_at) > julianday(?)");
+        values.push(crate::d1::QVal::Text(since.to_rfc3339()));
+    }
+    let direction = if args.base.order_descending.unwrap_or(false) {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    sql.push_str(&format!(
+        " ORDER BY julianday(r.updated_at) {direction}, r.proven_tx_req_id {direction} LIMIT ? OFFSET ?"
+    ));
+    let paged = args.base.paged.clone().unwrap_or_default();
+    values.push(crate::d1::QVal::Int(i64::from(
+        paged
+            .limit
+            .unwrap_or(crate::door::bounds::DEFAULT_LIST_LIMIT),
+    )));
+    values.push(crate::d1::QVal::Int(paged.offset.unwrap_or(0) as i64));
+    (sql, values)
 }
