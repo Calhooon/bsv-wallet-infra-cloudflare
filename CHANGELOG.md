@@ -4,7 +4,53 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
-## Unreleased (0.6.0): bsv-rs 0.8.1 and the agents' adapter 0.7.2
+## 0.7.0, 2026-11-17: bsv-rs 0.8.11, and the work main carried past 0.6.0
+
+### Changed
+
+- **bsv-rs `0.8.11`** (the caret, from `0.8.1`), the newest 0.8 on the index;
+  bsv-middleware-cloudflare stays `=0.7.2` (core 0.4.1) and the lock holds one
+  bsv-rs. The lock moves bsv-rs and the dependencies its 0.8.3 brought, nothing
+  else: k256 and p256 to 0.14 (RUSTSEC-2026-0387), with ecdsa 0.17,
+  elliptic-curve 0.14, sha2 0.11, sha1 0.11, hmac 0.13, pbkdf2 0.13, ripemd 0.2,
+  rfc6979 0.6, digest 0.11 and their own (hybrid-array, crypto-bigint 0.7,
+  primefield, wnaf, ctutils, cmov, cpubits, serdect, rand_core 0.10;
+  pem-rfc7468 leaves). No source change: the Worker calls none of the doors
+  0.8.11 bounds or tightens (`from_beef`, `from_atomic_beef`,
+  `find_atomic_transaction`, `HttpRequest::from_payload`,
+  `sighash::parse_transaction`), no template classifier, no broadcaster and
+  no fee policy of bsv-rs's, and `from_ef` only in two tests over bytes they
+  build (GHSA-82g9-h6jw-r99f has no patched version; no production read of
+  Extended Format bytes is left to bound). Builds with the `overlay`,
+  `kvstore`, `registry` and `identity` features off, so the KVStore,
+  registry and discovery advisories reach no code here.
+- **What a client sees.** An honest request is answered as on 0.8.1. Three
+  refusals are new, each of bytes no miner accepts: `internalizeAction` with
+  `beefAtRest` refuses, as `-32602` "does not spend", a spend of a coin proven
+  below the Genesis height that the rules of its era refuse, and a spend of a
+  coin locked `OP_HASH160 <20 bytes> OP_EQUAL` whose redeem script fails
+  (GHSA-h4m7-c6p8-725m, GHSA-fr33-7jw7-mwwh); a BRC-103 signature in DER
+  with bytes after it, a wrong sequence length or an unneeded zero is refused
+  at the door as any bad signature is (0.8.6, GHSA-9c8r-76f3-m426); and a
+  `processAction` raw transaction with bytes after it is no longer read by
+  the local script check (0.8.5, GHSA-j8hr-pjhm-6h27): it goes to the
+  broadcaster, whose answer decides, where 0.8.1 judged the prefix.
+- **The version is 0.7.0**, a minor: the first tag over what main carried
+  past v0.6.0, all of it in production at `0bfbf2a` since 2026-10-27. The
+  door's policies (#22): bodies and responses bounded at 8 MiB (413), 300
+  requests a minute per IP before auth and 1,000 per identity after (429
+  with the draft-8 RateLimit headers), 24 requests in flight per isolate
+  (503), list, offset, array and nesting limits, `findOrInsertUser` for the
+  session's own key only, internal errors collapsed to `WERR_INTERNAL`'s
+  text, `GET /healthz` and `GET /robots.txt`, `monitor/status` and
+  `monitor/audit` behind the trigger key, and `GET /` naming each rate-limit
+  binding. The route fixtures replayed on the compiled Worker (#15). The
+  proof held pending until the header service answers (#49). Arcade's 400
+  carrying 460 to 475 read as a policy refusal, a hint, never `InvalidTx`,
+  its 466 a conflict hint, `/policy` read once per provider, and the local
+  script check run on the inline BEEF before any write (#50). No migration.
+
+## 0.6.0, 2026-10-22: bsv-rs 0.8.1 and the agents' adapter 0.7.2
 
 ### Changed
 
