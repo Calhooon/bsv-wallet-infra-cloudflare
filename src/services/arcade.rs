@@ -20,9 +20,11 @@
 //!   • Free `merklePath` arrives on the MINED SSE payload — OUT OF SCOPE this migration
 //!     (the monitor's existing proof providers keep that job).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use bsv_sdk::transaction::{Beef, Transaction};
+use bsv_sdk::primitives::Writer;
+use bsv_sdk::script::UnlockingScript;
+use bsv_sdk::transaction::{Beef, Transaction, TransactionOutput};
 
 use super::{BroadcastError, BroadcastResult};
 
@@ -117,9 +119,17 @@ pub type EfTx = (String, Vec<u8>);
 /// chain TXs otherwise never reach the network. Source satoshis/scripts come from the BEEF's
 /// own ancestry, so a valid BEEF always carries enough data for EF encoding.
 ///
-/// THE KNOWN TRAP (paid for in the reference impl): bsv-rs `Transaction::to_ef()` requires
-/// `input.source_transaction` to be linked, and the BEEF parser does NOT link it — we link
-/// each input manually from the BEEF's own tx map, one level deep.
+/// Each input's EF entry is written from the input's own fields and the satoshis and locking
+/// script of the ONE output it spends, read in place from the source transaction the BEEF
+/// holds: no source is cloned and none is linked (the BEEF parser links none, and bsv-rs
+/// `Transaction::to_ef()` needs them linked). The bytes are the bytes `to_ef()` writes over
+/// the linked transaction (pinned in the tests against that path).
+///
+/// A transaction and an outpoint are each written once in a batch: a repeated entry of a
+/// transaction already converted adds nothing, and a transaction spending an output another
+/// transaction of the batch already spends (a double spend inside one BEEF, which no network
+/// admits) is refused. That refusal is reported only when no other conversion error is, so
+/// every other error keeps the transaction and the words it had.
 ///
 /// Returns `(efs, subject_txid)` — `(txid, EF binary)` pairs for all unproven TXs in
 /// dependency order (`Beef::sort_txs`), and the txid of the BEEF's subject transaction.
@@ -130,20 +140,25 @@ pub fn beef_to_ef_batch(beef_hex: &str) -> std::result::Result<(Vec<EfTx>, Strin
     let mut beef = Beef::from_hex(beef_hex).map_err(|e| format!("Arcade EF: BEEF parse: {e:?}"))?;
     beef.sort_txs();
 
-    // txid → parsed transaction, for linking input sources one level deep.
-    // BEEF-parsed transactions have no sources linked themselves, so clones stay flat.
-    let mut tx_map: HashMap<String, Transaction> = HashMap::with_capacity(beef.txs.len());
-    for btx in &beef.txs {
+    // txid → the BEEF's own parsed transaction, borrowed: an input's spent output is read
+    // in place.
+    let txids: Vec<String> = beef.txs.iter().map(|btx| btx.txid()).collect();
+    let mut sources: HashMap<&str, &Transaction> = HashMap::with_capacity(beef.txs.len());
+    for (btx, txid) in beef.txs.iter().zip(&txids) {
         if let Some(tx) = btx.tx() {
-            tx_map.insert(btx.txid(), tx.clone());
+            sources.insert(txid.as_str(), tx);
         }
     }
+    // Every unproven transaction the batch converts, and every outpoint they spend.
+    let mut converted: HashSet<&str> = HashSet::new();
+    let mut spent: HashSet<(&str, u32)> = HashSet::new();
+    // The first spend of an outpoint the batch already spends; nothing is written after it.
+    let mut respent: Option<String> = None;
 
     let mut efs = Vec::new();
     let mut subject_txid = String::new();
 
-    for btx in &beef.txs {
-        let txid = btx.txid();
+    for (btx, txid) in beef.txs.iter().zip(&txids) {
         subject_txid = txid.clone();
 
         if btx.has_proof() {
@@ -155,25 +170,26 @@ pub fn beef_to_ef_batch(beef_hex: &str) -> std::result::Result<(Vec<EfTx>, Strin
             .tx()
             .ok_or_else(|| format!("Arcade EF: txid-only entry {txid} has no transaction data"))?;
 
-        let mut tx = tx.clone();
-        for input in &mut tx.inputs {
-            if input.source_transaction.is_some() {
-                continue;
-            }
-            let src_txid = input
-                .source_txid
-                .clone()
-                .ok_or_else(|| format!("Arcade EF: input in {txid} has no source txid"))?;
-            let src = tx_map.get(&src_txid).ok_or_else(|| {
-                format!("Arcade EF: source tx {src_txid} for {txid} not present in BEEF")
-            })?;
-            input.source_transaction = Some(Box::new(src.clone()));
+        if !converted.insert(txid.as_str()) {
+            // A repeated entry of a transaction the batch holds already: written once.
+            continue;
         }
-
-        let ef = tx
-            .to_ef()
-            .map_err(|e| format!("Arcade EF: {txid}: {e:?}"))?;
-        efs.push((txid, ef));
+        let spends = spent_outputs(tx, txid, &sources)?;
+        if respent.is_some() {
+            continue;
+        }
+        if let Some((src_txid, vout)) = spends
+            .iter()
+            .map(|spend| (spend.src_txid, spend.vout))
+            .find(|outpoint| !spent.insert(*outpoint))
+        {
+            respent = Some(format!(
+                "Arcade EF: {txid}: spends {src_txid}:{vout}, which the batch already spends; \
+                 inconsistent BEEF; STOP"
+            ));
+            continue;
+        }
+        efs.push((txid.clone(), write_ef(tx, &spends)));
     }
 
     // An ATOMIC-framed BEEF declares its subject — prefer it, but only if it AGREES with the
@@ -187,8 +203,95 @@ pub fn beef_to_ef_batch(beef_hex: &str) -> std::result::Result<(Vec<EfTx>, Strin
         }
         subject_txid = atomic.clone();
     }
+    if let Some(e) = respent {
+        return Err(e);
+    }
 
     Ok((efs, subject_txid))
+}
+
+/// One input's checked parts: the outpoint it spends, its own unlocking script, and the
+/// output it spends, read in place from the source the BEEF holds.
+struct Spend<'a> {
+    src_txid: &'a str,
+    src_txid_bytes: [u8; 32],
+    vout: u32,
+    unlocking: &'a UnlockingScript,
+    output: &'a TransactionOutput,
+}
+
+/// Each input's [`Spend`], after every check the conversion makes before writing: first that
+/// every input names a source the BEEF holds, then `Transaction::to_ef`'s own checks per
+/// input in its order, each refusal in the words it has always had.
+fn spent_outputs<'a>(
+    tx: &'a Transaction,
+    txid: &str,
+    sources: &HashMap<&'a str, &'a Transaction>,
+) -> std::result::Result<Vec<Spend<'a>>, String> {
+    let mut held: Vec<(&'a str, &'a Transaction)> = Vec::with_capacity(tx.inputs.len());
+    for input in &tx.inputs {
+        let src_txid = input
+            .source_txid
+            .as_deref()
+            .ok_or_else(|| format!("Arcade EF: input in {txid} has no source txid"))?;
+        let (&src_txid, &src) = sources.get_key_value(src_txid).ok_or_else(|| {
+            format!("Arcade EF: source tx {src_txid} for {txid} not present in BEEF")
+        })?;
+        held.push((src_txid, src));
+    }
+    let sdk = |e: bsv_sdk::Error| format!("Arcade EF: {txid}: {e:?}");
+    let refusal = |words: &str| sdk(bsv_sdk::Error::TransactionError(words.to_string()));
+    let mut spends = Vec::with_capacity(held.len());
+    for (input, (src_txid, src)) in tx.inputs.iter().zip(held) {
+        let src_txid_bytes = input.get_source_txid_bytes().map_err(sdk)?;
+        let unlocking = input
+            .unlocking_script
+            .as_ref()
+            .ok_or_else(|| refusal("unlockingScript is undefined"))?;
+        let output = src
+            .outputs
+            .get(input.source_output_index as usize)
+            .ok_or_else(|| refusal("Source output index out of bounds"))?;
+        spends.push(Spend {
+            src_txid,
+            src_txid_bytes,
+            vout: input.source_output_index,
+            unlocking,
+            output,
+        });
+    }
+    Ok(spends)
+}
+
+/// One transaction in Extended Format (BRC-30): its own fields and, per input, the satoshis
+/// and locking script of the output it spends, in the field order and encoding of
+/// `Transaction::to_ef`.
+fn write_ef(tx: &Transaction, spends: &[Spend<'_>]) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.write_u32_le(tx.version);
+    writer.write_bytes(&[0x00, 0x00, 0x00, 0x00, 0x00, 0xEF]);
+    writer.write_var_int(tx.inputs.len() as u64);
+    for (input, spend) in tx.inputs.iter().zip(spends) {
+        writer.write_bytes(&spend.src_txid_bytes);
+        writer.write_u32_le(spend.vout);
+        let unlocking = spend.unlocking.to_binary();
+        writer.write_var_int(unlocking.len() as u64);
+        writer.write_bytes(&unlocking);
+        writer.write_u32_le(input.sequence);
+        writer.write_u64_le(spend.output.satoshis.unwrap_or(0));
+        let lock = spend.output.locking_script.to_binary();
+        writer.write_var_int(lock.len() as u64);
+        writer.write_bytes(&lock);
+    }
+    writer.write_var_int(tx.outputs.len() as u64);
+    for output in &tx.outputs {
+        writer.write_u64_le(output.satoshis.unwrap_or(0));
+        let script = output.locking_script.to_binary();
+        writer.write_var_int(script.len() as u64);
+        writer.write_bytes(&script);
+    }
+    writer.write_u32_le(tx.lock_time);
+    writer.into_bytes()
 }
 
 // =============================================================================
@@ -783,7 +886,8 @@ pub async fn fetch_tx_record(base_url: &str, txid: &str) -> Option<serde_json::V
 mod tests {
     use super::*;
     use bsv_sdk::primitives::{sha256d, to_hex};
-    use bsv_sdk::transaction::{MerklePath, MerklePathLeaf};
+    use bsv_sdk::script::LockingScript;
+    use bsv_sdk::transaction::{MerklePath, MerklePathLeaf, TransactionInput};
 
     // ── deterministic script-shaped vectors ──
 
@@ -940,8 +1044,8 @@ mod tests {
 
     #[test]
     fn ef_batch_pins_the_source_linking_trap() {
-        // THE TRAP: a BEEF-parsed tx has NO source_transaction linked — to_ef() on it fails.
-        // beef_to_ef_batch must link manually (that's its whole reason to exist).
+        // A BEEF-parsed tx has NO source_transaction linked — to_ef() on it fails.
+        // beef_to_ef_batch reads each spent output from the BEEF's own transactions.
         let (beef_hex, child_txid) = {
             let root = raw_tx(&"11".repeat(32), 0, &[0x51], &[(5000, lock(0x22))]);
             let root_txid = display_txid(&root);
@@ -972,8 +1076,8 @@ mod tests {
             "BEEF parser must NOT have linked source_transaction (else the trap moved)"
         );
 
-        // …but the batch fn links from the BEEF's own tx map and succeeds.
-        let (efs, subject) = beef_to_ef_batch(&beef_hex).expect("manual linking works");
+        // …but the batch fn reads the spent outputs from the BEEF and succeeds.
+        let (efs, subject) = beef_to_ef_batch(&beef_hex).expect("converts unlinked");
         assert_eq!(subject, child_txid);
         assert_eq!(efs.len(), 1);
         assert_eq!(efs[0].0, child_txid);
@@ -1048,6 +1152,588 @@ mod tests {
             err.contains("not present in BEEF"),
             "the error names the gap: {err}"
         );
+    }
+
+    // ── the Extended Format bytes, against the linking path ──
+
+    /// The conversion as 0.7.0 wrote it: every input linked to a copy of its source
+    /// transaction, then bsv-rs `Transaction::to_ef()`. Test-only: the oracle of the pins below.
+    fn linked_ef_batch(beef_hex: &str) -> std::result::Result<(Vec<EfTx>, String), String> {
+        let mut beef =
+            Beef::from_hex(beef_hex).map_err(|e| format!("Arcade EF: BEEF parse: {e:?}"))?;
+        beef.sort_txs();
+        let mut tx_map: HashMap<String, Transaction> = HashMap::with_capacity(beef.txs.len());
+        for btx in &beef.txs {
+            if let Some(tx) = btx.tx() {
+                tx_map.insert(btx.txid(), tx.clone());
+            }
+        }
+        let mut efs = Vec::new();
+        let mut subject_txid = String::new();
+        for btx in &beef.txs {
+            let txid = btx.txid();
+            subject_txid = txid.clone();
+            if btx.has_proof() {
+                continue;
+            }
+            let tx = btx.tx().ok_or_else(|| {
+                format!("Arcade EF: txid-only entry {txid} has no transaction data")
+            })?;
+            let mut tx = tx.clone();
+            for input in &mut tx.inputs {
+                if input.source_transaction.is_some() {
+                    continue;
+                }
+                let src_txid = input
+                    .source_txid
+                    .clone()
+                    .ok_or_else(|| format!("Arcade EF: input in {txid} has no source txid"))?;
+                let src = tx_map.get(&src_txid).ok_or_else(|| {
+                    format!("Arcade EF: source tx {src_txid} for {txid} not present in BEEF")
+                })?;
+                input.source_transaction = Some(Box::new(src.clone()));
+            }
+            let ef = tx
+                .to_ef()
+                .map_err(|e| format!("Arcade EF: {txid}: {e:?}"))?;
+            efs.push((txid, ef));
+        }
+        if let Some(atomic) = &beef.atomic_txid {
+            if *atomic != subject_txid {
+                return Err(format!(
+                    "Arcade EF: AtomicBEEF declares subject {atomic} but the last tx in \
+                     dependency order is {subject_txid} — inconsistent BEEF; STOP"
+                ));
+            }
+            subject_txid = atomic.clone();
+        }
+        Ok((efs, subject_txid))
+    }
+
+    /// The linking path's batch with a repeated entry of one transaction kept once.
+    fn once_each(efs: Vec<EfTx>) -> Vec<EfTx> {
+        let mut seen = std::collections::HashSet::new();
+        efs.into_iter()
+            .filter(|(txid, _)| seen.insert(txid.clone()))
+            .collect()
+    }
+
+    /// How one BEEF compared: the same batch, the same error, or (only where the BEEF spends
+    /// one outpoint twice) refused where the linking path wrote a batch.
+    #[derive(Debug, PartialEq)]
+    enum Compared {
+        /// The same batch; `true` where a repeated entry was written once.
+        SameBatch(bool),
+        /// The same error, by its kind.
+        SameError(&'static str),
+        Respent,
+    }
+
+    fn error_kind(e: &str) -> &'static str {
+        [
+            "BEEF parse",
+            "txid-only entry",
+            "has no source txid",
+            "not present in BEEF",
+            "Source output index out of bounds",
+            "inconsistent BEEF",
+        ]
+        .into_iter()
+        .find(|k| e.contains(k))
+        .unwrap_or("other")
+    }
+
+    fn compare(beef_hex: &str, double_spends: bool) -> Compared {
+        let oracle = linked_ef_batch(beef_hex);
+        let ours = beef_to_ef_batch(beef_hex);
+        match (oracle, ours) {
+            (Ok((linked, linked_subject)), Ok((efs, subject))) => {
+                assert_eq!(subject, linked_subject, "the subject moved");
+                let repeated = linked.len();
+                assert_eq!(efs, once_each(linked), "the bytes moved");
+                for (txid, ef) in &efs {
+                    assert_eq!(&Transaction::from_ef(ef).expect("EF reparses").id(), txid);
+                }
+                Compared::SameBatch(repeated != efs.len())
+            }
+            (Err(linked), Err(e)) => {
+                assert_eq!(e, linked, "the error moved");
+                Compared::SameError(error_kind(&e))
+            }
+            (Ok(_), Err(e)) => {
+                assert!(
+                    double_spends && e.contains("which the batch already spends"),
+                    "refused a BEEF the linking path converts: {e}"
+                );
+                Compared::Respent
+            }
+            (Err(linked), Ok(_)) => panic!("converted a BEEF the linking path refuses: {linked}"),
+        }
+    }
+
+    /// Every BEEF fixture in the tree that reaches the conversion: the broadcast-body bodies
+    /// (bare and AtomicBEEF), the internalizeAction route fixtures, the production AtomicBEEF
+    /// of the verification tests, the stored-row stubs, and the deep chain's bodies.
+    fn tree_fixtures() -> Vec<(String, String)> {
+        use super::beef_chain;
+        let mut out = Vec::new();
+        for (name, bytes) in [
+            (
+                "example_atomic_payment",
+                &include_bytes!("../../tests/fixtures/broadcast-body/example_atomic_payment.bin")[..],
+            ),
+            (
+                "example",
+                &include_bytes!("../../tests/fixtures/broadcast-body/example.bin")[..],
+            ),
+            (
+                "lone_atomic",
+                &include_bytes!("../../tests/fixtures/broadcast-body/lone_atomic.bin")[..],
+            ),
+            (
+                "lone",
+                &include_bytes!("../../tests/fixtures/broadcast-body/lone.bin")[..],
+            ),
+            (
+                "small_chain_atomic_true",
+                &include_bytes!("../../tests/fixtures/broadcast-body/small_chain_atomic_true.bin")
+                    [..],
+            ),
+            (
+                "small_chain_true",
+                &include_bytes!("../../tests/fixtures/broadcast-body/small_chain_true.bin")[..],
+            ),
+        ] {
+            out.push((format!("broadcast-body/{name}"), to_hex(bytes)));
+        }
+        for (name, json) in [
+            (
+                "35-internalizeAction",
+                include_str!("../../tests/fixtures/routes/35-internalizeAction.json"),
+            ),
+            (
+                "36-internalizeAction-bad-beef",
+                include_str!("../../tests/fixtures/routes/36-internalizeAction-bad-beef.json"),
+            ),
+        ] {
+            let case: serde_json::Value = serde_json::from_str(json).unwrap();
+            let tx = case["request"]["body"]["params"][1]["tx"].as_str().unwrap();
+            out.push((format!("routes/{name}"), tx.to_string()));
+        }
+        let src = include_str!("../storage/beef_verification.rs");
+        let from = src.find("REAL_BEEF_HEX: &str = \"").unwrap() + "REAL_BEEF_HEX: &str = \"".len();
+        let to = from + src[from..].find('"').unwrap();
+        out.push((
+            "beef_verification/REAL_BEEF_HEX".into(),
+            src[from..to].into(),
+        ));
+        out.push(("stored-row stub".into(), "0100beef".into()));
+        for n in [1usize, 2, 3, 10, 100] {
+            for atomic in [false, true] {
+                let mut bytes = Vec::new();
+                let mut source = if atomic {
+                    beef_chain::ChainSource::atomic(n)
+                } else {
+                    beef_chain::ChainSource::new(n)
+                };
+                std::io::Read::read_to_end(&mut source, &mut bytes).unwrap();
+                out.push((format!("beef_chain n={n} atomic={atomic}"), to_hex(&bytes)));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ef_batch_writes_the_linking_paths_bytes_for_every_fixture() {
+        let fixtures = tree_fixtures();
+        let mut batches = 0;
+        for (name, beef_hex) in &fixtures {
+            match compare(beef_hex, false) {
+                Compared::SameBatch(repeated) => {
+                    assert!(!repeated, "{name}");
+                    batches += 1;
+                }
+                Compared::SameError(kind) => println!("fixture {name}: the same error ({kind})"),
+                Compared::Respent => unreachable!("{name}"),
+            }
+        }
+        println!("fixtures: {} ({batches} converted)", fixtures.len());
+        assert_eq!(fixtures.len(), 20);
+        assert_eq!(batches, 18, "the fixtures that convert");
+    }
+
+    /// A deterministic generator (splitmix64), so every graph is reproducible from its seed.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// A script of pushes and plain opcodes (so it round-trips byte for byte), up to about
+    /// `max` bytes; `max` 0 is the empty script.
+    fn script_bytes(rng: &mut Rng, max: usize) -> Vec<u8> {
+        let target = rng.below(max as u64 + 1) as usize;
+        let mut s = Vec::new();
+        while s.len() < target {
+            if rng.chance(30) {
+                const OPS: [u8; 8] = [0x51, 0x52, 0x60, 0x61, 0x76, 0x87, 0xa9, 0xac];
+                s.push(OPS[rng.below(OPS.len() as u64) as usize]);
+            } else {
+                let n = 1 + rng.below(75) as usize;
+                s.push(n as u8);
+                s.extend(rng.bytes(n));
+            }
+        }
+        s
+    }
+
+    /// A graph under construction: its transactions in creation order, which are proven, and
+    /// the outpoints not yet spent.
+    struct Graph {
+        txs: Vec<Transaction>,
+        proven: Vec<bool>,
+        unspent: Vec<(usize, u32)>,
+        double_spends: bool,
+    }
+
+    impl Graph {
+        fn new() -> Self {
+            Graph {
+                txs: Vec::new(),
+                proven: Vec::new(),
+                unspent: Vec::new(),
+                double_spends: false,
+            }
+        }
+
+        /// A transaction spending `spends` (index into `txs`, vout) and paying `outputs`
+        /// outputs with locks up to `lock_max` bytes. An index past `txs` names a txid the
+        /// BEEF does not carry.
+        fn add(
+            &mut self,
+            rng: &mut Rng,
+            spends: &[(usize, u32)],
+            outputs: u32,
+            lock_max: usize,
+            proven: bool,
+        ) -> usize {
+            let mut tx = Transaction::new();
+            tx.version = if rng.chance(80) { 1 } else { 2 };
+            tx.lock_time = if rng.chance(70) { 0 } else { rng.next() as u32 };
+            for &(i, vout) in spends {
+                let source_txid = match self.txs.get(i) {
+                    Some(src) => src.id(),
+                    None => to_hex(&rng.bytes(32)),
+                };
+                tx.inputs.push(TransactionInput {
+                    source_txid: Some(source_txid),
+                    source_output_index: vout,
+                    unlocking_script: Some(
+                        UnlockingScript::from_binary(&script_bytes(rng, 120)).unwrap(),
+                    ),
+                    sequence: if rng.chance(80) {
+                        u32::MAX
+                    } else {
+                        rng.next() as u32
+                    },
+                    ..Default::default()
+                });
+            }
+            for _ in 0..outputs {
+                tx.outputs.push(TransactionOutput::new(
+                    rng.below(5_000_000_000),
+                    LockingScript::from_binary(&script_bytes(rng, lock_max)).unwrap(),
+                ));
+            }
+            let at = self.txs.len();
+            self.unspent.extend((0..outputs).map(|v| (at, v)));
+            self.txs.push(tx);
+            self.proven.push(proven);
+            at
+        }
+
+        /// A proven root of `outputs` outputs, its own source outside the BEEF.
+        fn root(&mut self, rng: &mut Rng, outputs: u32, lock_max: usize) -> usize {
+            self.add(rng, &[(usize::MAX, 0)], outputs, lock_max, true)
+        }
+
+        /// Take `n` unspent outpoints at random.
+        fn take(&mut self, rng: &mut Rng, n: usize) -> Vec<(usize, u32)> {
+            (0..n.min(self.unspent.len()))
+                .map(|_| {
+                    let k = rng.below(self.unspent.len() as u64) as usize;
+                    self.unspent.swap_remove(k)
+                })
+                .collect()
+        }
+
+        /// The BEEF: every transaction merged in a shuffled order, a proven one with its own
+        /// one-leaf BUMP at its own height; `txid_only` entries carry no transaction.
+        fn beef(&self, rng: &mut Rng, txid_only: &[usize]) -> Beef {
+            let mut order: Vec<usize> = (0..self.txs.len()).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            let mut beef = Beef::new();
+            for i in order {
+                let txid = self.txs[i].id();
+                if txid_only.contains(&i) {
+                    beef.merge_txid_only(txid);
+                } else if self.proven[i] {
+                    let bump = MerklePath::new_unchecked(
+                        800_000 + i as u32,
+                        vec![vec![MerklePathLeaf::new_txid(0, txid)]],
+                    )
+                    .unwrap();
+                    let idx = beef.merge_bump(bump);
+                    beef.merge_raw_tx(self.txs[i].to_binary(), Some(idx));
+                } else {
+                    beef.merge_raw_tx(self.txs[i].to_binary(), None);
+                }
+            }
+            beef
+        }
+    }
+
+    /// One generated graph from `seed`: a chain, a fan, a sweep of one parent, or a mixed
+    /// graph of proven and unproven transactions; a quarter carry one fault (a missing
+    /// source, an output index out of bounds, a txid-only parent, an AtomicBEEF frame, a
+    /// double spend, a repeated entry). Returns the BEEF's hex and whether it spends an
+    /// outpoint twice.
+    fn generated(seed: u64) -> (String, bool) {
+        let mut rng = Rng(seed);
+        let mut g = Graph::new();
+        let lock_max = [0usize, 1, 25, 200, 1_500][rng.below(5) as usize];
+        match seed % 4 {
+            0 => {
+                // a chain, some links proven
+                let outs = 1 + rng.below(3) as u32;
+                let mut prev = g.root(&mut rng, outs, lock_max);
+                for _ in 0..1 + rng.below(10) {
+                    let vout = rng.below(g.txs[prev].outputs.len() as u64) as u32;
+                    let proven = rng.chance(15);
+                    let outs = 1 + rng.below(3) as u32;
+                    prev = g.add(&mut rng, &[(prev, vout)], outs, lock_max, proven);
+                }
+            }
+            1 => {
+                // a fan: one parent's outputs each spent by a child, the children swept
+                let n = 1 + rng.below(30) as u32;
+                let parent = if rng.chance(50) {
+                    g.root(&mut rng, n, lock_max)
+                } else {
+                    let root = g.root(&mut rng, 1, lock_max);
+                    g.add(&mut rng, &[(root, 0)], n, lock_max, false)
+                };
+                let children: Vec<usize> = (0..n)
+                    .map(|v| g.add(&mut rng, &[(parent, v)], 1, lock_max, false))
+                    .collect();
+                let swept: Vec<(usize, u32)> = children.iter().map(|&c| (c, 0)).collect();
+                g.add(&mut rng, &swept, 1, lock_max, false);
+            }
+            2 => {
+                // a sweep: many inputs spending one wide parent, proven or not
+                let n = 1 + rng.below(300) as u32;
+                let proven = rng.chance(50);
+                let parent = if proven {
+                    g.root(&mut rng, n, lock_max)
+                } else {
+                    let root = g.root(&mut rng, 1, lock_max);
+                    g.add(&mut rng, &[(root, 0)], n, lock_max, false)
+                };
+                g.unspent.retain(|&(t, _)| t == parent);
+                let k = 1 + rng.below(n as u64) as usize;
+                let spends = g.take(&mut rng, k);
+                let outs = 1 + rng.below(2) as u32;
+                g.add(&mut rng, &spends, outs, lock_max, false);
+            }
+            _ => {
+                // mixed: proven roots, then transactions spending what is unspent
+                for _ in 0..1 + rng.below(3) {
+                    let outs = 1 + rng.below(6) as u32;
+                    g.root(&mut rng, outs, lock_max);
+                }
+                for _ in 0..2 + rng.below(12) {
+                    let k = 1 + rng.below(4) as usize;
+                    let spends = g.take(&mut rng, k);
+                    if spends.is_empty() {
+                        break;
+                    }
+                    let outs = 1 + rng.below(5) as u32;
+                    let proven = rng.chance(20);
+                    g.add(&mut rng, &spends, outs, lock_max, proven);
+                }
+            }
+        }
+
+        let mut txid_only = Vec::new();
+        let mut atomic: Option<String> = None;
+        let mut repeat: Option<usize> = None;
+        if rng.chance(25) {
+            let last = g.txs.len() - 1;
+            match rng.below(7) {
+                0 => {
+                    // an input whose source the BEEF does not carry
+                    g.add(&mut rng, &[(last, 0), (usize::MAX, 0)], 1, lock_max, false);
+                }
+                1 => {
+                    // an output index past the source's outputs
+                    let vout = g.txs[last].outputs.len() as u32 + rng.below(3) as u32;
+                    g.add(&mut rng, &[(last, vout)], 1, lock_max, false);
+                }
+                2 => {
+                    // a parent the BEEF carries as a txid only
+                    let child = g.add(&mut rng, &[(last, 0)], 1, lock_max, false);
+                    let _ = child;
+                    txid_only.push(last);
+                }
+                3 | 4 => {
+                    // an AtomicBEEF frame, naming a random transaction of the graph
+                    let i = rng.below(g.txs.len() as u64) as usize;
+                    atomic = Some(g.txs[i].id());
+                }
+                5 => {
+                    // a second transaction spending an outpoint already spent
+                    let spender = g.txs.iter().rposition(|t| !t.inputs.is_empty());
+                    if let Some(s) = spender.filter(|&s| s > 0 && !g.proven[s]) {
+                        let input = &g.txs[s].inputs[0];
+                        let src = input.source_txid.clone().unwrap();
+                        if let Some(i) = g.txs.iter().position(|t| t.id() == src) {
+                            let vout = input.source_output_index;
+                            g.add(&mut rng, &[(i, vout)], 1, lock_max, false);
+                            g.double_spends = true;
+                        }
+                    }
+                }
+                _ => {
+                    // a transaction carried twice
+                    repeat = Some(rng.below(g.txs.len() as u64) as usize);
+                }
+            }
+        }
+
+        let mut beef = g.beef(&mut rng, &txid_only);
+        if let Some(i) = repeat {
+            let txid = g.txs[i].id();
+            if let Some(entry) = beef.txs.iter().find(|t| t.txid() == txid).cloned() {
+                beef.txs.push(entry);
+            }
+        }
+        let mut bytes = beef.to_binary();
+        if let Some(subject) = atomic {
+            let mut framed = 0x0101_0101u32.to_le_bytes().to_vec();
+            let mut id = bsv_sdk::primitives::from_hex(&subject).unwrap();
+            id.reverse();
+            framed.extend_from_slice(&id);
+            framed.append(&mut bytes);
+            bytes = framed;
+        }
+        (to_hex(&bytes), g.double_spends)
+    }
+
+    #[test]
+    fn ef_batch_writes_the_linking_paths_bytes_for_generated_graphs() {
+        const GRAPHS: u64 = 600;
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for seed in 0..GRAPHS {
+            let (beef_hex, double_spends) = generated(seed);
+            let compared = compare(&beef_hex, double_spends);
+            *counts
+                .entry(match compared {
+                    Compared::SameBatch(false) => "same batch",
+                    Compared::SameBatch(true) => "same batch, a repeated entry once",
+                    Compared::SameError(kind) => kind,
+                    Compared::Respent => "refused: an outpoint spent twice",
+                })
+                .or_default() += 1;
+        }
+        let mut counts: Vec<_> = counts.into_iter().collect();
+        counts.sort();
+        println!("generated graphs: {GRAPHS} {counts:?}");
+        let count = |k: &str| counts.iter().find(|(c, _)| *c == k).map_or(0, |(_, n)| *n);
+        assert!(count("same batch") >= 450, "{counts:?}");
+        for kind in [
+            "same batch, a repeated entry once",
+            "txid-only entry",
+            "not present in BEEF",
+            "Source output index out of bounds",
+            "inconsistent BEEF",
+            "refused: an outpoint spent twice",
+        ] {
+            assert!(count(kind) >= 5, "{kind}: {counts:?}");
+        }
+        assert_eq!(count("other"), 0, "{counts:?}");
+    }
+
+    #[test]
+    fn ef_batch_writes_a_repeated_entry_and_an_outpoint_once() {
+        let mut rng = Rng(7);
+        let mut g = Graph::new();
+        let root = g.root(&mut rng, 3, 25);
+        let parent = g.add(&mut rng, &[(root, 0)], 2, 25, false);
+        let child = g.add(&mut rng, &[(parent, 0), (root, 1)], 1, 25, false);
+        let child_txid = g.txs[child].id();
+
+        // a repeated entry: the linking path wrote it twice, the batch writes it once
+        let mut beef = g.beef(&mut rng, &[]);
+        let entry = beef
+            .txs
+            .iter()
+            .find(|t| t.txid() == child_txid)
+            .cloned()
+            .unwrap();
+        beef.txs.push(entry);
+        let beef_hex = to_hex(&beef.to_binary());
+        let (linked, _) = linked_ef_batch(&beef_hex).unwrap();
+        let (efs, subject) = beef_to_ef_batch(&beef_hex).unwrap();
+        assert_eq!(linked.len(), 3);
+        assert_eq!(efs.len(), 2);
+        assert_eq!(subject, child_txid);
+        assert_eq!(efs, once_each(linked));
+
+        // a second transaction spending root:1: refused, naming it and the outpoint
+        let again = g.add(&mut rng, &[(root, 1)], 1, 25, false);
+        let again_txid = g.txs[again].id();
+        let beef_hex = to_hex(&g.beef(&mut rng, &[]).to_binary());
+        assert!(linked_ef_batch(&beef_hex).is_ok());
+        let err = beef_to_ef_batch(&beef_hex).expect_err("a double spend in the batch");
+        assert!(err.contains("which the batch already spends"), "{err}");
+        assert!(err.contains(&format!("{}:1", g.txs[root].id())), "{err}");
+        assert!(
+            err.contains(&again_txid) || err.contains(&child_txid),
+            "names the spender: {err}"
+        );
+
+        // and any other error the BEEF carries is the one reported, in its own words
+        let missing = g.add(&mut rng, &[(again, 0), (usize::MAX, 0)], 1, 25, false);
+        let _ = missing;
+        let beef_hex = to_hex(&g.beef(&mut rng, &[]).to_binary());
+        let linked = linked_ef_batch(&beef_hex).expect_err("a missing source");
+        assert_eq!(beef_to_ef_batch(&beef_hex).expect_err("the same"), linked);
+        assert!(linked.contains("not present in BEEF"), "{linked}");
+    }
+
+    #[test]
+    fn ef_batch_links_and_clones_no_source() {
+        let src = include_str!("arcade.rs");
+        let production = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(!production.contains(concat!("source_transaction", " = Some(")));
+        assert!(!production.contains(concat!(".to_", "ef()")));
+        assert!(!production.contains(concat!("tx.", "clone()")));
     }
 
     // ── the SSE verdict scanner (synthetic frames — the recorded Arcade wire shape) ──
@@ -1319,3 +2005,8 @@ mod tests {
         );
     }
 }
+
+/// The deep chain's byte source (the tests' own), for the EF fixture pin.
+#[cfg(test)]
+#[path = "../../tests/support/beef_chain.rs"]
+mod beef_chain;

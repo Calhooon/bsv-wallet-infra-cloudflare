@@ -1,7 +1,7 @@
 [package]
 name = "bsv-wallet-infra-cloudflare"
 description = "BSV wallet storage on Cloudflare Workers: JSON-RPC over D1 and R2 behind BRC-31 authentication."
-version = "0.7.0"
+version = "0.7.1"
 license = "MIT"
 edition = "2021"
 repository = "https://github.com/Calhooon/bsv-wallet-infra-cloudflare"
@@ -10,6 +10,7 @@ keywords = ["bitcoin", "bsv", "wallet", "cloudflare", "wasm"]
 categories = ["cryptography::cryptocurrencies"]
 include = [
     "src/**/*.rs",
+    "build.rs",
     "migrations/*.sql",
     "wrangler.toml",
     "README.md",
@@ -39,6 +40,12 @@ js-sys = "0.3"
 hex = "0.4"
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+# The build object GET /healthz serves: the revision, build time and locked versions
+# captured by build.rs.
+bsv-worker-build-info = "=0.4.0"
+
+[build-dependencies]
+bsv-worker-build-info = { version = "=0.4.0", features = ["build"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

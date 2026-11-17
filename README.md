@@ -26,7 +26,7 @@ From the fetch handler in [src/lib.rs](src/lib.rs):
 |---|---|---|
 | `OPTIONS` any path | none | CORS preflight |
 | `GET /` | none | health: `status`, `service`, and the `broadcaster` selected by `BROADCASTER` |
-| `GET /healthz` | none | `{"status":"ok"}`, `Cache-Control: no-store` |
+| `GET /healthz` | none | `{"status":"ok","build":{...}}`, the build object being `lib_rev`, `built_at`, `dirty` and `crates` (the locked versions of bsv-rs, the middleware and this crate); `Cache-Control: no-store` |
 | `GET /robots.txt` | none | `User-agent: *`, `Disallow: /` |
 | `POST /arcade/callback` | `Authorization: Bearer <ARCADE_CALLBACK_TOKEN>`; 404 when the secret is unset | Arcade's status webhook |
 | `GET /monitor/status` | `?key=<MONITOR_TRIGGER_KEY>` | aggregate monitor counts |

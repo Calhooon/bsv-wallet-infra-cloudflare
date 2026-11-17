@@ -3,8 +3,9 @@
 // from wrangler.toml; GET / naming each binding bound or absent; the 429's
 // draft-8 headers), the list budgets, findOrInsertUser bound to the session,
 // migrate without a write, a D1 fault collapsed on the wire, the status route
-// behind the trigger key, healthz and robots.txt. Miniflare with D1, KV, R2
-// and the rate-limit bindings; @bsv/sdk's AuthFetch for the BRC-31 door.
+// behind the trigger key, healthz (with the build object) and robots.txt.
+// Miniflare with D1, KV, R2 and the rate-limit bindings; @bsv/sdk's AuthFetch
+// for the BRC-31 door.
 // Nothing leaves this process. No deploy.
 //
 // worker-build --release   (worker-build ^0.8, the wrangler.toml [build] line)
@@ -140,12 +141,30 @@ print(json.dumps(statements))
     const health = await fetch(new URL('/healthz', base))
     assert.equal(health.status, 200)
     assert.equal(health.headers.get('cache-control'), 'no-store')
-    assert.deepEqual(await health.json(), { status: 'ok' })
+    const { status, build, ...rest } = await health.json()
+    assert.equal(status, 'ok')
+    assert.deepEqual(rest, {})
+    // The build object: the revision, the build time, the dirty flag, and the
+    // versions the lock names (one entry each), this crate's among them.
+    assert.deepEqual(Object.keys(build).sort(), ['built_at', 'crates', 'dirty', 'lib_rev'])
+    assert.match(build.lib_rev, /^([0-9a-f]{40}|unknown)$/)
+    assert.equal(typeof build.dirty, 'boolean')
+    assert.match(build.built_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/)
+    const lock = readFileSync('Cargo.lock', 'utf8')
+    const locked = name => {
+      const found = [...lock.matchAll(new RegExp(`\\[\\[package\\]\\]\\nname = "${name}"\\nversion = "([^"]+)"`, 'g'))]
+      assert.equal(found.length, 1, `the lock names ${name} once`)
+      return found[0][1]
+    }
+    const names = ['bsv-rs', 'bsv-middleware-cloudflare', 'bsv-middleware-core', 'bsv-wallet-infra-cloudflare']
+    assert.deepEqual(build.crates, Object.fromEntries(names.map(n => [n, locked(n)])))
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim()
+    if (head) assert.equal(build.lib_rev, head)
     const robots = await fetch(new URL('/robots.txt', base))
     assert.equal(robots.status, 200)
     assert.match(robots.headers.get('content-type'), /^text\/plain/)
     assert.equal(await robots.text(), 'User-agent: *\nDisallow: /')
-    say('healthz: 200 {"status":"ok"}, no-store; robots.txt: User-agent: * / Disallow: /')
+    say(`healthz: 200 {"status":"ok","build":${JSON.stringify(build)}}, no-store; robots.txt: User-agent: * / Disallow: /`)
   }
 
   // 1b. GET / names each rate-limit binding: bound here, absent on a Worker without them.
