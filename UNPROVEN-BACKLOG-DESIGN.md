@@ -360,7 +360,7 @@ Slowing `*/2 → */3` or `*/5` would reduce but not eliminate the race, at the c
 
 Sampled 5 post-deploy INCOMING x402 payments:
 - 4/5 are now known to WoC (vs 0/5 pre-deploy all orphaned)
-- `96663585163e753e22b80617e4e34efd0f7ceb4e42d5bbfe89e01a65a2a7b57c` logs "broadcast seen on network" — full success path
+- txid `96663585163e753e22b80617e4e34efd0f7ceb4e42d5bbfe89e01a65a2a7b57c` logs "broadcast seen on network" — full success path
 - Incoming `internalizeAction → broadcast_beef` path is confirmed working
 
 ### Surfaced bug — refund signer in `bsv-auth-cloudflare`
