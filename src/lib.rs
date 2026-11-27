@@ -531,6 +531,12 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         return sign_refusal(&too_large, &session);
     }
 
+    // The array-item bound on the raw body (#22): a body whose arrays together
+    // exceed the parse-heap envelope is refused before it is built into a value.
+    if let Err(too_large) = door::bounds::prescan_body(&request_body) {
+        return sign_refusal(&too_large, &session);
+    }
+
     // Parse JSON-RPC request
     let rpc_request: JsonRpcRequest = match serde_json::from_slice(&request_body) {
         Ok(r) => r,
