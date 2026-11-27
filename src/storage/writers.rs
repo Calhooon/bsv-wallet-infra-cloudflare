@@ -11,6 +11,83 @@ use serde::Deserialize;
 use super::StorageD1;
 
 // =============================================================================
+// Find-or-create rows: one row to a name
+// =============================================================================
+//
+// A basket, a label and a tag are found by name or created. Each insert
+// carries the predicate of the read before it, inside the statement: it
+// writes the row only when that read would still find none. A map row is
+// inserted under its table's own unique key. An insert that writes nothing
+// (`changes == 0`) says the row stands, and the row is read and used. So a
+// name has one row and each caller is served, in whatever order the
+// statements of several calls reach the database. The consts live at module
+// scope so the rusqlite harness below runs the REAL SQL against the REAL
+// migrations.
+
+/// Binds: user_id.
+const FIND_DEFAULT_BASKET_SQL: &str =
+    "SELECT * FROM output_baskets WHERE user_id = ? AND name = 'default' AND is_deleted = 0";
+
+/// Binds: user_id, created_at, updated_at, then the predicate's user_id.
+const INSERT_DEFAULT_BASKET_SQL: &str = "INSERT INTO output_baskets \
+     (user_id, name, number_of_desired_utxos, minimum_desired_utxo_value, created_at, updated_at) \
+     SELECT ?, 'default', 6, 10000, ?, ? \
+     WHERE NOT EXISTS (SELECT 1 FROM output_baskets \
+     WHERE user_id = ? AND name = 'default' AND is_deleted = 0)";
+
+/// Binds: user_id, name.
+const FIND_BASKET_SQL: &str =
+    "SELECT * FROM output_baskets WHERE user_id = ? AND name = ? AND is_deleted = 0";
+
+/// Binds: user_id, name, created_at, updated_at, then the predicate's
+/// user_id, name.
+const INSERT_BASKET_SQL: &str = "INSERT INTO output_baskets \
+     (user_id, name, number_of_desired_utxos, minimum_desired_utxo_value, created_at, updated_at) \
+     SELECT ?, ?, 6, 10000, ?, ? \
+     WHERE NOT EXISTS (SELECT 1 FROM output_baskets \
+     WHERE user_id = ? AND name = ? AND is_deleted = 0)";
+
+/// Binds: user_id, label.
+const FIND_LABEL_SQL: &str =
+    "SELECT tx_label_id FROM tx_labels WHERE user_id = ? AND label = ? AND is_deleted = 0";
+
+/// Binds: user_id, label, created_at, updated_at, then the predicate's
+/// user_id, label.
+const INSERT_LABEL_SQL: &str = "INSERT INTO tx_labels (user_id, label, created_at, updated_at) \
+     SELECT ?, ?, ?, ? \
+     WHERE NOT EXISTS (SELECT 1 FROM tx_labels \
+     WHERE user_id = ? AND label = ? AND is_deleted = 0)";
+
+/// Binds: transaction_id, tx_label_id, created_at, updated_at.
+const INSERT_LABEL_MAP_SQL: &str = "INSERT INTO tx_labels_map \
+     (transaction_id, tx_label_id, created_at, updated_at) VALUES (?, ?, ?, ?) \
+     ON CONFLICT(tx_label_id, transaction_id) DO NOTHING";
+
+/// Binds: user_id, tag.
+const FIND_TAG_SQL: &str =
+    "SELECT output_tag_id FROM output_tags WHERE user_id = ? AND tag = ? AND is_deleted = 0";
+
+/// Binds: user_id, tag, created_at, updated_at, then the predicate's
+/// user_id, tag.
+const INSERT_TAG_SQL: &str = "INSERT INTO output_tags (user_id, tag, created_at, updated_at) \
+     SELECT ?, ?, ?, ? \
+     WHERE NOT EXISTS (SELECT 1 FROM output_tags \
+     WHERE user_id = ? AND tag = ? AND is_deleted = 0)";
+
+/// Binds: output_id, output_tag_id, created_at, updated_at.
+const INSERT_TAG_MAP_SQL: &str = "INSERT INTO output_tags_map \
+     (output_id, output_tag_id, created_at, updated_at) VALUES (?, ?, ?, ?) \
+     ON CONFLICT(output_tag_id, output_id) DO NOTHING";
+
+/// The fault of a row that an insert said stands and the read after it does
+/// not return.
+fn not_readable(what: &str) -> Error {
+    Error::InternalError(format!(
+        "{what}: the row its insert found standing is not read"
+    ))
+}
+
+// =============================================================================
 // D1 row types (for serde_wasm_bindgen deserialization)
 // =============================================================================
 
@@ -252,27 +329,35 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
     /// Find or create the "default" output basket for a user.
     pub async fn find_or_create_default_basket(&self, user_id: i64) -> Result<TableOutputBasket> {
-        let existing: Option<BasketRow> = Query::new(
-            "SELECT * FROM output_baskets WHERE user_id = ? AND name = 'default' AND is_deleted = 0",
-        )
-        .bind(user_id)
-        .fetch_optional(self.db)
-        .await?;
+        let existing: Option<BasketRow> = Query::new(FIND_DEFAULT_BASKET_SQL)
+            .bind(user_id)
+            .fetch_optional(self.db)
+            .await?;
 
         if let Some(row) = existing {
             return Ok(row.into_table());
         }
 
-        // Create default basket
+        // Create default basket: written only when the read above would
+        // still find none.
         let now = Utc::now();
-        let meta = Query::new(
-            "INSERT INTO output_baskets (user_id, name, number_of_desired_utxos, minimum_desired_utxo_value, created_at, updated_at) VALUES (?, 'default', 6, 10000, ?, ?)",
-        )
-        .bind(user_id)
-        .bind(now)
-        .bind(now)
-        .execute(self.db)
-        .await?;
+        let meta = Query::new(INSERT_DEFAULT_BASKET_SQL)
+            .bind(user_id)
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .execute(self.db)
+            .await?;
+
+        if meta.changes == 0 {
+            // The basket stands: it is the one.
+            let row: BasketRow = Query::new(FIND_DEFAULT_BASKET_SQL)
+                .bind(user_id)
+                .fetch_optional(self.db)
+                .await?
+                .ok_or_else(|| not_readable("default basket"))?;
+            return Ok(row.into_table());
+        }
 
         Ok(TableOutputBasket {
             basket_id: meta.last_row_id,
@@ -287,28 +372,38 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
     /// Get or create a named basket for a user.
     pub async fn get_or_create_basket(&self, user_id: i64, name: &str) -> Result<i64> {
-        let existing: Option<BasketRow> = Query::new(
-            "SELECT * FROM output_baskets WHERE user_id = ? AND name = ? AND is_deleted = 0",
-        )
-        .bind(user_id)
-        .bind(name)
-        .fetch_optional(self.db)
-        .await?;
+        let existing: Option<BasketRow> = Query::new(FIND_BASKET_SQL)
+            .bind(user_id)
+            .bind(name)
+            .fetch_optional(self.db)
+            .await?;
 
         if let Some(row) = existing {
             return Ok(row.basket_id.map(|v| v as i64).unwrap_or(0));
         }
 
+        // Written only when the read above would still find none.
         let now = Utc::now();
-        let meta = Query::new(
-            "INSERT INTO output_baskets (user_id, name, number_of_desired_utxos, minimum_desired_utxo_value, created_at, updated_at) VALUES (?, ?, 6, 10000, ?, ?)",
-        )
-        .bind(user_id)
-        .bind(name)
-        .bind(now)
-        .bind(now)
-        .execute(self.db)
-        .await?;
+        let meta = Query::new(INSERT_BASKET_SQL)
+            .bind(user_id)
+            .bind(name)
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .bind(name)
+            .execute(self.db)
+            .await?;
+
+        if meta.changes == 0 {
+            // The basket stands: it is the one.
+            let row: BasketRow = Query::new(FIND_BASKET_SQL)
+                .bind(user_id)
+                .bind(name)
+                .fetch_optional(self.db)
+                .await?
+                .ok_or_else(|| not_readable("basket"))?;
+            return Ok(row.basket_id.map(|v| v as i64).unwrap_or(0));
+        }
 
         Ok(meta.last_row_id)
     }
@@ -323,27 +418,37 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             tx_label_id: Option<f64>,
         }
 
-        let existing: Option<LabelIdRow> = Query::new(
-            "SELECT tx_label_id FROM tx_labels WHERE user_id = ? AND label = ? AND is_deleted = 0",
-        )
-        .bind(user_id)
-        .bind(label)
-        .fetch_optional(self.db)
-        .await?;
+        let existing: Option<LabelIdRow> = Query::new(FIND_LABEL_SQL)
+            .bind(user_id)
+            .bind(label)
+            .fetch_optional(self.db)
+            .await?;
 
         let label_id = if let Some(row) = existing {
             row.tx_label_id.map(|v| v as i64).unwrap_or(0)
         } else {
-            let meta = Query::new(
-                "INSERT INTO tx_labels (user_id, label, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            )
-            .bind(user_id)
-            .bind(label)
-            .bind(now)
-            .bind(now)
-            .execute(self.db)
-            .await?;
-            meta.last_row_id
+            // Written only when the read above would still find none.
+            let meta = Query::new(INSERT_LABEL_SQL)
+                .bind(user_id)
+                .bind(label)
+                .bind(now)
+                .bind(now)
+                .bind(user_id)
+                .bind(label)
+                .execute(self.db)
+                .await?;
+            if meta.changes > 0 {
+                meta.last_row_id
+            } else {
+                // The label stands: it is the one.
+                let row: LabelIdRow = Query::new(FIND_LABEL_SQL)
+                    .bind(user_id)
+                    .bind(label)
+                    .fetch_optional(self.db)
+                    .await?
+                    .ok_or_else(|| not_readable("label"))?;
+                row.tx_label_id.map(|v| v as i64).unwrap_or(0)
+            }
         };
 
         // Check if mapping exists
@@ -356,15 +461,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         .await?;
 
         if existing_map.is_none() {
-            Query::new(
-                "INSERT INTO tx_labels_map (transaction_id, tx_label_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            )
-            .bind(transaction_id)
-            .bind(label_id)
-            .bind(now)
-            .bind(now)
-            .execute(self.db)
-            .await?;
+            // One map row to (label, transaction): a row that stands is kept.
+            Query::new(INSERT_LABEL_MAP_SQL)
+                .bind(transaction_id)
+                .bind(label_id)
+                .bind(now)
+                .bind(now)
+                .execute(self.db)
+                .await?;
         }
 
         Ok(())
@@ -379,27 +483,37 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             output_tag_id: Option<f64>,
         }
 
-        let existing: Option<TagIdRow> = Query::new(
-            "SELECT output_tag_id FROM output_tags WHERE user_id = ? AND tag = ? AND is_deleted = 0",
-        )
-        .bind(user_id)
-        .bind(tag)
-        .fetch_optional(self.db)
-        .await?;
+        let existing: Option<TagIdRow> = Query::new(FIND_TAG_SQL)
+            .bind(user_id)
+            .bind(tag)
+            .fetch_optional(self.db)
+            .await?;
 
         let tag_id = if let Some(row) = existing {
             row.output_tag_id.map(|v| v as i64).unwrap_or(0)
         } else {
-            let meta = Query::new(
-                "INSERT INTO output_tags (user_id, tag, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            )
-            .bind(user_id)
-            .bind(tag)
-            .bind(now)
-            .bind(now)
-            .execute(self.db)
-            .await?;
-            meta.last_row_id
+            // Written only when the read above would still find none.
+            let meta = Query::new(INSERT_TAG_SQL)
+                .bind(user_id)
+                .bind(tag)
+                .bind(now)
+                .bind(now)
+                .bind(user_id)
+                .bind(tag)
+                .execute(self.db)
+                .await?;
+            if meta.changes > 0 {
+                meta.last_row_id
+            } else {
+                // The tag stands: it is the one.
+                let row: TagIdRow = Query::new(FIND_TAG_SQL)
+                    .bind(user_id)
+                    .bind(tag)
+                    .fetch_optional(self.db)
+                    .await?
+                    .ok_or_else(|| not_readable("tag"))?;
+                row.output_tag_id.map(|v| v as i64).unwrap_or(0)
+            }
         };
 
         // Check if mapping exists
@@ -418,15 +532,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         .await?;
 
         if existing_map.is_none() {
-            Query::new(
-                "INSERT INTO output_tags_map (output_id, output_tag_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            )
-            .bind(output_id)
-            .bind(tag_id)
-            .bind(now)
-            .bind(now)
-            .execute(self.db)
-            .await?;
+            // One map row to (tag, output): a row that stands is kept.
+            Query::new(INSERT_TAG_MAP_SQL)
+                .bind(output_id)
+                .bind(tag_id)
+                .bind(now)
+                .bind(now)
+                .execute(self.db)
+                .await?;
         }
 
         Ok(())
@@ -781,5 +894,125 @@ mod tests {
         let min_value = 10000i64;
         assert_eq!(desired_utxos, 6);
         assert_eq!(min_value, 10000);
+    }
+
+    // =========================================================================
+    // Find-or-create rows: real-SQLite harness. The ACTUAL migrations and the
+    // ACTUAL SQL consts against an in-memory DB (D1 is SQLite).
+    // =========================================================================
+
+    fn names_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for migration in [
+            include_str!("../../migrations/0001_initial.sql"),
+            include_str!("../../migrations/0002_add_indexes.sql"),
+            include_str!("../../migrations/0003_add_output_reservations.sql"),
+            include_str!("../../migrations/0004_proven_txs_height_pair_index.sql"),
+        ] {
+            conn.execute_batch(migration).unwrap();
+        }
+        // D1 enforces foreign keys.
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            INSERT INTO users (user_id, identity_key) VALUES (1, '02aa'), (2, '02bb');
+            INSERT INTO transactions (transaction_id, user_id, status, reference, is_outgoing, description, txid)
+            VALUES (5, 1, 'unproven', 'r5', 0, 'fixture', 'ee01');
+            INSERT INTO outputs (output_id, user_id, transaction_id, spendable, change, vout, satoshis,
+                                 provided_by, purpose, type, txid)
+            VALUES (7, 1, 5, 1, 0, 0, 1000, 'storage', 'receive', 'custom', 'ee01');
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn find_or_create_inserts_carry_their_reads_predicate() {
+        // Each insert's condition is the predicate of the read before it,
+        // word for word.
+        for (find, insert) in [
+            (FIND_DEFAULT_BASKET_SQL, INSERT_DEFAULT_BASKET_SQL),
+            (FIND_BASKET_SQL, INSERT_BASKET_SQL),
+            (FIND_LABEL_SQL, INSERT_LABEL_SQL),
+            (FIND_TAG_SQL, INSERT_TAG_SQL),
+        ] {
+            let (table, predicate) = find
+                .split_once(" FROM ")
+                .and_then(|(_, from)| from.split_once(" WHERE "))
+                .unwrap();
+            assert!(
+                insert.ends_with(&format!(
+                    "WHERE NOT EXISTS (SELECT 1 FROM {table} WHERE {predicate})"
+                )),
+                "{insert}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_or_create_one_row_to_a_name() {
+        // An insert writes its row once; the same insert again writes
+        // nothing and raises nothing, and the read gives the first row.
+        // Another user's row of the same name is not held back.
+        let conn = names_db();
+        let run = |sql: &str, params: &[&dyn rusqlite::ToSql]| conn.execute(sql, params).unwrap();
+        let id = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> i64 {
+            conn.query_row(sql, params, |r| r.get(0)).unwrap()
+        };
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+
+        assert_eq!(run(INSERT_DEFAULT_BASKET_SQL, &[&1, &"t", &"t", &1]), 1);
+        let default = id(FIND_DEFAULT_BASKET_SQL, &[&1]);
+        assert_eq!(run(INSERT_DEFAULT_BASKET_SQL, &[&1, &"t", &"t", &1]), 0);
+        assert_eq!(id(FIND_DEFAULT_BASKET_SQL, &[&1]), default);
+        assert_eq!(run(INSERT_DEFAULT_BASKET_SQL, &[&2, &"t", &"t", &2]), 1);
+
+        assert_eq!(
+            run(INSERT_BASKET_SQL, &[&1, &"fee", &"t", &"t", &1, &"fee"]),
+            1
+        );
+        let fee = id(FIND_BASKET_SQL, &[&1, &"fee"]);
+        assert_eq!(
+            run(INSERT_BASKET_SQL, &[&1, &"fee", &"t", &"t", &1, &"fee"]),
+            0
+        );
+        assert_eq!(id(FIND_BASKET_SQL, &[&1, &"fee"]), fee);
+        assert_eq!(
+            run(INSERT_BASKET_SQL, &[&2, &"fee", &"t", &"t", &2, &"fee"]),
+            1
+        );
+        assert_eq!(count("output_baskets"), 4);
+
+        assert_eq!(
+            run(INSERT_LABEL_SQL, &[&1, &"paid", &"t", &"t", &1, &"paid"]),
+            1
+        );
+        let label = id(FIND_LABEL_SQL, &[&1, &"paid"]);
+        assert_eq!(
+            run(INSERT_LABEL_SQL, &[&1, &"paid", &"t", &"t", &1, &"paid"]),
+            0
+        );
+        assert_eq!(id(FIND_LABEL_SQL, &[&1, &"paid"]), label);
+        assert_eq!(run(INSERT_LABEL_MAP_SQL, &[&5, &label, &"t", &"t"]), 1);
+        assert_eq!(run(INSERT_LABEL_MAP_SQL, &[&5, &label, &"t", &"t"]), 0);
+        assert_eq!((count("tx_labels"), count("tx_labels_map")), (1, 1));
+
+        assert_eq!(
+            run(INSERT_TAG_SQL, &[&1, &"seat", &"t", &"t", &1, &"seat"]),
+            1
+        );
+        let tag = id(FIND_TAG_SQL, &[&1, &"seat"]);
+        assert_eq!(
+            run(INSERT_TAG_SQL, &[&1, &"seat", &"t", &"t", &1, &"seat"]),
+            0
+        );
+        assert_eq!(id(FIND_TAG_SQL, &[&1, &"seat"]), tag);
+        assert_eq!(run(INSERT_TAG_MAP_SQL, &[&7, &tag, &"t", &"t"]), 1);
+        assert_eq!(run(INSERT_TAG_MAP_SQL, &[&7, &tag, &"t", &"t"]), 0);
+        assert_eq!((count("output_tags"), count("output_tags_map")), (1, 1));
     }
 }

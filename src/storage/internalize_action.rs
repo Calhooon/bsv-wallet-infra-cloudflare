@@ -98,6 +98,111 @@ const INTERNALIZE_RESTORE_SPENDABLE_SQL: &str = "UPDATE outputs \
      SET spendable = 1, updated_at = ? \
      WHERE output_id = ? AND spent_by IS NULL AND basket_id IS NOT NULL";
 
+// =============================================================================
+// One row per payment: the subject's rows are written by guarded inserts
+// =============================================================================
+//
+// D1 runs a statement whole, and a call's statements are separate, so calls
+// for one transaction meet at the statement. Each insert of the subject's
+// rows therefore carries its own condition: the transactions row is inserted
+// only when the read that decides "new" or "merge" would still find none
+// (the same predicate, inside the statement), and an outputs row or a proof
+// request only when the table's own unique key is free. An insert that
+// writes nothing (`changes == 0`) says a row stands, and the call goes on as
+// the merge it is. So a user holds ONE transactions row for an internalized
+// txid and ONE outputs row for an outpoint, in whatever order the statements
+// of several calls reach the database, and each of those calls is answered
+// as accepted. A call names each output index once (step 4), so an outputs
+// row it finds standing is never one it wrote itself. The consts live at
+// module scope so the rusqlite harness below runs the REAL SQL against the
+// REAL migrations.
+
+/// The reference's message for a call whose `outputs` name one output index
+/// more than once: `WERR_INVALID_PARAMETER` of `outputs`, "unique outputIndex
+/// values" (`internalizeActionCore.ts:445`, the text of `WERR_errors.ts:105`).
+/// Answered as every refusal of that class is here: a `ValidationError`,
+/// `-32602` on the wire.
+const UNIQUE_OUTPUT_INDEX_TEXT: &str = "The outputs parameter must be unique outputIndex values";
+
+/// A call names each output index once. One named more than once, under
+/// whichever protocols and whatever the storage holds, is refused where the
+/// specifications are read (step 4): before a row of the transaction, of an
+/// output or of a proof request is written, and before anything is announced.
+fn require_unique_output_indexes(indexes: impl IntoIterator<Item = u32>) -> Result<()> {
+    let mut named = std::collections::HashSet::new();
+    for index in indexes {
+        if !named.insert(index) {
+            return Err(Error::ValidationError(UNIQUE_OUTPUT_INDEX_TEXT.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// The user's row for the subject txid, if one stands: the read that decides
+/// "new" or "merge".
+/// Binds: user_id, txid.
+const INTERNALIZE_FIND_TX_SQL: &str = "SELECT transaction_id, user_id, txid, status, reference, \
+        description, satoshis, version, lock_time, is_outgoing, created_at, updated_at \
+     FROM transactions WHERE user_id = ? AND txid = ?";
+
+/// The subject's transactions row, inserted only when the read above would
+/// still find none: its predicate, word for word, inside the statement.
+/// `changes == 0` means a row stands and the call is a merge onto it.
+/// raw_tx and input_beef follow by a second statement (the blob store needs
+/// the row's id).
+/// Binds: user_id, txid, status, reference, description, satoshis, version,
+/// lock_time, created_at, updated_at, then the predicate's user_id, txid.
+const INTERNALIZE_INSERT_TX_SQL: &str = "INSERT INTO transactions ( \
+        user_id, txid, status, reference, description, satoshis, \
+        version, lock_time, raw_tx, input_beef, is_outgoing, created_at, updated_at \
+     ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ? \
+     WHERE NOT EXISTS (SELECT 1 FROM transactions WHERE user_id = ? AND txid = ?)";
+
+/// The user's rows for the subject's outputs: what a merge reads to find the
+/// row that stands for an output index.
+/// Binds: user_id, txid.
+const INTERNALIZE_EXISTING_OUTPUTS_SQL: &str = "SELECT output_id, user_id, transaction_id, \
+        basket_id, txid, vout, satoshis, script_length, script_offset, type, provided_by, \
+        purpose, spendable, change, derivation_prefix, derivation_suffix, \
+        sender_identity_key, custom_instructions, created_at, updated_at \
+     FROM outputs WHERE user_id = ? AND txid = ?";
+
+/// A wallet payment's outputs row. The schema holds one row to
+/// (transaction_id, vout, user_id); when one stands the statement writes
+/// nothing (`changes == 0`) and the output is merged onto that row. The
+/// script follows by a second statement (the blob store needs the row's id).
+/// Binds: user_id, transaction_id, basket_id, txid, vout, satoshis,
+/// script_length, derivation_prefix, derivation_suffix, sender_identity_key,
+/// created_at, updated_at.
+const INTERNALIZE_INSERT_PAYMENT_OUTPUT_SQL: &str = "INSERT INTO outputs ( \
+        user_id, transaction_id, basket_id, txid, vout, satoshis, \
+        locking_script, script_length, type, spendable, change, \
+        derivation_prefix, derivation_suffix, sender_identity_key, \
+        provided_by, purpose, created_at, updated_at \
+     ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'P2PKH', 1, 1, ?, ?, ?, 'storage', 'receive', ?, ?) \
+     ON CONFLICT(transaction_id, vout, user_id) DO NOTHING";
+
+/// A basket insertion's outputs row, under the same key and the same rule.
+/// Binds: user_id, transaction_id, basket_id, txid, vout, satoshis,
+/// script_length, custom_instructions, created_at, updated_at.
+const INTERNALIZE_INSERT_BASKET_OUTPUT_SQL: &str = "INSERT INTO outputs ( \
+        user_id, transaction_id, basket_id, txid, vout, satoshis, \
+        locking_script, script_length, type, spendable, change, \
+        custom_instructions, provided_by, purpose, created_at, updated_at \
+     ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'custom', 1, 0, ?, 'storage', 'receive', ?, ?) \
+     ON CONFLICT(transaction_id, vout, user_id) DO NOTHING";
+
+/// The subject's proof request. `proven_tx_reqs.txid` is unique: when a
+/// request stands (another writer's) the statement writes nothing
+/// (`changes == 0`) and that request serves this call too. input_beef
+/// follows by a second statement (the blob store needs the row's id).
+/// Binds: txid, status, raw_tx, created_at, updated_at.
+const INTERNALIZE_INSERT_REQ_SQL: &str = "INSERT INTO proven_tx_reqs ( \
+        txid, status, attempts, history, notify, notified, raw_tx, input_beef, \
+        created_at, updated_at \
+     ) VALUES (?, ?, 0, '{}', '{}', 0, ?, NULL, ?, ?) \
+     ON CONFLICT(txid) DO NOTHING";
+
 /// What an internalize broadcast left for the caller.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PostOutcome {
@@ -286,6 +391,13 @@ struct OutputData {
     existing_is_change: bool,
 }
 
+impl OutputData {
+    /// The row that stands for this output is change in `basket_id`.
+    fn is_change_in(&self, basket_id: i64) -> bool {
+        self.existing_basket_id == Some(basket_id) && self.existing_is_change
+    }
+}
+
 /// The inline door's parse of a caller's AtomicBEEF: measured before it is
 /// parsed (`crate::door::beef_measure`), so a BEEF whose parse would pass the
 /// budget is refused as too large; one the measure cannot read meets the
@@ -374,7 +486,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         };
         drop(beef);
 
-        self.internalize_subject(user_id, &args, subject, BeefBlob::Inline(&args.tx))
+        self.internalize_subject(user_id, &args, subject, BeefBlob::Inline(&args.tx), false)
             .await
     }
 
@@ -423,7 +535,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             // inline way.
             let bytes = crate::beef_at_rest::read_small(store, &reference, caller).await?;
             return self
-                .internalize_subject(user_id, &args, subject, BeefBlob::Inline(&bytes))
+                .internalize_subject(user_id, &args, subject, BeefBlob::Inline(&bytes), false)
                 .await;
         }
         self.internalize_subject(
@@ -435,18 +547,23 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 reference: &reference,
                 caller,
             },
+            false,
         )
         .await
     }
 
     /// Steps 2 to 10 of internalizeAction: the subject, verified, into the
     /// user's storage; `beef` is where the whole BEEF is (inline or at rest).
+    /// `again` is set on the one pass a call makes after its insert of the
+    /// transactions row wrote nothing (step 7): that pass reads the row that
+    /// stands and is the merge.
     async fn internalize_subject(
         &self,
         user_id: i64,
         args: &InternalizeActionArgs,
         subject: Subject,
         beef: BeefBlob<'_>,
+        again: bool,
     ) -> Result<StorageInternalizeActionResult> {
         let Subject {
             txid,
@@ -524,6 +641,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             });
         }
 
+        // Each output index is named once. Asked when every specification
+        // has passed its own refusals above (an index out of range, a
+        // missing remittance, an unknown protocol), which are answered first.
+        require_unique_output_indexes(outputs_data.iter().map(|od| od.vout))?;
+
         // Step 5: If merging, load existing outputs
         if is_merge {
             let existing_outputs = self.load_existing_outputs(user_id, &txid).await?;
@@ -536,7 +658,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             }
         }
 
-        // Step 6: Calculate satoshi changes
+        // Step 6: Calculate satoshi changes (from what step 5 read; step 9
+        // corrects the sum for an output whose row another call wrote since)
         let mut net_satoshis: i64 = 0;
 
         for od in &outputs_data {
@@ -622,24 +745,48 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             // 1 MB row limit.
             let reference = generate_uuid();
 
-            let meta = Query::new(
-                r#"INSERT INTO transactions (
-                    user_id, txid, status, reference, description, satoshis,
-                    version, lock_time, raw_tx, input_beef, is_outgoing, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?)"#,
-            )
-            .bind(user_id)
-            .bind(txid.as_str())
-            .bind(status)
-            .bind(reference.as_str())
-            .bind(args.description.as_str())
-            .bind(net_satoshis)
-            .bind(tx_version as i64)
-            .bind(tx_lock_time as i64)
-            .bind(now)
-            .bind(now)
-            .execute(self.db)
-            .await?;
+            // The insert carries the step-3 read's predicate: it writes the
+            // row only when that read would still find none.
+            let meta = Query::new(INTERNALIZE_INSERT_TX_SQL)
+                .bind(user_id)
+                .bind(txid.as_str())
+                .bind(status)
+                .bind(reference.as_str())
+                .bind(args.description.as_str())
+                .bind(net_satoshis)
+                .bind(tx_version as i64)
+                .bind(tx_lock_time as i64)
+                .bind(now)
+                .bind(now)
+                .bind(user_id)
+                .bind(txid.as_str())
+                .execute(self.db)
+                .await?;
+            if meta.changes == 0 {
+                // A row for this user and txid stands, so this call is a
+                // merge onto it. Nothing of the subject has been written by
+                // this call yet: it starts again at the read, once, and
+                // takes the merge path a call arriving later takes.
+                if again {
+                    return Err(Error::InternalError(format!(
+                        "internalize: no transactions row could be read or inserted for {txid}"
+                    )));
+                }
+                worker::console_log!(
+                    "internalize: a transactions row for {} stands; this call merges onto it",
+                    txid
+                );
+                let subject = Subject {
+                    txid,
+                    raw_tx,
+                    version: tx_version,
+                    lock_time: tx_lock_time,
+                    outputs: extracted_outputs,
+                    has_proof,
+                };
+                return Box::pin(self.internalize_subject(user_id, args, subject, beef, true))
+                    .await;
+            }
             let new_tx_id = meta.last_row_id;
 
             let store = crate::r2::BlobStore::new(self.blobs);
@@ -693,7 +840,12 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         // the monitor) must be visible in the result.
         let mut outputs_demoted = false;
 
-        for od in &outputs_data {
+        // Each output is taken from a queue. An output whose insert writes
+        // nothing (the schema holds one row to (transaction_id, vout,
+        // user_id), and one stands) goes back to the front carrying that
+        // row, and is merged onto it as an output step 5 had read.
+        let mut queue: std::collections::VecDeque<OutputData> = outputs_data.into();
+        while let Some(od) = queue.pop_front() {
             match od.protocol.as_str() {
                 WALLET_PAYMENT_PROTOCOL => {
                     let payment = od.payment.as_ref().ok_or(Error::ValidationError(
@@ -759,28 +911,36 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         // Two-phase INSERT for locking_script: output_id is PK
                         // autoincrement, so we reserve the row with NULL script
                         // first, then route the script through BlobStore.
-                        let out_meta = Query::new(
-                            r#"INSERT INTO outputs (
-                                user_id, transaction_id, basket_id, txid, vout, satoshis,
-                                locking_script, script_length, type, spendable, change,
-                                derivation_prefix, derivation_suffix, sender_identity_key,
-                                provided_by, purpose, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'P2PKH', 1, 1, ?, ?, ?, 'storage', 'receive', ?, ?)"#,
-                        )
-                        .bind(user_id)
-                        .bind(transaction_id)
-                        .bind(change_basket_id)
-                        .bind(txid.as_str())
-                        .bind(od.vout as i64)
-                        .bind(od.satoshis as i64)
-                        .bind(od.locking_script.len() as i64)
-                        .bind(payment.derivation_prefix.as_str())
-                        .bind(payment.derivation_suffix.as_str())
-                        .bind(payment.sender_identity_key.as_str())
-                        .bind(now)
-                        .bind(now)
-                        .execute(self.db)
-                        .await?;
+                        let out_meta = Query::new(INTERNALIZE_INSERT_PAYMENT_OUTPUT_SQL)
+                            .bind(user_id)
+                            .bind(transaction_id)
+                            .bind(change_basket_id)
+                            .bind(txid.as_str())
+                            .bind(od.vout as i64)
+                            .bind(od.satoshis as i64)
+                            .bind(od.locking_script.len() as i64)
+                            .bind(payment.derivation_prefix.as_str())
+                            .bind(payment.derivation_suffix.as_str())
+                            .bind(payment.sender_identity_key.as_str())
+                            .bind(now)
+                            .bind(now)
+                            .execute(self.db)
+                            .await?;
+                        if out_meta.changes == 0 {
+                            worker::console_log!(
+                                "internalize: an outputs row for {}:{} stands; the output merges onto it",
+                                txid,
+                                od.vout
+                            );
+                            let standing = self
+                                .standing_output(user_id, &txid, transaction_id, od)
+                                .await?;
+                            if standing.is_change_in(change_basket_id) {
+                                net_satoshis -= standing.satoshis as i64;
+                            }
+                            queue.push_front(standing);
+                            continue;
+                        }
                         let new_out_id = out_meta.last_row_id;
                         let store = crate::r2::BlobStore::new(self.blobs);
                         let (script_d1, _) = store
@@ -851,25 +1011,34 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     } else {
                         // Two-phase: basket-insertion custom scripts can be
                         // arbitrarily large (non-P2PKH). Reserve PK, then R2.
-                        let meta = Query::new(
-                            r#"INSERT INTO outputs (
-                                user_id, transaction_id, basket_id, txid, vout, satoshis,
-                                locking_script, script_length, type, spendable, change,
-                                custom_instructions, provided_by, purpose, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'custom', 1, 0, ?, 'storage', 'receive', ?, ?)"#,
-                        )
-                        .bind(user_id)
-                        .bind(transaction_id)
-                        .bind(basket_id)
-                        .bind(txid.as_str())
-                        .bind(od.vout as i64)
-                        .bind(od.satoshis as i64)
-                        .bind(od.locking_script.len() as i64)
-                        .bind(insertion.custom_instructions.as_deref())
-                        .bind(now)
-                        .bind(now)
-                        .execute(self.db)
-                        .await?;
+                        let meta = Query::new(INTERNALIZE_INSERT_BASKET_OUTPUT_SQL)
+                            .bind(user_id)
+                            .bind(transaction_id)
+                            .bind(basket_id)
+                            .bind(txid.as_str())
+                            .bind(od.vout as i64)
+                            .bind(od.satoshis as i64)
+                            .bind(od.locking_script.len() as i64)
+                            .bind(insertion.custom_instructions.as_deref())
+                            .bind(now)
+                            .bind(now)
+                            .execute(self.db)
+                            .await?;
+                        if meta.changes == 0 {
+                            worker::console_log!(
+                                "internalize: an outputs row for {}:{} stands; the output merges onto it",
+                                txid,
+                                od.vout
+                            );
+                            let standing = self
+                                .standing_output(user_id, &txid, transaction_id, od)
+                                .await?;
+                            if standing.is_change_in(change_basket_id) {
+                                net_satoshis -= standing.satoshis as i64;
+                            }
+                            queue.push_front(standing);
+                            continue;
+                        }
 
                         let output_id = meta.last_row_id;
                         let store = crate::r2::BlobStore::new(self.blobs);
@@ -1071,33 +1240,51 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         user_id: i64,
         txid: &str,
     ) -> Result<Option<TableTransaction>> {
-        let row: Option<TransactionRow> = Query::new(
-            r#"SELECT transaction_id, user_id, txid, status, reference, description,
-                      satoshis, version, lock_time, is_outgoing, created_at, updated_at
-               FROM transactions WHERE user_id = ? AND txid = ?"#,
-        )
-        .bind(user_id)
-        .bind(txid)
-        .fetch_optional(self.db)
-        .await?;
+        let row: Option<TransactionRow> = Query::new(INTERNALIZE_FIND_TX_SQL)
+            .bind(user_id)
+            .bind(txid)
+            .fetch_optional(self.db)
+            .await?;
 
         Ok(row.map(|r| r.into_table()))
     }
 
     async fn load_existing_outputs(&self, user_id: i64, txid: &str) -> Result<Vec<TableOutput>> {
-        let rows: Vec<OutputRow> = Query::new(
-            r#"SELECT output_id, user_id, transaction_id, basket_id, txid, vout,
-                      satoshis, script_length, script_offset, type, provided_by, purpose,
-                      spendable, change, derivation_prefix, derivation_suffix,
-                      sender_identity_key, custom_instructions, created_at, updated_at
-               FROM outputs WHERE user_id = ? AND txid = ?"#,
-        )
-        .bind(user_id)
-        .bind(txid)
-        .fetch_all(self.db)
-        .await?;
+        let rows: Vec<OutputRow> = Query::new(INTERNALIZE_EXISTING_OUTPUTS_SQL)
+            .bind(user_id)
+            .bind(txid)
+            .fetch_all(self.db)
+            .await?;
 
         Ok(rows.into_iter().map(|r| r.into_table()).collect())
+    }
+
+    /// The output specification `od`, whose insert wrote nothing, carrying
+    /// the row that stands for its index: read as step 5 reads it, so the
+    /// output is merged exactly as one found there. A row the schema's key
+    /// holds and that read does not return is answered as the fault the
+    /// insert itself gave.
+    async fn standing_output(
+        &self,
+        user_id: i64,
+        txid: &str,
+        transaction_id: i64,
+        mut od: OutputData,
+    ) -> Result<OutputData> {
+        let existing = self.load_existing_outputs(user_id, txid).await?;
+        let row = existing
+            .iter()
+            .find(|o| o.vout == od.vout as i32)
+            .ok_or_else(|| {
+                Error::DatabaseError(format!(
+                    "internalize: outputs holds a row at ({transaction_id}, {}, {user_id}) that is not read under {txid}",
+                    od.vout
+                ))
+            })?;
+        od.existing_output_id = Some(row.output_id);
+        od.existing_basket_id = row.basket_id;
+        od.existing_is_change = row.change;
+        Ok(od)
     }
 
     /// Mark every storage row at each of the subject tx's consumed-input
@@ -1368,31 +1555,37 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         // directly, matching reference semantics. input_beef is potentially
         // huge (AtomicBEEF of refund flows can be 100+ KB) — use two-phase
         // so R2 overflow works.
-        let req_meta = Query::new(
-            r#"INSERT INTO proven_tx_reqs (
-                txid, status, attempts, history, notify, notified, raw_tx, input_beef, created_at, updated_at
-            ) VALUES (?, ?, 0, '{}', '{}', 0, ?, NULL, ?, ?)"#,
-        )
-        .bind(txid)
-        .bind(if policy_hint.is_some() { "unsent" } else { "unmined" })
-        .bind(raw_tx)
-        .bind(now)
-        .bind(now)
-        .execute(self.db)
-        .await?;
-        let req_id = req_meta.last_row_id;
-
-        let ib_d1 = self
-            .put_input_beef("proven_tx_reqs", req_id, input_beef)
+        let req_meta = Query::new(INTERNALIZE_INSERT_REQ_SQL)
+            .bind(txid)
+            .bind(if policy_hint.is_some() {
+                "unsent"
+            } else {
+                "unmined"
+            })
+            .bind(raw_tx)
+            .bind(now)
+            .bind(now)
+            .execute(self.db)
             .await?;
-        Query::new(
-            "UPDATE proven_tx_reqs SET input_beef = ?, updated_at = ? WHERE proven_tx_req_id = ?",
-        )
-        .bind(ib_d1)
-        .bind(now)
-        .bind(req_id)
-        .execute(self.db)
-        .await?;
+        // `changes == 0`: a request for this txid stands, made by another
+        // writer since the read above. It serves this call as it is, and its
+        // BEEF is its writer's to store; what this call's broadcast left is
+        // still what the caller is told.
+        if req_meta.changes > 0 {
+            let req_id = req_meta.last_row_id;
+
+            let ib_d1 = self
+                .put_input_beef("proven_tx_reqs", req_id, input_beef)
+                .await?;
+            Query::new(
+                "UPDATE proven_tx_reqs SET input_beef = ?, updated_at = ? WHERE proven_tx_req_id = ?",
+            )
+            .bind(ib_d1)
+            .bind(now)
+            .bind(req_id)
+            .execute(self.db)
+            .await?;
+        }
         if let Some(note) = policy_hint {
             super::tracker_rule::append_note(self.db, txid, note).await?;
         }
@@ -2167,5 +2360,644 @@ mod tests {
             input_mark_decision(true, None, None),
             Mark { set_spent_by: None }
         );
+    }
+
+    // =========================================================================
+    // One row per payment: real-SQLite harness (the #22 pattern above). The
+    // ACTUAL migrations and the ACTUAL SQL consts; a call's deciding
+    // statements run one at a time, as D1 runs them, so a test places the
+    // statements of two calls in an order it names, or in every order.
+    // =========================================================================
+
+    /// The subject transaction of these fixtures and what each output pays.
+    const ONE_TXID: &str = "ee01";
+    const ONE_SATS: i64 = 1000;
+    /// The internalizing user and their default basket.
+    const ONE_USER: i64 = 1;
+    const ONE_BASKET: i64 = 10;
+
+    fn one_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for migration in [
+            include_str!("../../migrations/0001_initial.sql"),
+            include_str!("../../migrations/0002_add_indexes.sql"),
+            include_str!("../../migrations/0003_add_output_reservations.sql"),
+            include_str!("../../migrations/0004_proven_txs_height_pair_index.sql"),
+        ] {
+            conn.execute_batch(migration).unwrap();
+        }
+        // D1 enforces foreign keys.
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            INSERT INTO users (user_id, identity_key) VALUES (1, '02aa'), (2, '02bb');
+            INSERT INTO output_baskets (basket_id, user_id, name)
+            VALUES (10, 1, 'default'), (20, 2, 'default');
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum OneStep {
+        /// Step 3: the read that decides "new" or "merge".
+        ReadTx,
+        /// Step 7: the transactions row.
+        InsertTx,
+        /// Step 5: a merge reads the outputs that stand.
+        ReadOutputs,
+        /// Step 9: the outputs row.
+        InsertOutput,
+        /// Step 9, after an insert that wrote nothing: the row that stands.
+        ReadStanding,
+        Done,
+    }
+
+    /// One "wallet payment" call for output `vout` of ONE_TXID by ONE_USER:
+    /// the native mirror of internalize_subject's deciding statements, with
+    /// the code's own decision on what each returns. `step` runs exactly one
+    /// statement.
+    #[derive(Clone, Debug)]
+    struct OneCall {
+        vout: i64,
+        /// The output indexes the call's `outputs` name, in their order.
+        named: Vec<u32>,
+        /// The refusal of the specifications (step 4), as the wire gives it:
+        /// the call's answer, and its end.
+        refusal: Option<(i32, String)>,
+        reference: &'static str,
+        next: OneStep,
+        again: bool,
+        transaction_id: i64,
+        /// The answer's `isMerge` and `satoshis`.
+        is_merge: bool,
+        satoshis: i64,
+        /// An insert of this call wrote nothing because a row stood.
+        tx_stood: bool,
+        output_stood: bool,
+    }
+
+    impl OneCall {
+        fn new(reference: &'static str, vout: i64) -> Self {
+            Self::naming(reference, &[vout as u32])
+        }
+
+        /// A call whose `outputs` name `named`; the output it goes on to
+        /// write is the first of them.
+        fn naming(reference: &'static str, named: &[u32]) -> Self {
+            OneCall {
+                vout: named[0] as i64,
+                named: named.to_vec(),
+                refusal: None,
+                reference,
+                next: OneStep::ReadTx,
+                again: false,
+                transaction_id: 0,
+                is_merge: false,
+                satoshis: 0,
+                tx_stood: false,
+                output_stood: false,
+            }
+        }
+
+        fn done(&self) -> bool {
+            self.next == OneStep::Done
+        }
+
+        /// The row that stands for this call's output index, as step 5 reads
+        /// it: (basket_id, change).
+        fn standing(&self, conn: &rusqlite::Connection) -> Option<(Option<i64>, bool)> {
+            let mut stmt = conn.prepare(INTERNALIZE_EXISTING_OUTPUTS_SQL).unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![ONE_USER, ONE_TXID], |r| {
+                    Ok((
+                        r.get::<_, i64>("vout")?,
+                        r.get::<_, Option<i64>>("basket_id")?,
+                        r.get::<_, i64>("change")? != 0,
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows.into_iter()
+                .find(|row| row.0 == self.vout)
+                .map(|row| (row.1, row.2))
+        }
+
+        fn step(&mut self, conn: &rusqlite::Connection) {
+            use rusqlite::OptionalExtension;
+            match self.next {
+                OneStep::ReadTx => {
+                    let row: Option<(i64, String)> = conn
+                        .query_row(
+                            INTERNALIZE_FIND_TX_SQL,
+                            rusqlite::params![ONE_USER, ONE_TXID],
+                            |r| Ok((r.get("transaction_id")?, r.get("status")?)),
+                        )
+                        .optional()
+                        .unwrap();
+                    match row {
+                        Some((transaction_id, status)) => {
+                            validate_merge_status(&TransactionStatus::parse_status(&status))
+                                .unwrap();
+                            self.transaction_id = transaction_id;
+                            self.is_merge = true;
+                            self.next = OneStep::ReadOutputs;
+                        }
+                        None => self.next = OneStep::InsertTx,
+                    }
+                    // Step 4, between the read and the first write: the
+                    // specifications, no statement.
+                    if let Err(refusal) = require_unique_output_indexes(self.named.iter().copied())
+                    {
+                        self.refusal = Some(crate::door::errors::public_parts(&refusal));
+                        self.next = OneStep::Done;
+                    }
+                }
+                OneStep::InsertTx => {
+                    let changes = conn
+                        .execute(
+                            INTERNALIZE_INSERT_TX_SQL,
+                            rusqlite::params![
+                                ONE_USER,
+                                ONE_TXID,
+                                "unproven",
+                                self.reference,
+                                "payment",
+                                ONE_SATS,
+                                1i64,
+                                0i64,
+                                "t-insert",
+                                "t-insert",
+                                ONE_USER,
+                                ONE_TXID
+                            ],
+                        )
+                        .unwrap();
+                    if changes == 0 {
+                        // A row stands: once more from the read, as the merge.
+                        assert!(!self.again, "a second pass read no row and inserted none");
+                        self.again = true;
+                        self.tx_stood = true;
+                        self.next = OneStep::ReadTx;
+                    } else {
+                        self.transaction_id = conn.last_insert_rowid();
+                        self.satoshis = ONE_SATS;
+                        self.next = OneStep::InsertOutput;
+                    }
+                }
+                OneStep::ReadOutputs => match self.standing(conn) {
+                    // Change in the default basket already: nothing to write
+                    // and nothing to count.
+                    Some((Some(ONE_BASKET), true)) => {
+                        self.satoshis = 0;
+                        self.next = OneStep::Done;
+                    }
+                    Some(other) => panic!("no such row in these fixtures: {other:?}"),
+                    None => {
+                        self.satoshis = ONE_SATS;
+                        self.next = OneStep::InsertOutput;
+                    }
+                },
+                OneStep::InsertOutput => {
+                    let changes = conn
+                        .execute(
+                            INTERNALIZE_INSERT_PAYMENT_OUTPUT_SQL,
+                            rusqlite::params![
+                                ONE_USER,
+                                self.transaction_id,
+                                ONE_BASKET,
+                                ONE_TXID,
+                                self.vout,
+                                ONE_SATS,
+                                25i64,
+                                "prefix",
+                                "suffix",
+                                "02cc",
+                                "t-insert",
+                                "t-insert"
+                            ],
+                        )
+                        .unwrap();
+                    if changes == 0 {
+                        self.output_stood = true;
+                        self.next = OneStep::ReadStanding;
+                    } else {
+                        self.next = OneStep::Done;
+                    }
+                }
+                OneStep::ReadStanding => match self.standing(conn) {
+                    // Merged as a row step 5 had read: nothing to write, and
+                    // what step 6 counted for it comes off.
+                    Some((Some(ONE_BASKET), true)) => {
+                        self.satoshis -= ONE_SATS;
+                        self.next = OneStep::Done;
+                    }
+                    other => panic!("the insert wrote nothing and the read gave {other:?}"),
+                },
+                OneStep::Done => panic!("the call is over"),
+            }
+        }
+
+        /// The whole call, alone: the statements it ran.
+        fn run(&mut self, conn: &rusqlite::Connection) -> Vec<OneStep> {
+            let mut ran = Vec::new();
+            while !self.done() {
+                ran.push(self.next);
+                self.step(conn);
+            }
+            ran
+        }
+    }
+
+    /// For ONE_USER and ONE_TXID: the transactions rows, and at `vout` the
+    /// outputs rows and the spendable ones.
+    fn one_rows(conn: &rusqlite::Connection, vout: i64) -> (i64, i64, i64) {
+        let txs = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE user_id = ? AND txid = ?",
+                rusqlite::params![ONE_USER, ONE_TXID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (outputs, spendable) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(spendable), 0) FROM outputs \
+                 WHERE user_id = ? AND txid = ? AND vout = ?",
+                rusqlite::params![ONE_USER, ONE_TXID, vout],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        (txs, outputs, spendable)
+    }
+
+    /// ONE_USER's balance as getBalance sums it (readers.rs): the spendable
+    /// outputs of the transactions that count.
+    fn one_balance(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT COALESCE(SUM(o.satoshis), 0) FROM outputs o \
+             JOIN transactions t ON o.transaction_id = t.transaction_id \
+             WHERE o.user_id = ? AND o.spendable = 1 \
+               AND t.status IN ('completed', 'unproven', 'sending')",
+            [ONE_USER],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Every order of the two calls' statements, each from the same start;
+    /// `end` sees the database and the two calls when both are over. Returns
+    /// the number of orders.
+    fn one_every_order(
+        conn: &rusqlite::Connection,
+        a: &OneCall,
+        b: &OneCall,
+        end: &mut dyn FnMut(&rusqlite::Connection, &OneCall, &OneCall),
+    ) -> usize {
+        if a.done() && b.done() {
+            end(conn, a, b);
+            return 1;
+        }
+        let mut orders = 0;
+        for a_moves in [true, false] {
+            let (mut a, mut b) = (a.clone(), b.clone());
+            let mover = if a_moves { &mut a } else { &mut b };
+            if mover.done() {
+                continue;
+            }
+            conn.execute_batch("SAVEPOINT one_order").unwrap();
+            mover.step(conn);
+            orders += one_every_order(conn, &a, &b, end);
+            conn.execute_batch("ROLLBACK TO one_order; RELEASE one_order")
+                .unwrap();
+        }
+        orders
+    }
+
+    #[test]
+    fn test_one_row_reads_first_then_inserts() {
+        // Two calls for one payment, their statements in an order named
+        // here: both step-3 reads, then both inserts of the transactions
+        // row; the second call then goes on to the insert of its output,
+        // the first call runs to its end, and the second ends.
+        let conn = one_db();
+        let (mut a, mut b) = (OneCall::new("ref-a", 0), OneCall::new("ref-b", 0));
+        a.step(&conn);
+        b.step(&conn);
+        assert_eq!((a.next, b.next), (OneStep::InsertTx, OneStep::InsertTx));
+        a.step(&conn);
+        b.step(&conn);
+        while !matches!(b.next, OneStep::InsertOutput | OneStep::Done) {
+            b.step(&conn);
+        }
+        a.run(&conn);
+        b.run(&conn);
+
+        // One transactions row, one spendable outputs row, the balance of
+        // one payment; both calls are answered, one as new and one as the
+        // merge, and their satoshis sum to the payment.
+        assert_eq!(one_rows(&conn, 0), (1, 1, 1));
+        assert_eq!(one_balance(&conn), ONE_SATS);
+        assert!(a.done() && b.done());
+        assert_eq!((a.is_merge, b.is_merge), (false, true));
+        assert_eq!(a.satoshis + b.satoshis, ONE_SATS);
+        // The way there: the second call's insert of the transactions row
+        // wrote nothing and it read the first call's row; its insert of the
+        // output wrote nothing too, and it counted nothing.
+        assert!(b.tx_stood && !a.tx_stood);
+        assert_eq!(b.transaction_id, a.transaction_id);
+        assert!(b.output_stood && !a.output_stood);
+        assert_eq!((a.satoshis, b.satoshis), (ONE_SATS, 0));
+    }
+
+    #[test]
+    fn test_one_row_same_output_every_order() {
+        // Two calls for one payment, in every order of their statements: one
+        // transactions row, one spendable outputs row, the balance of one
+        // payment; one call answers as new and one as a merge, and the
+        // satoshis of the two answers sum to the payment.
+        let conn = one_db();
+        let (mut tx_stood, mut output_stood) = (0, 0);
+        let orders = one_every_order(
+            &conn,
+            &OneCall::new("ref-a", 0),
+            &OneCall::new("ref-b", 0),
+            &mut |conn, a, b| {
+                assert_eq!(one_rows(conn, 0), (1, 1, 1), "{a:?} {b:?}");
+                assert_eq!(one_balance(conn), ONE_SATS, "{a:?} {b:?}");
+                assert!(a.is_merge != b.is_merge, "{a:?} {b:?}");
+                assert_eq!(a.satoshis + b.satoshis, ONE_SATS, "{a:?} {b:?}");
+                tx_stood += usize::from(a.tx_stood || b.tx_stood);
+                output_stood += usize::from(a.output_stood || b.output_stood);
+            },
+        );
+        // The start is as it was, and the orders include those in which an
+        // insert met a row that stood.
+        assert_eq!(one_rows(&conn, 0), (0, 0, 0));
+        println!("same output: {orders} orders, {tx_stood} with a transactions insert that wrote nothing, {output_stood} with an outputs insert that wrote nothing");
+        assert!(orders > 20 && tx_stood > 0 && output_stood > 0);
+    }
+
+    #[test]
+    fn test_one_row_other_output_index_every_order() {
+        // The second call names another output of the same transaction: one
+        // transactions row, each output once, the balance of the two.
+        let conn = one_db();
+        let mut tx_stood = 0;
+        let orders = one_every_order(
+            &conn,
+            &OneCall::new("ref-a", 0),
+            &OneCall::new("ref-b", 1),
+            &mut |conn, a, b| {
+                assert_eq!(one_rows(conn, 0), (1, 1, 1), "{a:?} {b:?}");
+                assert_eq!(one_rows(conn, 1), (1, 1, 1), "{a:?} {b:?}");
+                assert_eq!(one_balance(conn), 2 * ONE_SATS, "{a:?} {b:?}");
+                assert!(a.is_merge != b.is_merge, "{a:?} {b:?}");
+                assert_eq!((a.satoshis, b.satoshis), (ONE_SATS, ONE_SATS));
+                assert!(!a.output_stood && !b.output_stood);
+                tx_stood += usize::from(a.tx_stood || b.tx_stood);
+            },
+        );
+        println!("other output index: {orders} orders, {tx_stood} with a transactions insert that wrote nothing");
+        assert!(orders > 20 && tx_stood > 0);
+    }
+
+    #[test]
+    fn test_one_row_one_call_after_another() {
+        // A call alone runs the read, the insert and the output's insert,
+        // and nothing more; the same call again is a merge that writes no
+        // row; a later call for another output inserts that output alone.
+        let conn = one_db();
+        let mut first = OneCall::new("ref-a", 0);
+        assert_eq!(
+            first.run(&conn),
+            [OneStep::ReadTx, OneStep::InsertTx, OneStep::InsertOutput]
+        );
+        assert_eq!((first.is_merge, first.satoshis), (false, ONE_SATS));
+
+        let mut again = OneCall::new("ref-b", 0);
+        assert_eq!(again.run(&conn), [OneStep::ReadTx, OneStep::ReadOutputs]);
+        assert_eq!((again.is_merge, again.satoshis), (true, 0));
+        assert_eq!(one_rows(&conn, 0), (1, 1, 1));
+        assert_eq!(one_balance(&conn), ONE_SATS);
+
+        let mut other = OneCall::new("ref-c", 1);
+        assert_eq!(
+            other.run(&conn),
+            [OneStep::ReadTx, OneStep::ReadOutputs, OneStep::InsertOutput]
+        );
+        assert_eq!((other.is_merge, other.satoshis), (true, ONE_SATS));
+        assert_eq!(one_rows(&conn, 1), (1, 1, 1));
+        assert_eq!(one_balance(&conn), 2 * ONE_SATS);
+        assert!(!first.tx_stood && !again.tx_stood && !other.tx_stood);
+        assert!(!first.output_stood && !again.output_stood && !other.output_stood);
+    }
+
+    /// The wire answer of a call naming an output index more than once.
+    fn one_index_refusal() -> Option<(i32, String)> {
+        Some((
+            crate::json_rpc::INVALID_PARAMS,
+            "The outputs parameter must be unique outputIndex values".to_string(),
+        ))
+    }
+
+    #[test]
+    fn test_one_index_once_the_refusal_and_its_wire_answer() {
+        // An index named more than once, wherever it stands among the
+        // outputs, is the reference's refusal on the wire; indexes named
+        // once pass.
+        for named in [vec![0, 0], vec![1, 0, 1], vec![0, 1, 2, 2], vec![7, 7, 7]] {
+            let refusal = require_unique_output_indexes(named.iter().copied()).unwrap_err();
+            assert!(matches!(refusal, Error::ValidationError(_)), "{named:?}");
+            assert_eq!(
+                Some(crate::door::errors::public_parts(&refusal)),
+                one_index_refusal(),
+                "{named:?}"
+            );
+        }
+        for named in [vec![], vec![0], vec![0, 1], vec![2, 0, 1]] {
+            assert!(
+                require_unique_output_indexes(named.iter().copied()).is_ok(),
+                "{named:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_one_index_once_refused_before_the_first_write() {
+        // A call naming output 0 twice, for a transaction the storage does
+        // not hold: it runs the step-3 read and is refused; no statement
+        // follows and no row is written.
+        let conn = one_db();
+        let written = conn.total_changes();
+        let mut new = OneCall::naming("ref-a", &[0, 0]);
+        assert_eq!(new.run(&conn), [OneStep::ReadTx]);
+        assert_eq!(new.refusal, one_index_refusal());
+        assert_eq!(conn.total_changes(), written);
+        assert_eq!(one_rows(&conn, 0), (0, 0, 0));
+
+        // The transaction held (its output 0, by a call alone): a call
+        // naming output 1 twice, and one naming the held output 0 twice,
+        // are refused the same, the rows as they were.
+        let mut first = OneCall::new("ref-b", 0);
+        first.run(&conn);
+        assert_eq!((first.refusal.clone(), first.satoshis), (None, ONE_SATS));
+        let written = conn.total_changes();
+        for named in [[1, 1], [0, 0]] {
+            let mut held = OneCall::naming("ref-c", &named);
+            assert_eq!(held.run(&conn), [OneStep::ReadTx], "{named:?}");
+            assert_eq!(held.refusal, one_index_refusal(), "{named:?}");
+        }
+        assert_eq!(conn.total_changes(), written);
+        assert_eq!(one_rows(&conn, 0), (1, 1, 1));
+        assert_eq!(one_rows(&conn, 1), (1, 0, 0));
+        assert_eq!(one_balance(&conn), ONE_SATS);
+
+        // Output 1 named once is then the merge that inserts it.
+        let mut once = OneCall::new("ref-d", 1);
+        assert_eq!(
+            once.run(&conn),
+            [OneStep::ReadTx, OneStep::ReadOutputs, OneStep::InsertOutput]
+        );
+        assert_eq!(
+            (once.refusal.clone(), once.is_merge, once.satoshis),
+            (None, true, ONE_SATS)
+        );
+        assert!(!once.output_stood);
+    }
+
+    #[test]
+    fn test_one_index_once_a_refused_call_beside_another_every_order() {
+        // A call naming output 0 twice beside a call naming it once, in
+        // every order of their statements: the first is refused and writes
+        // nothing, the second is answered as a call alone is.
+        let conn = one_db();
+        let orders = one_every_order(
+            &conn,
+            &OneCall::naming("ref-a", &[0, 0]),
+            &OneCall::new("ref-b", 0),
+            &mut |conn, a, b| {
+                assert_eq!(a.refusal, one_index_refusal(), "{a:?} {b:?}");
+                assert_eq!(b.refusal, None, "{a:?} {b:?}");
+                assert_eq!((b.is_merge, b.satoshis), (false, ONE_SATS), "{b:?}");
+                assert!(!b.tx_stood && !b.output_stood, "{b:?}");
+                assert_eq!(one_rows(conn, 0), (1, 1, 1), "{a:?} {b:?}");
+                assert_eq!(one_balance(conn), ONE_SATS, "{a:?} {b:?}");
+            },
+        );
+        assert_eq!(orders, 4);
+    }
+
+    #[test]
+    fn test_one_row_insert_carries_the_reads_predicate() {
+        // The insert's condition is the read's predicate, word for word.
+        let predicate = INTERNALIZE_FIND_TX_SQL.rsplit_once(" WHERE ").unwrap().1;
+        assert_eq!(predicate, "user_id = ? AND txid = ?");
+        assert!(INTERNALIZE_INSERT_TX_SQL.ends_with(&format!(
+            "WHERE NOT EXISTS (SELECT 1 FROM transactions WHERE {predicate})"
+        )));
+
+        // It holds one row to a user and a txid: another user and another
+        // txid are not held back.
+        let conn = one_db();
+        let insert = |user: i64, txid: &str, reference: &str| {
+            conn.execute(
+                INTERNALIZE_INSERT_TX_SQL,
+                rusqlite::params![
+                    user, txid, "unproven", reference, "payment", ONE_SATS, 1i64, 0i64, "t", "t",
+                    user, txid
+                ],
+            )
+            .unwrap()
+        };
+        assert_eq!(insert(1, ONE_TXID, "ref-1"), 1);
+        assert_eq!(insert(1, ONE_TXID, "ref-2"), 0);
+        assert_eq!(insert(2, ONE_TXID, "ref-3"), 1);
+        assert_eq!(insert(1, "ee02", "ref-4"), 1);
+        assert_eq!(one_rows(&conn, 0).0, 1);
+
+        // The condition is this statement's alone: the schema is as it was,
+        // and takes the rows other writers insert for a txid they repeat.
+        for reference in ["sent-1", "sent-2"] {
+            conn.execute(
+                "INSERT INTO transactions (user_id, txid, status, reference, is_outgoing, description) \
+                 VALUES (1, 'ee03', 'failed', ?, 1, 'outgoing')",
+                [reference],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_one_row_output_inserts_hold_the_schema_key() {
+        // One outputs row to (transaction_id, vout, user_id), whichever
+        // protocol's insert comes second; another index is free.
+        let conn = one_db();
+        let mut call = OneCall::new("ref-a", 0);
+        call.run(&conn);
+        let basket_insert = |vout: i64| {
+            conn.execute(
+                INTERNALIZE_INSERT_BASKET_OUTPUT_SQL,
+                rusqlite::params![
+                    ONE_USER,
+                    call.transaction_id,
+                    ONE_BASKET,
+                    ONE_TXID,
+                    vout,
+                    ONE_SATS,
+                    1i64,
+                    Option::<&str>::None,
+                    "t",
+                    "t"
+                ],
+            )
+            .unwrap()
+        };
+        assert_eq!(basket_insert(0), 0);
+        assert_eq!(basket_insert(1), 1);
+        assert_eq!(basket_insert(1), 0);
+        let mut payment = OneCall::new("ref-b", 1);
+        payment.transaction_id = call.transaction_id;
+        payment.next = OneStep::InsertOutput;
+        payment.step(&conn);
+        assert!(payment.output_stood);
+        assert_eq!(one_rows(&conn, 0), (1, 1, 1));
+        assert_eq!(one_rows(&conn, 1), (1, 1, 1));
+
+        // A row the key does not cover is still refused: an insert naming a
+        // transaction that does not exist is a fault, not a row that stands.
+        let orphan = conn.execute(
+            INTERNALIZE_INSERT_PAYMENT_OUTPUT_SQL,
+            rusqlite::params![
+                ONE_USER, 999i64, ONE_BASKET, ONE_TXID, 0i64, ONE_SATS, 25i64, "p", "s", "02cc",
+                "t", "t"
+            ],
+        );
+        assert!(orphan.is_err());
+    }
+
+    #[test]
+    fn test_one_row_proof_request_insert() {
+        // One proof request to a txid: the second insert writes nothing and
+        // raises nothing, and the request that stands is as it was.
+        let conn = one_db();
+        let insert = |status: &str| {
+            conn.execute(
+                INTERNALIZE_INSERT_REQ_SQL,
+                rusqlite::params![ONE_TXID, status, vec![1u8], "t", "t"],
+            )
+            .unwrap()
+        };
+        assert_eq!(insert("unmined"), 1);
+        assert_eq!(insert("unsent"), 0);
+        let (rows, status): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(status) FROM proven_tx_reqs WHERE txid = ?",
+                [ONE_TXID],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, status.as_str()), (1, "unmined"));
     }
 }

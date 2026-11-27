@@ -4,6 +4,88 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.4, 2026-11-27: one row per payment under concurrent calls
+
+### Changed
+
+- **`internalizeAction`: the transaction row and the output row are written
+  by guarded inserts.** The transaction row's insert carries, inside the
+  statement, the predicate of the read that decides "new" or "merge" (the
+  user and the txid), and writes the row only when that read would still find
+  none; a call whose insert writes nothing reads the row that stands and goes
+  on as the merge a later call is. The output row's insert holds the schema's
+  key, one row to (`transaction_id`, `vout`, `user_id`); an output whose
+  insert writes nothing is merged onto the row that stands. So a user holds
+  one transaction row for an internalized txid and one output row for an
+  outpoint, in whatever order the statements of concurrent calls reach D1;
+  each call is answered as accepted, one as new and the others as merges, and
+  the satoshis of the answers sum to the payment.
+- **The other inserts on that path hold their keys the same way**: the proof
+  request (one to a txid), the default basket, a named basket, a label and a
+  tag (each insert carries its read's predicate), and the label and tag map
+  rows (one to their pair). A call that finds a row standing uses it.
+- **A call names each output index once.** A call whose `outputs` name one
+  output index more than once is refused: under whichever protocols (two
+  wallet payments, two basket insertions, one of each), and whether or not
+  the storage holds the transaction or the output. The answer is `-32602`,
+  the code of every refused argument here, with the message
+  `The outputs parameter must be unique outputIndex values`
+  (`WERR_INVALID_PARAMETER` of `outputs`). The message is the reference's,
+  which gives it in one form only: a transaction held whose output row
+  stands at the index, the index named as a wallet payment and as a basket
+  insertion (the other forms: `docs/DIVERGENCES.md`, row 17). The reference
+  was read at its head of 2026-11-27, `bsv-blockchain/ts-stack`
+  57c5f13055b555b83c1ef368fff3650abd21b6ef, not run. The answer is given
+  where the call's specifications are read, after an index out of range or
+  a missing remittance is answered: no row of the transaction, of an output
+  or of a proof request is written, and nothing is announced. The same call
+  naming the index once is then answered as a call alone is
+  (`docs/DIVERGENCES.md`, row 17).
+- Every other call alone writes the rows it wrote and is answered as it was.
+  No migration and no configuration change.
+
+### Tests
+
+- `storage::internalize_action` (`test_one_row_*`): the statements on SQLite
+  over the actual migrations, a call's deciding statements run one at a time:
+  two calls for one payment in a named order and in every order of their
+  statements, the same with the second call naming another output index, one
+  call after another, and each insert's condition against its read's
+  predicate and the schema's key.
+- `storage::writers` (`find_or_create_*`): the basket, label and tag
+  statements the same way.
+- `tests/worker_tracker_rule.mjs`, now run by the `worker` check: the
+  compiled Worker on workerd's D1, one AtomicBEEF posted by two sessions of a
+  user at the same moment, 40 payments in turn; each leaves one transaction
+  row and one spendable output, the balance grows by one payment, and both
+  answers are accepted. Then another output of a transaction the storage
+  already holds, by two calls at once, 20 payments in turn: one row for the
+  output, one payment more on the balance, both answers accepted as merges.
+  Then the first two calls of a new user at once, 10 users, a basket
+  insertion with a new basket, label and tag: one default basket, one row of
+  each, both answers accepted.
+- `storage::internalize_action` (`test_one_index_once_*`): the refusal and
+  its answer on the wire; a call naming an index twice runs the read that
+  decides "new" or "merge" and no statement after it, for a transaction the
+  storage does not hold and for one it holds; and beside a call naming the
+  index once, in every order of their statements, the first is refused and
+  the second is answered as a call alone is.
+- `tests/worker_tracker_rule.mjs` (checks `z1` to `z6`): one call, alone,
+  naming an index twice, on the compiled Worker: as two wallet payments of a
+  new transaction, as two basket insertions into two baskets, as two wallet
+  payments of another output of a transaction held, and as a wallet payment
+  and a basket insertion in either order; then for an output the storage
+  holds and with another index between the two. Each is answered `-32602`
+  with the message, every row of every table is as it was, nothing is
+  announced and the balance stands; the same call naming the index once is
+  then accepted, as new or as a merge. An index out of range among them is
+  answered first. Nothing of the payment is written for a caller the server
+  has not seen before either: its user row and its default basket are made
+  first, as they are before every other refusal given where the
+  specifications are read. Check `z6` is a user who holds no basket yet:
+  answered the same, nothing announced, and the one row written is that
+  user's default basket.
+
 ## 0.7.3, 2026-11-17: a list page of more than 100 rows is served
 
 ### Fixed
