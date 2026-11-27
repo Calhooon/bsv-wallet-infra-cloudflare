@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-wallet-infra-cloudflare"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "base64",
  "bsv-middleware-cloudflare",

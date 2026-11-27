@@ -11,7 +11,7 @@ const sha = b => createHash('sha256').update(b).digest()
 const hash = b => sha(sha(b))
 const txid = b => Buffer.from(hash(b)).reverse().toString('hex')
 const u32 = n => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b }
-const raw = (prev, script, marker) => Buffer.concat([u32(1), Buffer.from([1]), prev, u32(0), Buffer.from([0]), u32(0xffffffff), Buffer.from([1]), Buffer.from('e803000000000000', 'hex'), Buffer.from([1, script]), u32(marker)])
+const raw = (prev, script, marker, outputs = 1) => Buffer.concat([u32(1), Buffer.from([1]), prev, u32(0), Buffer.from([0]), u32(0xffffffff), Buffer.from([outputs]), ...Array.from({ length: outputs }, () => Buffer.concat([Buffer.from('e803000000000000', 'hex'), Buffer.from([1, script])])), u32(marker)])
 // A BEEF V2 head with one bump: `parent` alone in a block at `height` (its root is its txid).
 const bumped = (parent, height) => Buffer.concat([u32(0xefbe0002), Buffer.from([1, 0xfe]), u32(height), Buffer.from([1, 1, 0, 2]), hash(parent)])
 const provenBeef = (parent, height) => Buffer.concat([bumped(parent, height), Buffer.from([1, 1, 0]), parent])
@@ -36,13 +36,17 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
     await db.batch(JSON.parse(split.stdout).map(sql => db.prepare(sql)))
   }
   const key = PrivateKey.fromRandom()
-  const client = new AuthFetch(new ProtoWallet(key))
   let id = 0
-  const rpc = async (method, params) => {
-    const response = await client.fetch(new URL('/', base).toString(), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }) })
-    assert.equal(response.status, 200)
-    return JSON.parse(await response.text())
+  // A session of the fixture's user, or of the user of another key: its own BRC-31 client.
+  const session = (of = key) => {
+    const client = new AuthFetch(new ProtoWallet(of))
+    return async (method, params) => {
+      const response = await client.fetch(new URL('/', base).toString(), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }) })
+      assert.equal(response.status, 200)
+      return JSON.parse(await response.text())
+    }
   }
+  const rpc = session()
   const user = (await rpc('findOrInsertUser', [key.toPublicKey().toString()])).result.user.userId
   const exec = (sql, ...args) => db.prepare(sql).bind(...args.map(a => Buffer.isBuffer(a) ? new Uint8Array(a) : a)).run()
   await exec("INSERT INTO output_baskets (user_id, name) VALUES (?, 'default')", user)
@@ -63,7 +67,7 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
     const o = await db.prepare('SELECT spendable, spent_by FROM outputs WHERE spent_by = ?').bind(s.childId).first()
     assert.ok(o, 'input was released'); assert.equal(o.spendable, 0)
   }
-  return { mf, base, db, rpc, exec, seed, row, locked }
+  return { mf, base, db, rpc, session, exec, seed, row, locked }
 }
 let failed = 0, ran = 0
 const check = async (name, f) => { ran++; try { await f(); console.log(`PASS ${name}`) } catch (e) { failed++; console.log(`FAIL ${name}: ${e.message}`) } }
@@ -281,8 +285,17 @@ try {
 // #50 under production's settings (INTERNALIZE_ZERO_CONF=true, BROADCASTER=arcade): an
 // inbound payment Arcade refuses is never credited as spendable; one it accepts (202, then
 // SEEN_ON_NETWORK on its event stream) is credited as before, and a refused one becomes
-// spendable when a later announce is seen.
+// spendable when a later announce is seen. And one row per inbound payment: two calls for one
+// payment at the same moment leave one transaction row and one spendable output (checks w, x, y).
 let zeroCode = 461, zeroPosts = 0
+// A height listed in `together` has its header answered when two calls have asked for it, so the
+// two calls of one payment are let on into the storage at the same moment; `met` counts the
+// heights at which two calls met. The two answers are given while D1 is busy with a statement of
+// the fixture's own (HOLD, `holding`): workerd finds both answers waiting when the statement
+// ends, and the two calls go on from there statement for statement.
+const together = new Map()
+let met = 0, holding = null
+const HOLD = 'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 800000) SELECT COUNT(*) AS c FROM n'
 const zero = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.test', CHAINTRACKS_URL: 'https://headers.test', BEEF_VERIFICATION: 'strict', INTERNALIZE_ZERO_CONF: 'true' }, async request => {
   const url = new URL(request.url)
   const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -298,19 +311,35 @@ const zero = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.tes
   if (url.host === 'arcade.test' && url.pathname === '/policy') return json({ policy: { miningFee: { satoshis: 100, bytes: 1000 } } })
   if (url.host === 'headers.test' && url.pathname === '/findHeaderHexForHeight') {
     const height = Number(url.searchParams.get('height'))
+    const waiting = together.get(height)
+    if (waiting) {
+      await new Promise(go => {
+        waiting.push(go)
+        if (waiting.length === 2) {
+          met++
+          holding = zero.db.prepare(HOLD).first()
+          setTimeout(() => { for (const each of waiting) each() }, 25)
+        } else setTimeout(() => { together.delete(height); go() }, 5000)
+      })
+    }
     return json({ status: 'success', value: { merkleRoot: roots.get(height) ?? '00'.repeat(32), height } })
   }
   return new Response('not found', { status: 404 })
 })
 const sender = PrivateKey.fromRandom().toPublicKey().toString()
-// An AtomicBEEF paying output 0 of a fresh subject; its funding is proven at 800000 + n.
-const inbound = async (n, lock = 0x51) => {
+// An AtomicBEEF of a fresh subject of `outputs` outputs, internalized as a wallet payment of its
+// output `index`; its funding is proven at 800000 + n.
+const payment = (n, lock = 0x51, outputs = 1) => {
   const funding = raw(Buffer.alloc(32, n), lock, n)
-  const subject = raw(hash(funding), 0x51, n + 1)
+  const subject = raw(hash(funding), 0x51, n + 1, outputs)
   roots.set(800000 + n, Buffer.from(hash(funding)).reverse().toString('hex'))
   const atomic = Buffer.concat([u32(0x01010101), hash(subject), bumped(funding, 800000 + n), Buffer.from([2, 1, 0]), funding, Buffer.from([0]), subject])
-  const r = await zero.rpc('internalizeAction', [{ identityKey: '' }, { tx: atomic.toString('hex'), outputs: [{ outputIndex: 0, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: 'cHJlZml4', derivationSuffix: Buffer.from(`s${n}`).toString('base64'), senderIdentityKey: sender } }], description: 'zero-conf payment', labels: [], seekPermission: false }])
-  return { r, txid: txid(subject) }
+  return { atomic, txid: txid(subject) }
+}
+const internalize = (rpc, n, atomic, index = 0) => rpc('internalizeAction', [{ identityKey: '' }, { tx: atomic.toString('hex'), outputs: [{ outputIndex: index, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: 'cHJlZml4', derivationSuffix: Buffer.from(`s${n + index}`).toString('base64'), senderIdentityKey: sender } }], description: 'zero-conf payment', labels: [], seekPermission: false }])
+const inbound = async (n, lock = 0x51) => {
+  const { atomic, txid: t } = payment(n, lock)
+  return { r: await internalize(zero.rpc, n, atomic), txid: t }
 }
 const credit = async t => (await zero.db.prepare('SELECT COALESCE(SUM(spendable), 0) AS n, COUNT(*) AS c FROM outputs WHERE txid = ?').bind(t).first())
 const zeroReq = t => zero.db.prepare('SELECT r.status, r.history, t.status AS tx_status FROM proven_tx_reqs r JOIN transactions t ON t.txid = r.txid WHERE r.txid = ?').bind(t).first()
@@ -350,6 +379,186 @@ try {
     assert.ok(r.error, JSON.stringify(r)); assert.match(JSON.stringify(r.error), /local script check/)
     assert.equal(zeroPosts, before); assert.equal((await credit(t)).c, 0)
     assert.equal(await zero.db.prepare('SELECT 1 FROM proven_tx_reqs WHERE txid = ?').bind(t).first(), null)
+  })
+  // One AtomicBEEF posted by two sessions of the user at the same moment, payment after payment.
+  // The header service answers the two calls of a payment together, so both are in the storage
+  // at once and their statements reach D1 in whatever order they fall.
+  const other = zero.session()
+  const balance = async rpc => (await rpc('getBalance', [{ identityKey: '' }, { basket: 'default' }])).result.balance
+  const count = async (sql, ...binds) => (await zero.db.prepare(sql).bind(...binds).first()).c
+  const atOnce = async (n, calls) => {
+    const before = met
+    together.set(800000 + n, [])
+    const answers = await Promise.all(calls.map(call => call()))
+    assert.equal(met - before, 1, `payment ${n}: the two calls were not in flight together`)
+    assert.equal((await holding).c, 800000)
+    for (const r of answers) { assert.ok(r.result, `payment ${n}: ${JSON.stringify(r)}`); assert.equal(r.result.accepted, true, `payment ${n}`) }
+    return answers.map(r => r.result)
+  }
+  const PAIRS = 40
+  await check(`w two calls at once for one payment, ${PAIRS} payments: one transaction row, one spendable output, the balance of one payment, both accepted`, async () => {
+    zeroCode = 0
+    let expected = await balance(zero.rpc)
+    assert.equal(await balance(other), expected)
+    for (let i = 0; i < PAIRS; i++) {
+      const n = 1000 + 2 * i
+      const { atomic, txid: t } = payment(n)
+      const answers = await atOnce(n, [zero.rpc, other].map(rpc => () => internalize(rpc, n, atomic, 0)))
+      assert.equal(await count('SELECT COUNT(*) AS c FROM transactions WHERE txid = ?', t), 1, `payment ${n}: transaction rows`)
+      const c = await credit(t); assert.equal(c.c, 1, `payment ${n}: output rows`); assert.equal(c.n, 1, `payment ${n}: spendable outputs`)
+      expected += 1000
+      assert.equal(await balance(zero.rpc), expected, `payment ${n}: the balance`)
+      assert.deepEqual(answers.map(a => a.isMerge).sort(), [false, true], `payment ${n}: one answer new, one a merge`)
+      assert.equal(answers[0].satoshis + answers[1].satoshis, 1000, `payment ${n}: the satoshis of the two answers`)
+      const req = await zeroReq(t); assert.equal(req.status, 'unmined', `payment ${n}`); assert.equal(req.tx_status, 'unproven', `payment ${n}`)
+    }
+  })
+  // The transaction is held already (its output 0, by a call alone); its output 1 is then
+  // internalized by two calls at once, both merges onto the one transaction row.
+  const SECOND = 20
+  await check(`x two calls at once for another output of a transaction held, ${SECOND} payments: one row for the output, one payment more on the balance, both accepted as merges`, async () => {
+    zeroCode = 0
+    let expected = await balance(zero.rpc)
+    for (let i = 0; i < SECOND; i++) {
+      const n = 2000 + 2 * i
+      const { atomic, txid: t } = payment(n, 0x51, 2)
+      const first = await internalize(zero.rpc, n, atomic, 0)
+      assert.ok(first.result, JSON.stringify(first)); assert.equal(first.result.isMerge, false); assert.equal(first.result.satoshis, 1000)
+      const answers = await atOnce(n, [zero.rpc, other].map(rpc => () => internalize(rpc, n, atomic, 1)))
+      assert.equal(await count('SELECT COUNT(*) AS c FROM transactions WHERE txid = ?', t), 1, `payment ${n}: transaction rows`)
+      const rows = await zero.db.prepare('SELECT vout, COUNT(*) AS c, SUM(spendable) AS n FROM outputs WHERE txid = ? GROUP BY vout ORDER BY vout').bind(t).all()
+      assert.deepEqual(rows.results, [{ vout: 0, c: 1, n: 1 }, { vout: 1, c: 1, n: 1 }], `payment ${n}: output rows`)
+      expected += 2000
+      assert.equal(await balance(zero.rpc), expected, `payment ${n}: the balance`)
+      assert.deepEqual(answers.map(a => a.isMerge), [true, true], `payment ${n}: both merges`)
+      assert.equal(answers[0].satoshis + answers[1].satoshis, 1000, `payment ${n}: the satoshis of the two answers`)
+    }
+  })
+  // A new user's first two calls, at once: a basket insertion into a basket, under a label and
+  // with a tag, none of which the storage holds yet (nor the user's default basket).
+  const USERS = 10
+  await check(`y the first two calls of a new user at once, ${USERS} users: a basket insertion with a new basket, label and tag leaves one row of each, both accepted`, async () => {
+    zeroCode = 0
+    for (let i = 0; i < USERS; i++) {
+      const n = 3000 + 2 * i
+      const key = PrivateKey.fromRandom()
+      const sessions = [zero.session(key), zero.session(key)]
+      let user
+      for (const rpc of sessions) user = (await rpc('findOrInsertUser', [key.toPublicKey().toString()])).result.user.userId
+      const { atomic, txid: t } = payment(n)
+      const args = { tx: atomic.toString('hex'), outputs: [{ outputIndex: 0, protocol: 'basket insertion', insertionRemittance: { basket: 'kept', customInstructions: 'fixture', tags: ['seat'] } }], description: 'kept output', labels: ['paid'], seekPermission: false }
+      await atOnce(n, sessions.map(rpc => () => rpc('internalizeAction', [{ identityKey: '' }, args])))
+      assert.equal(await count('SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND txid = ?', user, t), 1, `user ${i}: transaction rows`)
+      assert.equal(await count('SELECT COUNT(*) AS c FROM outputs WHERE user_id = ? AND txid = ? AND spendable = 1', user, t), 1, `user ${i}: output rows`)
+      assert.equal(await count('SELECT COUNT(*) AS c FROM outputs WHERE user_id = ?', user), 1, `user ${i}: output rows`)
+      const baskets = await zero.db.prepare('SELECT name FROM output_baskets WHERE user_id = ? ORDER BY name').bind(user).all()
+      assert.deepEqual(baskets.results.map(b => b.name), ['default', 'kept'], `user ${i}: baskets`)
+      assert.equal(await count('SELECT COUNT(*) AS c FROM tx_labels WHERE user_id = ?', user), 1, `user ${i}: labels`)
+      assert.equal(await count('SELECT COUNT(*) AS c FROM tx_labels_map m JOIN tx_labels l ON l.tx_label_id = m.tx_label_id WHERE l.user_id = ?', user), 1, `user ${i}: label map rows`)
+      assert.equal(await count('SELECT COUNT(*) AS c FROM output_tags WHERE user_id = ?', user), 1, `user ${i}: tags`)
+      assert.equal(await count('SELECT COUNT(*) AS c FROM output_tags_map m JOIN output_tags g ON g.output_tag_id = m.output_tag_id WHERE g.user_id = ?', user), 1, `user ${i}: tag map rows`)
+    }
+  })
+  // A call names each output index once. One call, alone, whose `outputs` name an index twice is
+  // refused where its specifications are read: `-32602` with the reference's message, every
+  // table of the storage as it was, and nothing announced.
+  const UNIQUE = 'The outputs parameter must be unique outputIndex values'
+  const pay = (index, word) => ({ outputIndex: index, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: 'cHJlZml4', derivationSuffix: Buffer.from(word).toString('base64'), senderIdentityKey: sender } })
+  const insert = (index, basket) => ({ outputIndex: index, protocol: 'basket insertion', insertionRemittance: { basket, customInstructions: 'fixture', tags: ['seat'] } })
+  const named = (atomic, outputs, rpc = zero.rpc) => rpc('internalizeAction', [{ identityKey: '' }, { tx: atomic.toString('hex'), outputs, description: 'named outputs', labels: ['paid'], seekPermission: false }])
+  const bytes = (_, v) => v instanceof ArrayBuffer ? Buffer.from(v).toString('hex') : ArrayBuffer.isView(v) ? Buffer.from(v.buffer, v.byteOffset, v.byteLength).toString('hex') : v
+  // Every row of every table of the storage.
+  const stored = async () => {
+    const tables = await zero.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name").all()
+    const rows = {}
+    for (const { name } of tables.results) rows[name] = JSON.stringify((await zero.db.prepare(`SELECT * FROM ${name}`).all()).results, bytes)
+    return rows
+  }
+  const refused = async (what, atomic, outputs, message = UNIQUE) => {
+    const before = await stored(), posts = zeroPosts, held = await balance(zero.rpc)
+    const r = await named(atomic, outputs)
+    assert.deepEqual(r.error, { code: -32602, message }, `${what}: ${JSON.stringify(r)}`)
+    assert.deepEqual(await stored(), before, `${what}: the storage is not as it was`)
+    assert.equal(zeroPosts, posts, `${what}: announced`)
+    assert.equal(await balance(zero.rpc), held, `${what}: the balance`)
+  }
+  const accepted = async (what, atomic, outputs, isMerge, satoshis) => {
+    const r = await named(atomic, outputs)
+    assert.ok(r.result, `${what}: ${JSON.stringify(r)}`)
+    assert.deepEqual([r.result.accepted, r.result.isMerge, r.result.satoshis], [true, isMerge, satoshis], what)
+  }
+  const outputRows = async t => (await zero.db.prepare('SELECT o.vout, o.spendable, o.change, o.type, b.name AS basket FROM outputs o JOIN output_baskets b ON b.basket_id = o.basket_id WHERE o.txid = ? ORDER BY o.vout').bind(t).all()).results
+  await check('z1 one call naming output 0 of a new transaction twice as a wallet payment: refused, no row written, nothing announced; named once it is then accepted as new', async () => {
+    zeroCode = 0
+    const { atomic, txid: t } = payment(4000)
+    const held = await balance(zero.rpc)
+    await refused('twice', atomic, [pay(0, 'one'), pay(0, 'one')])
+    await refused('twice, another derivation', atomic, [pay(0, 'one'), pay(0, 'two')])
+    assert.equal(await count('SELECT COUNT(*) AS c FROM transactions WHERE txid = ?', t), 0)
+    await accepted('once', atomic, [pay(0, 'one')], false, 1000)
+    assert.equal(await count('SELECT COUNT(*) AS c FROM transactions WHERE txid = ? AND satoshis = 1000', t), 1)
+    assert.deepEqual(await outputRows(t), [{ vout: 0, spendable: 1, change: 1, type: 'P2PKH', basket: 'default' }])
+    const req = await zeroReq(t); assert.equal(req.status, 'unmined'); assert.equal(req.tx_status, 'unproven')
+    assert.equal(await balance(zero.rpc), held + 1000)
+  })
+  await check('z2 one call naming output 0 of a new transaction twice as a basket insertion, two baskets: refused, no row and no basket written; named once it is then accepted as new', async () => {
+    zeroCode = 0
+    const { atomic, txid: t } = payment(4010)
+    await refused('twice', atomic, [insert(0, 'first shelf'), insert(0, 'second shelf')])
+    assert.equal(await count("SELECT COUNT(*) AS c FROM output_baskets WHERE name IN ('first shelf', 'second shelf')"), 0)
+    await accepted('once', atomic, [insert(0, 'first shelf')], false, 0)
+    assert.deepEqual(await outputRows(t), [{ vout: 0, spendable: 1, change: 0, type: 'custom', basket: 'first shelf' }])
+    assert.equal((await zeroReq(t)).status, 'unmined')
+  })
+  await check('z3 a transaction held, one call naming its output 1 twice as a wallet payment: refused, the rows as they were; named once it is then accepted as a merge', async () => {
+    zeroCode = 0
+    const { atomic, txid: t } = payment(4020, 0x51, 2)
+    const held = await balance(zero.rpc)
+    await accepted('output 0, a call alone', atomic, [pay(0, 'one')], false, 1000)
+    await refused('twice', atomic, [pay(1, 'two'), pay(1, 'two')])
+    assert.deepEqual((await outputRows(t)).map(o => o.vout), [0])
+    await accepted('once', atomic, [pay(1, 'two')], true, 1000)
+    assert.equal(await count('SELECT COUNT(*) AS c FROM transactions WHERE txid = ?', t), 1)
+    assert.deepEqual((await outputRows(t)).map(o => [o.vout, o.spendable, o.basket]), [[0, 1, 'default'], [1, 1, 'default']])
+    assert.equal(await balance(zero.rpc), held + 2000)
+  })
+  await check('z4 one call naming output 0 of a new transaction as a wallet payment and as a basket insertion: refused in either order, no row written; the wallet payment alone is then accepted as new', async () => {
+    zeroCode = 0
+    const { atomic, txid: t } = payment(4030)
+    const held = await balance(zero.rpc)
+    await refused('the payment first', atomic, [pay(0, 'one'), insert(0, 'third shelf')])
+    await refused('the insertion first', atomic, [insert(0, 'third shelf'), pay(0, 'one')])
+    assert.equal(await count("SELECT COUNT(*) AS c FROM output_baskets WHERE name = 'third shelf'"), 0)
+    await accepted('once', atomic, [pay(0, 'one')], false, 1000)
+    assert.deepEqual(await outputRows(t), [{ vout: 0, spendable: 1, change: 1, type: 'P2PKH', basket: 'default' }])
+    assert.equal(await balance(zero.rpc), held + 1000)
+  })
+  await check('z5 an index named twice is refused whatever the storage holds and wherever it stands among the outputs; an index out of range is answered first; indexes named once are accepted', async () => {
+    zeroCode = 0
+    const { atomic, txid: t } = payment(4040, 0x51, 3)
+    await accepted('outputs 0 and 1, each once', atomic, [pay(0, 'one'), pay(1, 'two')], false, 2000)
+    await refused('an output held, twice', atomic, [pay(0, 'one'), pay(0, 'one')])
+    await refused('an output held, as a payment and as an insertion', atomic, [pay(1, 'two'), insert(1, 'fourth shelf')])
+    await refused('twice, another between', atomic, [pay(2, 'three'), pay(0, 'one'), insert(2, 'fourth shelf')])
+    await refused('an index out of range among them', atomic, [pay(2, 'three'), pay(2, 'three'), pay(3, 'four')], 'Output index 3 is out of range (transaction has 3 outputs)')
+    await accepted('output 2, once, with one held', atomic, [pay(0, 'one'), pay(2, 'three')], true, 1000)
+    assert.deepEqual((await outputRows(t)).map(o => [o.vout, o.spendable, o.basket]), [[0, 1, 'default'], [1, 1, 'default'], [2, 1, 'default']])
+  })
+  await check('z6 the first call of a new user naming an index twice: refused, nothing announced; the one row written is the default basket a call finds or makes for its user first', async () => {
+    zeroCode = 0
+    const key = PrivateKey.fromRandom()
+    const rpc = zero.session(key)
+    const user = (await rpc('findOrInsertUser', [key.toPublicKey().toString()])).result.user.userId
+    const { atomic } = payment(4050)
+    const before = await stored(), posts = zeroPosts
+    const r = await named(atomic, [pay(0, 'one'), pay(0, 'one')], rpc)
+    assert.deepEqual(r.error, { code: -32602, message: UNIQUE }, JSON.stringify(r))
+    const after = await stored()
+    assert.deepEqual(Object.keys(after).filter(name => after[name] !== before[name]), ['output_baskets'])
+    const baskets = await zero.db.prepare('SELECT name FROM output_baskets WHERE user_id = ?').bind(user).all()
+    assert.deepEqual(baskets.results.map(b => b.name), ['default'])
+    assert.equal(JSON.parse(after.output_baskets).length, JSON.parse(before.output_baskets).length + 1)
+    assert.equal(zeroPosts, posts)
   })
 } finally { await zero.mf.dispose() }
 console.log(`Tracker Worker witnesses: ${ran - failed} passed; ${failed} failed`)
