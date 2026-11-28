@@ -88,8 +88,7 @@ typed code with the figure in force and, where the door knows it, the size:
 Where the payment is an array whose length is read only as it is decoded,
 `size` is absent and the message reads `Not judged: this payment is more than
 614400 bytes, the most this host reads of a payment: ...` with the same
-close. The door reads and keeps nothing of a refused payment. Each refusal is
-counted by one log line:
+close. Each refusal is counted by one log line:
 `payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=<bytes or none> budget=<the figure> identity_key=<the caller's public identity key>`.
 The reference's servers run under a process with no isolate ceiling and name
 no such figure; this host differs on purpose.
