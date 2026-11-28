@@ -4,6 +4,64 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.7, 2026-11-28: a door reads at most 600 KiB of a payment's bytes
+
+### Changed
+
+- **A door reads at most the payment figure of a payment's bytes**: the
+  Worker's setting `MAX_PAYMENT_BYTES`, in bytes; missing, zero or malformed,
+  614,400 (600 KiB), and a zero or malformed value is named once in the log.
+  `GET /` shows the figure in force as `max_payment_bytes`. An ordinary
+  payment is about a kilobyte; an operator who must take a larger one raises
+  the setting. `internalizeAction`'s AtomicBEEF, inline (`tx`, a JSON array of
+  bytes or a hex string) or at rest (`beefAtRest`, on the length the reference
+  names), and `processAction`'s signed transaction (`rawTx`) over it are
+  refused before any of it is parsed or verified and before anything is
+  written, with the arguments named or positional. A JSON array is decoded no
+  further than the figure (an array between the figure and the request's
+  1,000,000-item bound is refused by the figure); a hex string is held on its
+  length before it is decoded. The answer is `-32602`, the code of every
+  refused argument here, with the message `Not judged: this payment is {size}
+  bytes, and this host reads at most {budget} bytes of a payment: ...` (or
+  `... is more than {budget} bytes, the most this host reads of a payment:
+  ...` where the size is not known) and `data` `{code: "ERR_PAYMENT_SIZE",
+  budget, size}`; each refusal is counted by one `payment.not_judged` log
+  line. A Worker's isolate is memory-limited and a door bounds what it reads.
+  The reference names no such figure (its storage server holds a request's
+  bodies at 8 MiB and its arrays at 1,000,000 items); this host differs on
+  purpose. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then.
+- **A provider's answer is read within a bound and held to the same figure
+  before it is parsed**: a merkle proof from ARC, WhatsOnChain or Bitails, a
+  raw transaction from WhatsOnChain, Arcade's stored record, and the body of
+  `/arcade/callback` are read no further than twice the figure and 64 KiB
+  (an answer declaring a longer length is not read); the merkle path or
+  transaction inside is then held to the figure. Past either, that provider
+  is taken as unavailable at that moment, as on its error; each is counted by
+  one `provider.answer_not_read` log line. WhatsOnChain's status answers
+  (`/txs/status`, the second source asked after a broadcaster's refusal) and
+  its spent answers are read within the same bound; past it, the answer is
+  WhatsOnChain's error, so after a refusal it is no answer and the rows are
+  held without credit, as in 0.7.6. The lock is unchanged; no migration, no
+  `wrangler.toml` change.
+
+### Tests
+
+- `door::payment`'s and `services::arc`'s unit tests, the setting's fallback
+  and its log line, the positional form, the answer bound, and a door under
+  another figure; `tests/worker_door_policies.mjs` 1b and 8b-8e,
+  `tests/worker_beef_at_rest.mjs` 3b and `tests/worker_proof_hold.mjs` g-j:
+  one byte over refused at each door, named and positional, with no row
+  written (the users table included) and the log line pinned, exactly the
+  figure passed to the door's own handling, a Worker with
+  `MAX_PAYMENT_BYTES = "2000"` following it and one with `"600k"` serving
+  the default and saying so once, and a provider's answer over the figure or
+  past the bound not read on any proof path. The at-rest suite's accepted
+  chain is one of exactly the figure.
+- `tests/worker_tracker_rule.mjs` mk14: the broadcaster refuses and the
+  second source's answer passes the bound (one that, read whole, would say
+  "not known"): the caller is answered the refusal and the rows are held
+  without credit, as in mk9.
+
 ## 0.7.6, 2026-11-28: a coin's row is marked from a checked proof of its spender
 
 ### Changed
