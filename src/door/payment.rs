@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn a_payment_at_the_budget_is_read_as_before() {
+    fn a_payment_at_the_budget_decodes_as_serde_json_decodes_it() {
         let at = vec![7u8; CAP];
         for (method, field) in [("internalizeAction", "tx"), ("processAction", "rawTx")] {
             for params in [
