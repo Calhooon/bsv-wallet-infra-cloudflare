@@ -106,11 +106,14 @@ fn unfan(body: &serde_json::Value) -> Vec<TxEvent> {
 }
 
 /// Handle an authenticated webhook body. Returns a small JSON summary (also logged).
+/// `budget` is the payment figure (`door::payment`, MAX_PAYMENT_BYTES), read once
+/// by the caller: the most bytes of a merkle path read.
 pub async fn handle(
     env: &Env,
     db: &D1Database,
     blobs: &Bucket,
     body: serde_json::Value,
+    budget: u64,
 ) -> serde_json::Value {
     let events = unfan(&body);
     if events.is_empty() {
@@ -136,8 +139,6 @@ pub async fn handle(
         .or_else(|| env.var("WOC_API_KEY").ok().map(|v| v.to_string()));
     let headers =
         crate::services::chaintracker::build_header_provider(chaintracks_url, woc_api_key);
-    // The most bytes of a merkle path read (`door::payment`, MAX_PAYMENT_BYTES).
-    let budget = crate::payment_budget(env);
 
     let mut processed = 0u32;
     let mut ignored = 0u32;
@@ -204,7 +205,9 @@ async fn handle_one(
     }
     let mut record_block_hash: Option<String> = None;
     if candidates.is_empty() {
-        if let Some(record) = crate::services::arcade::fetch_tx_record(arcade_url, &ev.txid).await {
+        if let Some(record) =
+            crate::services::arcade::fetch_tx_record(arcade_url, &ev.txid, budget).await
+        {
             if let Some(h) = record
                 .get("merklePath")
                 .and_then(|m| m.as_str())

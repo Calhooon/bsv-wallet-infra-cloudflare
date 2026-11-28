@@ -438,7 +438,16 @@ impl ProofService for WocProvider {
                 return Err(format!("WoC get_raw_tx error {}", status));
             }
 
-            let hex_str = response.text().await.map_err(|e| e.to_string())?;
+            // Read no further than the payment figure's answer bound
+            // (`door::payment::read_answer`): past it, WoC's error.
+            let hex_str = crate::door::payment::read_answer(
+                &mut response,
+                "woc",
+                "raw_tx",
+                self.payment_budget,
+            )
+            .await
+            .map_err(String::from)?;
             let hex_str = hex_str.trim().trim_matches('"');
             if hex_str.is_empty() {
                 return Ok(None);
@@ -712,7 +721,9 @@ async fn fetch_tsc_proof(
             continue;
         }
         if status >= 400 {
-            let body = response.text().await.unwrap_or_default();
+            let body = crate::door::payment::read_answer(&mut response, "woc", "proof", budget)
+                .await
+                .unwrap_or_default();
             worker::console_log!(
                 "WoC TSC proof {}: HTTP {} body={} has_key={}",
                 txid,
@@ -723,7 +734,11 @@ async fn fetch_tsc_proof(
             return Err(format!("WoC proof API error {}", status));
         }
 
-        let text = response.text().await.map_err(|e| e.to_string())?;
+        // Read no further than the payment figure's answer bound
+        // (`door::payment::read_answer`), then held to the figure itself.
+        let text = crate::door::payment::read_answer(&mut response, "woc", "proof", budget)
+            .await
+            .map_err(String::from)?;
         crate::door::payment::admit_answer("woc", "proof", (text.len() / 2) as u64, budget)?;
         let result = parse_tsc_proof_response(&text);
         if let Ok(ref v) = result {

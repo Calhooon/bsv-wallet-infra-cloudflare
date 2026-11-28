@@ -198,10 +198,16 @@ async fn fetch_bitails_tsc_proof(
     // Bitails may return either a single object or an array depending on
     // version. Try object first, then array, then extract the flattened
     // `WocTscProof` payload.
-    let text = response
-        .text()
+    // Read no further than the payment figure's answer bound
+    // (`door::payment::read_answer`), then held to the figure itself.
+    let text = crate::door::payment::read_answer(&mut response, "bitails", "proof", budget)
         .await
-        .map_err(|e| format!("bitails tsc proof read error: {}", e))?;
+        .map_err(|e| match e {
+            crate::door::payment::AnswerError::Over(line) => line,
+            crate::door::payment::AnswerError::Read(e) => {
+                format!("bitails tsc proof read error: {}", e)
+            }
+        })?;
     if text.is_empty() || text == "null" || text == "[]" {
         return Ok(None);
     }

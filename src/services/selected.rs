@@ -88,7 +88,9 @@ impl SelectedProvider {
         match choice {
             BroadcasterChoice::Arc => SelectedProvider::Arc(multi),
             BroadcasterChoice::Arcade => SelectedProvider::Arcade {
-                arcade: ArcadeProvider::new(arcade_url).with_callback(callback),
+                arcade: ArcadeProvider::new(arcade_url)
+                    .with_callback(callback)
+                    .with_payment_budget(multi.payment_budget()),
                 fallback: multi,
             },
         }

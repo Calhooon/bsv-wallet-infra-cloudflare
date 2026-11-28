@@ -203,7 +203,20 @@ impl ArcProvider {
             .map_err(|e| format!("ARC fetch {}: {}", base_url, e))?;
 
         let status = response.status_code();
-        let text = response.text().await.unwrap_or_default();
+        // Read no further than the payment figure's answer bound
+        // (`door::payment::read_answer`): past it, this endpoint's error.
+        let text = match crate::door::payment::read_answer(
+            &mut response,
+            "arc",
+            "proof",
+            self.payment_budget,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(crate::door::payment::AnswerError::Over(line)) => return Err(line),
+            Err(crate::door::payment::AnswerError::Read(_)) => String::new(),
+        };
         Ok((status, text))
     }
 }

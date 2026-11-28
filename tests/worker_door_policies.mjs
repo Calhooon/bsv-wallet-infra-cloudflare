@@ -3,8 +3,10 @@
 // from wrangler.toml; GET / naming each binding bound or absent; the 429's
 // draft-8 headers), the list budgets, findOrInsertUser bound to the session,
 // migrate without a write, a D1 fault collapsed on the wire, the status route
-// behind the trigger key, healthz (with the build object) and robots.txt, and
-// a BEEF measured before it is parsed (internalizeAction, processAction).
+// behind the trigger key, healthz (with the build object) and robots.txt,
+// a BEEF measured before it is parsed (internalizeAction, processAction), and
+// a payment's bytes held to the figure in force, named or positional, with
+// the figure shown on GET / and a malformed setting named once in the log.
 // Miniflare with D1, KV, R2 and the rate-limit bindings; @bsv/sdk's AuthFetch
 // for the BRC-31 door.
 // Nothing leaves this process. No deploy.
@@ -175,11 +177,15 @@ print(json.dumps(statements))
     say(`healthz: 200 {"status":"ok","build":${JSON.stringify(build)}}, no-store; robots.txt: User-agent: * / Disallow: /`)
   }
 
-  // 1b. GET / names each rate-limit binding: bound here, absent on a Worker without them.
+  // 1b. GET / names each rate-limit binding: bound here, absent on a Worker
+  // without them; and the payment figure in force, a number (614,400 where
+  // MAX_PAYMENT_BYTES is unset).
   {
     const root = await fetch(new URL('/', base))
     assert.equal(root.status, 200)
-    assert.deepEqual((await root.json()).rate_limits, { RATE_LIMIT_IP: 'bound', RATE_LIMIT_IDENTITY: 'bound' })
+    const rootBody = await root.json()
+    assert.deepEqual(rootBody, { status: 'ok', service: 'wallet-infra', broadcaster: 'arc', rate_limits: { RATE_LIMIT_IP: 'bound', RATE_LIMIT_IDENTITY: 'bound' }, max_payment_bytes: 614400 })
+    say(`GET /: ${JSON.stringify(rootBody)}`)
     const { ratelimits, ...unbound } = options
     const bare = new Miniflare(unbound)
     try {
@@ -414,6 +420,56 @@ print(json.dumps(statements))
     assert.notEqual(handled.error?.message, 'RPC arrays must not exceed 1000000 items', JSON.stringify(handled).slice(0, 600))
     assert.notEqual(handled.error?.message, 'the transaction is too large to process', JSON.stringify(handled).slice(0, 600))
     assert.equal(notJudged().length, expected.length)
+    // 8c'. The positional form: the arguments as an array in the method's
+    // field order (internalizeAction: tx first; processAction: rawTx
+    // seventh), from a caller with no user row yet. One byte over is refused
+    // at the decode door with the pinned sentence and code, before the
+    // caller's user is looked up: no table gains a row, the users table
+    // included. Exactly the figure is handled as the named form is.
+    const freshKey = PrivateKey.fromRandom()
+    const fresh = freshKey.toPublicKey().toString()
+    const freshClient = clientFrom(freshKey, () => '192.0.2.12')
+    const send = async (method, params) => {
+      const r = await call(freshClient, method, params)
+      assert.equal(r.status, 200, JSON.stringify(r.body).slice(0, 600))
+      return r.body
+    }
+    const outputs = [{ outputIndex: 0, protocol: 'basket insertion', insertionRemittance: { basket: 'measure' } }]
+    const positionalInternalize = tx => send('internalizeAction', [{ identityKey: fresh }, [tx, outputs, 'a positional payment', null, null]])
+    const positionalProcess = rawTx => {
+      const txid = Buffer.from(sha(sha(Buffer.from(rawTx)))).reverse().toString('hex')
+      return send('processAction', [{ identityKey: fresh }, [true, false, false, false, budgetRef, txid, rawTx, []]])
+    }
+    const beforePositional = await counts()
+    assert.equal(await db.prepare('SELECT COUNT(*) AS n FROM users WHERE identity_key = ?').bind(fresh).first('n'), 0)
+    const positionalLogs = logs.length
+    const positionalBeef = await positionalInternalize(overBeef.toString('hex'))
+    assert.deepEqual(positionalBeef.error, { code: -32602, message: pinnedIs(CAP + 1), data: { code: 'ERR_PAYMENT_SIZE', budget: CAP, size: CAP + 1 } }, JSON.stringify(positionalBeef).slice(0, 600))
+    const positionalRaw = await positionalProcess(over)
+    assert.deepEqual(positionalRaw.error, { code: -32602, message: pinnedMore(), data: { code: 'ERR_PAYMENT_SIZE', budget: CAP } }, JSON.stringify(positionalRaw).slice(0, 600))
+    assert.deepEqual(await counts(), beforePositional)
+    assert.equal(await db.prepare('SELECT COUNT(*) AS n FROM users WHERE identity_key = ?').bind(fresh).first('n'), 0)
+    const positionalExpected = [
+      `payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=${CAP + 1} budget=${CAP} identity_key=${fresh}`,
+      `payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=none budget=${CAP} identity_key=${fresh}`,
+    ]
+    const positionalLines = () => logs.slice(positionalLogs).filter(l => l.startsWith('payment.not_judged'))
+    const positionalDeadline = Date.now() + 5000
+    while (positionalLines().length < positionalExpected.length && Date.now() < positionalDeadline) await new Promise(r => setTimeout(r, 50))
+    assert.deepEqual(positionalLines(), positionalExpected)
+    // Exactly the figure: the positional AtomicBEEF meets what the named one
+    // meets, and the positional transaction passes to the storage.
+    const atBeef = Buffer.concat([Buffer.from(beef.slice(0, 44)), Buffer.alloc(CAP - 44, 0x22)]).toString('hex')
+    const namedAt = await internalize(atBeef)
+    const positionalAt = await positionalInternalize(atBeef)
+    assert.notEqual(positionalAt.error?.data?.code, 'ERR_PAYMENT_SIZE', JSON.stringify(positionalAt).slice(0, 600))
+    assert.deepEqual(positionalAt.error, namedAt.error, JSON.stringify(positionalAt).slice(0, 600))
+    const positionalHandled = await positionalProcess(exact)
+    assert.notEqual(positionalHandled.error?.data?.code, 'ERR_PAYMENT_SIZE', JSON.stringify(positionalHandled).slice(0, 600))
+    assert.notEqual(positionalHandled.error?.message, 'RPC arrays must not exceed 1000000 items', JSON.stringify(positionalHandled).slice(0, 600))
+    assert.equal(positionalLines().length, positionalExpected.length)
+    say(`positional: internalizeAction's ${overBeef.length}-byte AtomicBEEF (hex, first) -32602 ${JSON.stringify(positionalBeef.error.data)}; processAction's ${over.length}-byte transaction (array, seventh) -32602 ${JSON.stringify(positionalRaw.error.data)}; no table gained a row, the users table included; at the figure the AtomicBEEF meets what the named form meets (${JSON.stringify(namedAt.error ?? namedAt.result).slice(0, 80)}) and the transaction passed to the storage: ${JSON.stringify(positionalHandled.error ?? positionalHandled.result).slice(0, 120)}`)
+
     say(`payment budget: processAction's ${over.length}-byte transaction (array) -32602 ${JSON.stringify(overRefused.error.data)}; internalizeAction's ${overBeef.length}-byte AtomicBEEF (hex) -32602 ${JSON.stringify(beefRefused.error.data)}; the ${between.length}-byte array, under the array budget, -32602 ${JSON.stringify(betweenRefused.error.data)}; counted "${expected[0]}"; no table gained or lost a row; the ${exact.length}-byte transaction passed to the storage: ${JSON.stringify(handled.error ?? handled.result).slice(0, 160)}`)
 
     // 8d. Another figure: a Worker whose setting MAX_PAYMENT_BYTES is 2000.
@@ -432,6 +488,8 @@ print(json.dumps(statements))
         assert.equal(r.status, 200, JSON.stringify(r.body))
         return r.body
       }
+      const figuredRoot = await (await fetch(new URL('/', figuredBase))).json()
+      assert.equal(figuredRoot.max_payment_bytes, FIGURE)
       await send('findOrInsertUser', [caller])
       const payment = n => ({ tx: Buffer.concat([Buffer.from(beef.slice(0, 44)), Buffer.alloc(n - 44, 0x22)]).toString('hex'),
         outputs: [{ outputIndex: 0, protocol: 'basket insertion', insertionRemittance: { basket: 'measure' } }], description: 'another figure' })
@@ -451,6 +509,33 @@ print(json.dumps(statements))
     } finally {
       await figured.dispose()
     }
+
+    // 8e. A malformed setting: MAX_PAYMENT_BYTES = "600k" is the default, the
+    // Worker serves, GET / shows the figure in force, and one log line names
+    // the variable and the figure, once for the isolate however many requests
+    // read it. The default Worker (no setting) logs no such line.
+    const misset = new Miniflare({ ...options, bindings: { ...options.bindings, MAX_PAYMENT_BYTES: '600k' } })
+    try {
+      const since = logs.length
+      const malformedBase = await misset.ready
+      const first = await fetch(new URL('/', malformedBase))
+      assert.equal(first.status, 200)
+      const shown = await first.json()
+      assert.equal(shown.max_payment_bytes, 614400)
+      const second = await fetch(new URL('/', malformedBase))
+      assert.equal((await second.json()).max_payment_bytes, 614400)
+      assert.equal((await fetch(new URL('/healthz', malformedBase))).status, 200)
+      const line = 'setting.malformed MAX_PAYMENT_BYTES is not a positive whole number of bytes; the figure in force is 614400'
+      const seen = () => logs.slice(since).filter(l => l.startsWith('setting.malformed'))
+      const until = Date.now() + 5000
+      while (seen().length < 1 && Date.now() < until) await new Promise(r => setTimeout(r, 50))
+      await new Promise(r => setTimeout(r, 200))
+      assert.deepEqual(seen(), [line])
+      say(`malformed setting (MAX_PAYMENT_BYTES="600k"): GET / ${JSON.stringify(shown)}; logged once "${line}"`)
+    } finally {
+      await misset.dispose()
+    }
+    assert.deepEqual(logs.filter(l => l.startsWith('setting.malformed')).length, 1)
   }
 
   // 9. The two rate limits, in one window of the limiter (aligned to its period).

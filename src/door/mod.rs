@@ -6,7 +6,8 @@
 //! the reference's order: the in-flight ceiling, the body bound, the rate
 //! limits, the request budgets, the response bound. A caller's BEEF is
 //! measured before the storage parses it (`beef_measure`), and a payment's
-//! bytes are read no further than one mebibyte (`payment`).
+//! bytes are read no further than the payment figure, the setting
+//! `MAX_PAYMENT_BYTES` (614,400 bytes, 600 KiB, by default; `payment`).
 
 pub mod beef_measure;
 pub mod bounds;

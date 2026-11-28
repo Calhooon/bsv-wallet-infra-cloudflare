@@ -60,20 +60,26 @@ force of them (the BEEF or the transaction as bytes, whatever encoding
 carried it) and refuses a larger one before it parses or verifies any of it
 and before anything is written (`door::payment`). The figure is the Worker's
 setting `MAX_PAYMENT_BYTES`, a var in bytes; where it is missing, zero or not
-a whole number it is 614,400 bytes (600 KiB). An ordinary payment is a few
-kilobytes (in 727 real payments the median was 5.4 KB and the largest
-434 KB); an operator who must take a larger one raises the setting. A
+a whole number it is 614,400 bytes (600 KiB). A zero or malformed value is
+named once in the log (`setting.malformed MAX_PAYMENT_BYTES is not a
+positive whole number of bytes; the figure in force is 614400`), and
+`GET /` shows the figure in force as `max_payment_bytes`. An ordinary payment
+is about a kilobyte (in 727 real payments the median was 1.2 KB and the
+largest 434 KB); an operator who must take a larger one raises the setting. A
 Worker's isolate is memory-limited and a door bounds what it reads. The
 doors are `internalizeAction`'s AtomicBEEF inline (`tx`, a JSON array of
 bytes or a hex string), `processAction`'s signed transaction (`rawTx`), and
 `internalizeAction`'s BEEF at rest (`beefAtRest`, held on the length its
 reference names, which the object's head must match, before the object is
-opened). An array is decoded no further than the figure and a hex string is
-held on its length before it is decoded; a request's other arguments keep
-their own limits. The request's bound of 1,000,000 array items is unchanged:
-an array between the figure and that bound is refused by the figure. The
-figure is provisional: it is read again at this crate's next bsv-rs pin and
-raised to the door's natural figure then.
+opened). The arguments may be named (`{"tx": ...}`) or positional (an array
+in the method's field order: `tx` first, `rawTx` seventh); in either form the
+payment is held as the request is decoded, before the caller's user is
+looked up or anything is written. An array is decoded no further than the
+figure and a hex string is held on its length before it is decoded; a
+request's other arguments keep their own limits. The request's bound of
+1,000,000 array items is unchanged: an array between the figure and that
+bound is refused by the figure. The figure is provisional: it is read again
+at this crate's next bsv-rs pin and raised to the door's natural figure then.
 
 The refusal is the JSON-RPC error of a refused argument, `-32602`, its
 `message` one of two sentences with the door's values, and its `data` the
@@ -90,10 +96,15 @@ Where the payment is an array whose length is read only as it is decoded,
 614400 bytes, the most this host reads of a payment: ...` with the same
 close. Each refusal is counted by one log line:
 `payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=<bytes or none> budget=<the figure> identity_key=<the caller's public identity key>`.
-The reference's servers run under a process with no isolate ceiling and name
-no such figure; this host differs on purpose.
+The reference names no such figure: its storage server holds a request's
+JSON and binary bodies at 8 MiB and its arrays at 1,000,000 items in the
+standard profile (bsv-blockchain/ts-stack@57c5f13,
+`StorageServer.ts:547-558, 561-566, 402-408`); this host differs on purpose.
 
-An answer a provider sends that the Worker hands to bsv-rs is held to the
+An answer a provider sends is read no further than twice the figure (its
+bytes travel as hex) and 64 KiB for its JSON wrapping: an answer that declares
+a longer `Content-Length` is not read, and one that passes the bound as it
+arrives is not read on. What the Worker hands to bsv-rs is then held to the
 same figure before it is parsed: a merkle proof from ARC (its `merklePath`),
 from WhatsOnChain or Bitails (the TSC answer, whose nodes travel as hex, at
 half its length), a raw transaction from WhatsOnChain (`/tx/{txid}/hex`), and
@@ -103,7 +114,9 @@ provider is taken as unavailable at that moment, the road a provider's error
 already takes (the next provider is asked, the request is held for the
 monitor's next run); it is never a verdict on a transaction. Each is counted
 by one log line:
-`provider.answer_not_read provider=<arc|woc|bitails|arcade> answer=<proof|raw_tx> size=<bytes> budget=<the figure>`.
+`provider.answer_not_read provider=<arc|woc|bitails|arcade> answer=<proof|raw_tx> size=<bytes> budget=<the figure>`,
+or, for an answer not read past the bound,
+`provider.answer_not_read provider=<...> answer=<proof|raw_tx|record|callback> <declared|read>=<bytes> bound=<bytes>`.
 
 The BRC-31 handshake is answered by the middleware; an authenticated request to any other path is a 404. The
 cron trigger in [wrangler.toml](wrangler.toml) (`*/5 * * * *`) runs the monitor.
