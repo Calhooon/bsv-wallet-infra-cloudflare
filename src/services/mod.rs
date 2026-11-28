@@ -133,6 +133,9 @@ pub struct ProofResult {
     pub block_hash: String,
     /// Merkle root of the block (empty if not available from provider).
     pub merkle_root: String,
+    /// The provider that answered (`arc`, `woc`, `bitails`, `arcade`), named
+    /// in the monitor's log lines.
+    pub provider: &'static str,
 }
 
 /// Status of a single transaction from batch status check.

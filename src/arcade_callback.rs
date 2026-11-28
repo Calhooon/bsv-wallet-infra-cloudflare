@@ -277,6 +277,7 @@ async fn handle_one(
         block_height: height,
         block_hash,
         merkle_root: root,
+        provider: "arcade",
     };
     // store_proof_result re-runs the same root gate (a RootCache hit — no extra lookup).
     let stored = crate::monitor::store_proof_result(

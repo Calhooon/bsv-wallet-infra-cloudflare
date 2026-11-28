@@ -602,16 +602,27 @@ async fn pair_members(
 
 async fn member_path(blobs: &Bucket, m: &PairMemberRow) -> Option<Vec<u8>> {
     let id = m.proven_tx_id? as i64;
-    let d1 = m
-        .merkle_path
-        .as_deref()
+    stored_path(blobs, id, m.merkle_path.as_deref())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// A proven_txs row's stored merkle path: the D1 column (read as `hex()`),
+/// else its R2 blob. `Ok(None)` when neither holds one; `Err` when the read
+/// itself failed.
+pub(crate) async fn stored_path(
+    blobs: &Bucket,
+    id: i64,
+    d1_hex: Option<&str>,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    let d1 = d1_hex
         .filter(|h| !h.is_empty())
         .and_then(|h| hex::decode(h).ok());
     crate::r2::BlobStore::new(blobs)
         .get("proven_txs", id, "merkle_path", d1)
         .await
-        .ok()
-        .flatten()
+        .map_err(|e| e.to_string())
 }
 
 async fn first_member_root(blobs: &Bucket, members: &[PairMemberRow]) -> Option<String> {
@@ -703,9 +714,54 @@ async fn repair_row<P: ProofService, H: HeaderService>(
     }
 }
 
-/// Replace the proof fields exactly like `shallow_reorg_sweep` (merkle_path via
-/// BlobStore), plus idx and the VERIFIED root. Guarded on the old
-/// height/block_hash so a concurrent writer's newer proof is never clobbered.
+/// The write of a checked proof over a stored one: height, idx and root are
+/// the gate's (`PathFacts`), the path goes through BlobStore. Guarded on the
+/// old height/block_hash so a concurrent writer's newer proof is never
+/// clobbered. Binds: height, idx, block_hash, merkle_root, merkle_path,
+/// updated_at, proven_tx_id, old height, old block_hash.
+pub(crate) const CHECKED_PROOF_WRITE_SQL: &str =
+    "UPDATE proven_txs SET height = ?, idx = ?, block_hash = ?, merkle_root = ?, \
+     merkle_path = ?, updated_at = ? \
+     WHERE proven_tx_id = ? AND height = ? AND block_hash = ?";
+
+/// Write a proof the gate passed (`f`) over the stored row `id`, whose stored
+/// height and block hash are `old_height`/`old_block_hash`. Shared by the deep
+/// sweep's repair and the monitor's two reorg passes.
+pub(crate) async fn write_checked_proof(
+    db: &D1Database,
+    blobs: &Bucket,
+    id: i64,
+    old_height: u32,
+    old_block_hash: &str,
+    p: &ProofResult,
+    f: &PathFacts,
+) -> std::result::Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    let (mp_d1, _) = crate::r2::BlobStore::new(blobs)
+        .put("proven_txs", id, "merkle_path", &p.merkle_path_binary)
+        .await
+        .map_err(|e| e.to_string())?;
+    let meta = Query::new(CHECKED_PROOF_WRITE_SQL)
+        .bind(f.height as i64)
+        .bind(f.idx as i64)
+        .bind(p.block_hash.as_str())
+        .bind(f.root.as_str())
+        .bind(mp_d1)
+        .bind(now.as_str())
+        .bind(id)
+        .bind(old_height as i64)
+        .bind(old_block_hash)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if meta.changes == 0 {
+        return Err("row changed concurrently (0 rows updated)".to_string());
+    }
+    Ok(())
+}
+
+/// Replace the proof fields with a checked proof (`write_checked_proof`) and
+/// record the repair.
 async fn write_repair(
     db: &D1Database,
     blobs: &Bucket,
@@ -715,31 +771,7 @@ async fn write_repair(
     p: &ProofResult,
     f: &PathFacts,
 ) -> std::result::Result<(), String> {
-    let now = Utc::now().to_rfc3339();
-    let (mp_d1, _) = crate::r2::BlobStore::new(blobs)
-        .put("proven_txs", id, "merkle_path", &p.merkle_path_binary)
-        .await
-        .map_err(|e| e.to_string())?;
-    let meta = Query::new(
-        "UPDATE proven_txs SET height = ?, idx = ?, block_hash = ?, merkle_root = ?, \
-         merkle_path = ?, updated_at = ? \
-         WHERE proven_tx_id = ? AND height = ? AND block_hash = ?",
-    )
-    .bind(f.height as i64)
-    .bind(f.idx as i64)
-    .bind(p.block_hash.as_str())
-    .bind(f.root.as_str())
-    .bind(mp_d1)
-    .bind(now.as_str())
-    .bind(id)
-    .bind(pair.height as i64)
-    .bind(pair.block_hash.as_str())
-    .execute(db)
-    .await
-    .map_err(|e| e.to_string())?;
-    if meta.changes == 0 {
-        return Err("row changed concurrently (0 rows updated)".to_string());
-    }
+    write_checked_proof(db, blobs, id, pair.height, &pair.block_hash, p, f).await?;
 
     let details = serde_json::json!({
         "txid": txid,
@@ -998,6 +1030,7 @@ mod tests {
             block_height: height,
             block_hash: "00".repeat(32),
             merkle_root: String::new(), // ARC-style: provider gave no root
+            provider: "test",
         };
         (a, proof, root)
     }

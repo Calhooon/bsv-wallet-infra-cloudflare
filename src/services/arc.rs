@@ -388,6 +388,7 @@ fn process_proof_response(
         block_height,
         block_hash: resp.block_hash.unwrap_or_default(),
         merkle_root: String::new(),
+        provider: "arc",
     }))
 }
 
