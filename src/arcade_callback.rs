@@ -106,11 +106,14 @@ fn unfan(body: &serde_json::Value) -> Vec<TxEvent> {
 }
 
 /// Handle an authenticated webhook body. Returns a small JSON summary (also logged).
+/// `budget` is the payment figure (`door::payment`, MAX_PAYMENT_BYTES), read once
+/// by the caller: the most bytes of a merkle path read.
 pub async fn handle(
     env: &Env,
     db: &D1Database,
     blobs: &Bucket,
     body: serde_json::Value,
+    budget: u64,
 ) -> serde_json::Value {
     let events = unfan(&body);
     if events.is_empty() {
@@ -140,7 +143,7 @@ pub async fn handle(
     let mut processed = 0u32;
     let mut ignored = 0u32;
     for ev in events {
-        match handle_one(db, blobs, &headers, &arcade_url, &ev).await {
+        match handle_one(db, blobs, &headers, &arcade_url, budget, &ev).await {
             Ok(true) => processed += 1,
             Ok(false) => ignored += 1,
             Err(e) => {
@@ -166,6 +169,7 @@ async fn handle_one(
     blobs: &Bucket,
     headers: &crate::services::chaintracker::HeaderProvider,
     arcade_url: &str,
+    budget: u64,
     ev: &TxEvent,
 ) -> std::result::Result<bool, String> {
     // Rung 1 scope: the PROOF push. MINED/IMMUTABLE carry (or imply) a merklePath;
@@ -201,7 +205,9 @@ async fn handle_one(
     }
     let mut record_block_hash: Option<String> = None;
     if candidates.is_empty() {
-        if let Some(record) = crate::services::arcade::fetch_tx_record(arcade_url, &ev.txid).await {
+        if let Some(record) =
+            crate::services::arcade::fetch_tx_record(arcade_url, &ev.txid, budget).await
+        {
             if let Some(h) = record
                 .get("merklePath")
                 .and_then(|m| m.as_str())
@@ -219,6 +225,10 @@ async fn handle_one(
         return Err("MINED but no merklePath available (payload or record)".to_string());
     };
 
+    // A merkle path of more than the payment figure is not decoded or parsed:
+    // the event is left to the monitor, as any per-tx problem here is
+    // (`door::payment`; nothing is stored).
+    crate::door::payment::admit_answer("arcade", "proof", (mp_hex.len() / 2) as u64, budget)?;
     let mp_bin = hex::decode(&mp_hex).map_err(|e| format!("merklePath hex: {e}"))?;
     let mp = MerklePath::from_binary(&mp_bin).map_err(|e| format!("BUMP parse: {e:?}"))?;
 

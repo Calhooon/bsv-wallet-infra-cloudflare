@@ -114,6 +114,9 @@ pub struct WocProvider {
     /// chain state; falling back to WoC's `/block/height/{h}` when it isn't
     /// set or errors keeps this change backward-compatible.
     chaintracks_url: Option<String>,
+    /// The most bytes of a proof or a raw transaction read from an answer
+    /// (`crate::door::payment`, the setting `MAX_PAYMENT_BYTES`).
+    payment_budget: u64,
 }
 
 impl Default for WocProvider {
@@ -128,7 +131,14 @@ impl WocProvider {
             header_cache: RefCell::new(HashMap::new()),
             api_key,
             chaintracks_url: None,
+            payment_budget: crate::door::payment::DEFAULT_MAX_PAYMENT_BYTES,
         }
+    }
+
+    /// The most bytes of a proof or a raw transaction read from an answer.
+    pub fn with_payment_budget(mut self, budget: u64) -> Self {
+        self.payment_budget = budget;
+        self
     }
 
     /// Configure the ChainTracks URL used for canonical block-hash lookups.
@@ -180,15 +190,27 @@ impl BroadcastService for WocProvider {
             .map_err(|e| BroadcastError::ServiceError(format!("Broadcast fetch: {}", e)))?;
 
         let status = response.status_code();
+        // Read no further than the payment figure's answer bound
+        // (`door::payment::read_answer`): past it, no answer, the service's
+        // error.
+        let text = match crate::door::payment::read_answer(
+            &mut response,
+            "woc",
+            "broadcast",
+            self.payment_budget,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(crate::door::payment::AnswerError::Over(line)) => {
+                return Err(BroadcastError::ServiceError(line))
+            }
+            Err(crate::door::payment::AnswerError::Read(_)) => String::new(),
+        };
 
         if status == 200 {
             // WoC returns the txid as the response body on success.
-            let txid = response
-                .text()
-                .await
-                .unwrap_or_default()
-                .trim()
-                .replace('"', "");
+            let txid = text.trim().replace('"', "");
             return Ok(BroadcastResult {
                 txid,
                 tx_status: "sent".to_string(),
@@ -197,7 +219,6 @@ impl BroadcastService for WocProvider {
         }
 
         // 400+ -- check if "already known" (not a real rejection)
-        let text = response.text().await.unwrap_or_default();
 
         if status >= 500 {
             // Server error -- transient
@@ -291,7 +312,7 @@ impl ProofService for WocProvider {
         // reorg). Earlier code took the first entry unconditionally and
         // silently cached stale orphan proofs — the exact failure mode that
         // blocked consolidation on claude at height 943424.
-        let proofs = fetch_tsc_proof(txid, api_key).await?;
+        let proofs = fetch_tsc_proof(txid, api_key, self.payment_budget).await?;
         if proofs.is_empty() {
             return Ok(None);
         }
@@ -428,11 +449,28 @@ impl ProofService for WocProvider {
                 return Err(format!("WoC get_raw_tx error {}", status));
             }
 
-            let hex_str = response.text().await.map_err(|e| e.to_string())?;
+            // Read no further than the payment figure's answer bound
+            // (`door::payment::read_answer`): past it, WoC's error.
+            let hex_str = crate::door::payment::read_answer(
+                &mut response,
+                "woc",
+                "raw_tx",
+                self.payment_budget,
+            )
+            .await
+            .map_err(String::from)?;
             let hex_str = hex_str.trim().trim_matches('"');
             if hex_str.is_empty() {
                 return Ok(None);
             }
+            // A transaction of more than the payment figure is not decoded:
+            // WoC is taken as unavailable for it (`door::payment`).
+            crate::door::payment::admit_answer(
+                "woc",
+                "raw_tx",
+                (hex_str.len() / 2) as u64,
+                self.payment_budget,
+            )?;
 
             return hex::decode(hex_str)
                 .map(Some)
@@ -504,7 +542,19 @@ impl ProofService for WocProvider {
                         return Err(format!("WoC get_status_for_txids HTTP {}", status));
                     }
 
-                    success = Some(response.text().await.map_err(|e| e.to_string())?);
+                    // Read no further than the payment figure's answer bound
+                    // (`door::payment::read_answer`): past it, WoC's error,
+                    // which the caller takes as no answer.
+                    success = Some(
+                        crate::door::payment::read_answer(
+                            &mut response,
+                            "woc",
+                            "status",
+                            self.payment_budget,
+                        )
+                        .await
+                        .map_err(String::from)?,
+                    );
                     break;
                 }
                 match success {
@@ -604,7 +654,17 @@ impl ProofService for WocProvider {
                 return Err(format!("WoC get_spent_status HTTP {}", status));
             }
 
-            let text = response.text().await.map_err(|e| e.to_string())?;
+            // Read no further than the payment figure's answer bound
+            // (`door::payment::read_answer`): past it, WoC's error, neither
+            // spent nor unspent.
+            let text = crate::door::payment::read_answer(
+                &mut response,
+                "woc",
+                "spent",
+                self.payment_budget,
+            )
+            .await
+            .map_err(String::from)?;
             return parse_spent_response(&text);
         }
 
@@ -642,9 +702,13 @@ fn parse_tsc_proof_response(text: &str) -> std::result::Result<Vec<WocTscProof>,
 /// Retries on 429 and 5xx via `RetryConfig::is_retryable_status`. CF Workers
 /// are single-threaded so retries are immediate (no sleep) — the value is
 /// hitting a different WoC backend on the next attempt.
+///
+/// An answer of more than twice `budget` characters (the proof's nodes travel
+/// as hex) is not parsed: WoC is taken as unavailable (`door::payment`).
 async fn fetch_tsc_proof(
     txid: &str,
     api_key: Option<&str>,
+    budget: u64,
 ) -> std::result::Result<Vec<WocTscProof>, String> {
     let url = format!("{}/tx/{}/proof/tsc", WOC_BASE, txid);
     let retry = RetryConfig::default();
@@ -690,7 +754,9 @@ async fn fetch_tsc_proof(
             continue;
         }
         if status >= 400 {
-            let body = response.text().await.unwrap_or_default();
+            let body = crate::door::payment::read_answer(&mut response, "woc", "proof", budget)
+                .await
+                .unwrap_or_default();
             worker::console_log!(
                 "WoC TSC proof {}: HTTP {} body={} has_key={}",
                 txid,
@@ -701,7 +767,12 @@ async fn fetch_tsc_proof(
             return Err(format!("WoC proof API error {}", status));
         }
 
-        let text = response.text().await.map_err(|e| e.to_string())?;
+        // Read no further than the payment figure's answer bound
+        // (`door::payment::read_answer`), then held to the figure itself.
+        let text = crate::door::payment::read_answer(&mut response, "woc", "proof", budget)
+            .await
+            .map_err(String::from)?;
+        crate::door::payment::admit_answer("woc", "proof", (text.len() / 2) as u64, budget)?;
         let result = parse_tsc_proof_response(&text);
         if let Ok(ref v) = result {
             if v.is_empty() {

@@ -1,7 +1,7 @@
 [package]
 name = "bsv-wallet-infra-cloudflare"
 description = "BSV wallet storage on Cloudflare Workers: JSON-RPC over D1 and R2 behind BRC-31 authentication."
-version = "0.7.6"
+version = "0.7.7"
 license = "MIT"
 edition = "2021"
 repository = "https://github.com/Calhooon/bsv-wallet-infra-cloudflare"

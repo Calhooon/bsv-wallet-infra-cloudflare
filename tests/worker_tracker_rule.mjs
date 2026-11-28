@@ -589,6 +589,8 @@ const marks = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.te
   if (url.host === 'api.whatsonchain.com' && request.method === 'POST' && url.pathname.endsWith('/txs/status')) {
     const { txids } = JSON.parse(await request.text())
     if (markWoc === 'error' && !txids.some(t => markMined.has(t))) return new Response('local fixture refusal', { status: 400 })
+    // An answer past the bound that, read whole, would say "not known".
+    if (markWoc === 'over' && !txids.some(t => markMined.has(t))) return new Response(JSON.stringify(txids.map(t => ({ txid: t, error: 'unknown' }))) + ' '.repeat(1_300_000), { headers: { 'content-type': 'application/json' } })
     return json(txids.map(t => markMined.has(t) ? { txid: t, blockhash: 'cd'.repeat(32), blockheight: 900100, confirmations: 1 } : markKnown.has(t) ? { txid: t } : { txid: t, error: 'unknown' }))
   }
   const spent = url.host === 'api.whatsonchain.com' && request.method === 'GET' && url.pathname.match(/\/tx\/([0-9a-f]{64})\/(\d+)\/spent$/)
@@ -831,6 +833,15 @@ try {
       assert.deepEqual([rows.tx, rows.spendable, rows.req], [tx, 0, req])
     })
   }
+  await check('mk14 the broadcaster refuses and the second source\'s answer passes the answer bound (1,294,336 bytes at the default figure): not read, so no answer; answered the refusal, the rows held without credit as in mk9; the owner\'s rows and balance as they were', async () => {
+    markArcade = 'invalid'; markWoc = 'over'
+    const c = await coin(331); const subject = spendOf(c, 332)
+    const balance = await callerBalance()
+    const r = refusal(await unchanged('mk14', () => take(withParent(c, subject), 331)))
+    assert.deepEqual(await heldRows(txid(subject)), { tx: 'unproven', spendable: 0, req: 'unmined', hold: r.error.message })
+    assert.equal(await callerBalance(), balance)
+    markWoc = 'unknown'
+  })
 } finally { await marks.mf.dispose() }
 console.log(`Tracker Worker witnesses: ${ran - failed} passed; ${failed} failed`)
 if (failed) process.exitCode = 1

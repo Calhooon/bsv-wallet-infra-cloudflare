@@ -131,7 +131,13 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
     // A fault's own text goes to the log, never to the wire (#22, door::errors).
     match result {
         Ok(val) => val,
-        Err(e) => crate::door::errors::rpc_error(id, &e),
+        Err(e) => {
+            if let Error::PaymentSize { size, budget } = &e {
+                let identity_key = auth.map_or("none", |a| a.identity_key.as_str());
+                crate::door::payment::log(*size, *budget, identity_key);
+            }
+            crate::door::errors::rpc_error(id, &e)
+        }
     }
 }
 
@@ -223,10 +229,17 @@ async fn handle_internalize_action<
         Error::ValidationError("internalizeAction requires authentication".to_string())
     })?;
 
-    let (user_id, _auth) = storage.resolve_auth(auth).await?;
     // The BEEF inline (`tx`) or at rest (`beefAtRest`, NL-7): see
-    // `crate::beef_at_rest::parse_internalize_params`.
-    let result = match crate::beef_at_rest::parse_internalize_params(&params)? {
+    // `crate::beef_at_rest::parse_internalize_params`. The arguments are read
+    // first, and a reference that names more bytes than the payment figure is
+    // refused here, before the caller's user is looked up or anything is
+    // written (`crate::door::payment`); the storage function holds it again.
+    let params = crate::beef_at_rest::parse_internalize_params(&params)?;
+    if let InternalizeParams::AtRest { reference, .. } = &params {
+        crate::door::payment::admit(reference.size, storage.payment_budget())?;
+    }
+    let (user_id, _auth) = storage.resolve_auth(auth).await?;
+    let result = match params {
         InternalizeParams::Inline(args) => storage.internalize_action(user_id, args).await?,
         InternalizeParams::AtRest { reference, args } => {
             storage

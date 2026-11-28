@@ -127,11 +127,23 @@ fn is_invalid_tx_body(text: &str) -> bool {
 
 pub struct ArcProvider {
     pub(crate) api_key: Option<String>,
+    /// The most bytes of a merkle proof read from an answer
+    /// (`crate::door::payment`, the setting `MAX_PAYMENT_BYTES`).
+    payment_budget: u64,
 }
 
 impl ArcProvider {
     pub fn new(api_key: Option<String>) -> Self {
-        Self { api_key }
+        Self {
+            api_key,
+            payment_budget: crate::door::payment::DEFAULT_MAX_PAYMENT_BYTES,
+        }
+    }
+
+    /// The most bytes of a merkle proof read from an answer.
+    pub fn with_payment_budget(mut self, budget: u64) -> Self {
+        self.payment_budget = budget;
+        self
     }
 
     fn build_headers(&self, content_type: &str) -> worker::Headers {
@@ -166,7 +178,21 @@ impl ArcProvider {
             .map_err(|e| format!("ARC fetch {}: {}", base_url, e))?;
 
         let status = response.status_code();
-        let text = response.text().await.unwrap_or_default();
+        // Read no further than the payment figure's answer bound
+        // (`door::payment::read_answer`): past it, this endpoint's error, and
+        // the race asks the next.
+        let text = match crate::door::payment::read_answer(
+            &mut response,
+            "arc",
+            "broadcast",
+            self.payment_budget,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(crate::door::payment::AnswerError::Over(line)) => return Err(line),
+            Err(crate::door::payment::AnswerError::Read(_)) => String::new(),
+        };
         Ok((status, text))
     }
 
@@ -191,7 +217,20 @@ impl ArcProvider {
             .map_err(|e| format!("ARC fetch {}: {}", base_url, e))?;
 
         let status = response.status_code();
-        let text = response.text().await.unwrap_or_default();
+        // Read no further than the payment figure's answer bound
+        // (`door::payment::read_answer`): past it, this endpoint's error.
+        let text = match crate::door::payment::read_answer(
+            &mut response,
+            "arc",
+            "proof",
+            self.payment_budget,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(crate::door::payment::AnswerError::Over(line)) => return Err(line),
+            Err(crate::door::payment::AnswerError::Read(_)) => String::new(),
+        };
         Ok((status, text))
     }
 }
@@ -305,10 +344,13 @@ fn process_broadcast_response(
     }
 }
 
+/// An answer whose merkle path is more than `budget` bytes is not decoded:
+/// the endpoint is taken as unavailable (`crate::door::payment::admit_answer`).
 fn process_proof_response(
     txid: &str,
     http_status: u16,
     text: &str,
+    budget: u64,
 ) -> std::result::Result<Option<ProofResult>, String> {
     if http_status == 404 {
         return Ok(None);
@@ -333,6 +375,7 @@ fn process_proof_response(
         Some(ref mp) if !mp.is_empty() => mp,
         _ => return Ok(None),
     };
+    crate::door::payment::admit_answer("arc", "proof", (merkle_path_hex.len() / 2) as u64, budget)?;
 
     let merkle_path_binary = hex::decode(merkle_path_hex)
         .map_err(|e| format!("ARC merklePath hex decode error: {}", e))?;
@@ -532,7 +575,7 @@ impl ProofService for ArcProvider {
                 }
             };
 
-            match process_proof_response(txid, status, &text) {
+            match process_proof_response(txid, status, &text, self.payment_budget) {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     last_error = e;
@@ -710,18 +753,40 @@ mod tests {
             r#"{{"txid":"abc","txStatus":"MINED","merklePath":"{}","blockHeight":800123}}"#,
             mp_hex
         );
-        let result = process_proof_response("abc", 200, &body).unwrap();
+        let result = process_proof_response("abc", 200, &body, 614_400).unwrap();
         assert!(result.is_some());
     }
 
     #[test]
+    fn test_proof_over_the_payment_figure_is_an_endpoint_unavailable() {
+        // A merkle path of exactly the figure is decoded; one byte over is not
+        // decoded and is the endpoint's error (the next endpoint, then WoC).
+        let body = |n: usize| {
+            format!(
+                r#"{{"txid":"abc","txStatus":"MINED","merklePath":"{}","blockHeight":800123}}"#,
+                hex::encode(vec![7u8; n])
+            )
+        };
+        let at = process_proof_response("abc", 200, &body(64), 64).unwrap();
+        assert_eq!(at.unwrap().merkle_path_binary.len(), 64);
+        assert_eq!(
+            process_proof_response("abc", 200, &body(65), 64).err(),
+            Some(crate::door::payment::answer_log_line(
+                "arc", "proof", 65, 64
+            ))
+        );
+    }
+
+    #[test]
     fn test_proof_404_returns_none() {
-        assert!(process_proof_response("abc", 404, "").unwrap().is_none());
+        assert!(process_proof_response("abc", 404, "", 614_400)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn test_proof_500_returns_error() {
-        assert!(process_proof_response("abc", 500, "err").is_err());
+        assert!(process_proof_response("abc", 500, "err", 614_400).is_err());
     }
 
     #[test]

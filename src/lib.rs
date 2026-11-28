@@ -47,6 +47,29 @@ fn env_value(env: &Env, name: &str) -> Option<String> {
         .or_else(|| env.var(name).ok().map(|v| v.to_string()))
 }
 
+/// Set once a malformed `MAX_PAYMENT_BYTES` has been named in the log.
+static PAYMENT_SETTING_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The most bytes of a payment a door reads, and of a provider's answer the
+/// Worker parses (`door::payment`): the var `MAX_PAYMENT_BYTES`, read as the
+/// other settings with a default are; missing, zero or malformed, the default
+/// of 614,400 bytes (600 KiB), never no figure. A zero or malformed value is
+/// named in the log once, at the first reading. Read once for each request
+/// (and each monitor run) and passed on.
+pub(crate) fn payment_budget(env: &Env) -> u64 {
+    let setting = door::payment::setting_from(
+        env.var(door::payment::SETTING)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
+    if let Some(line) = door::payment::setting_note(setting, &PAYMENT_SETTING_SAID) {
+        console_log!("{}", line);
+    }
+    setting.figure
+}
+
 /// ChainTracker for the monitor: ChainTracks (CHAINTRACKS_URL) with WoC fallback.
 fn build_monitor_headers(env: &Env) -> crate::services::chaintracker::HeaderProvider {
     let chaintracks_url = env
@@ -77,6 +100,7 @@ fn monitor_key_ok(env: &Env, url: &Url) -> bool {
 /// to run, never guessing a broadcaster.
 fn build_provider(
     env: &Env,
+    budget: u64,
 ) -> std::result::Result<crate::services::selected::SelectedProvider, String> {
     let arc_api_key = env_value(env, "ARC_API_KEY");
     let woc_api_key = env_value(env, "WOC_API_KEY");
@@ -89,7 +113,8 @@ fn build_provider(
         arc_api_key,
         woc_api_key,
         chaintracks_url,
-    );
+    )
+    .with_payment_budget(budget);
     let choice = crate::services::selected::BroadcasterChoice::parse(
         env_value(env, "BROADCASTER").as_deref(),
     )?;
@@ -158,9 +183,14 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         }
     }
 
+    // The payment figure (`door::payment`, MAX_PAYMENT_BYTES), read once here
+    // and passed to every door and provider this request reaches.
+    let budget = payment_budget(&env);
+
     // Health check (no auth). Surfaces the active broadcaster selection so a deploy
     // can be gate-checked (and a BROADCASTER typo is visible here, not just in logs),
-    // and each rate-limit binding as `bound` or `absent` (#22).
+    // each rate-limit binding as `bound` or `absent` (#22), and the payment figure
+    // in force, in bytes.
     if req.path() == "/" && req.method() == Method::Get {
         let broadcaster = match crate::services::selected::BroadcasterChoice::parse(
             env_value(&env, "BROADCASTER").as_deref(),
@@ -173,7 +203,8 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             "status": "ok",
             "service": "wallet-infra",
             "broadcaster": broadcaster,
-            "rate_limits": door::rate::surface(&env)
+            "rate_limits": door::rate::surface(&env),
+            "max_payment_bytes": budget
         }))?;
         return Ok(add_cors_headers(response));
     }
@@ -209,7 +240,17 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         if presented.as_deref() != Some(format!("Bearer {secret}").as_str()) {
             return Response::error("unauthorized", 401);
         }
-        let body: serde_json::Value = match req.json().await {
+        // The body is read no further than the payment figure's answer bound
+        // (`door::payment::read_request`); past it, it is not read on and is
+        // acknowledged as an unparseable body is, left to the monitor.
+        let text = match door::payment::read_request(&mut req, "arcade", "callback", budget).await {
+            Ok(text) => text,
+            Err(door::payment::AnswerError::Over(_)) => {
+                return Response::from_json(&serde_json::json!({ "ok": true, "processed": 0 }));
+            }
+            Err(door::payment::AnswerError::Read(_)) => String::new(),
+        };
+        let body: serde_json::Value = match serde_json::from_str(&text) {
             Ok(b) => b,
             Err(_) => {
                 // Unparseable body: ack (200) so a malformed event is not retried forever.
@@ -221,7 +262,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         let blobs = env
             .bucket("BLOBS")
             .map_err(|e| Error::from(e.to_string()))?;
-        let outcome = arcade_callback::handle(&env, &db, &blobs, body).await;
+        let outcome = arcade_callback::handle(&env, &db, &blobs, body, budget).await;
         return Response::from_json(&outcome);
     }
 
@@ -259,7 +300,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         let blobs = env
             .bucket("BLOBS")
             .map_err(|e| Error::from(e.to_string()))?;
-        let provider = match build_provider(&env) {
+        let provider = match build_provider(&env, budget) {
             Ok(p) => p,
             Err(e) => {
                 let response =
@@ -329,7 +370,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         let blobs = env
             .bucket("BLOBS")
             .map_err(|e| Error::from(e.to_string()))?;
-        let provider = match build_provider(&env) {
+        let provider = match build_provider(&env, budget) {
             Ok(p) => p,
             Err(e) => {
                 let response =
@@ -398,15 +439,26 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             .await
             .map_err(|e| Error::from(e.to_string()))?;
         let status = response.status_code();
-        let body = response.text().await.unwrap_or_default();
-        return Ok(add_cors_headers(Response::from_json(&serde_json::json!({
+        // Read no further than the payment figure's answer bound
+        // (`door::payment::read_answer`): past it, the line that says so.
+        let (body, not_read) =
+            match door::payment::read_answer(&mut response, "woc", "probe", budget).await {
+                Ok(body) => (body, None),
+                Err(door::payment::AnswerError::Over(line)) => (String::new(), Some(line)),
+                Err(door::payment::AnswerError::Read(_)) => (String::new(), None),
+            };
+        let mut probe = serde_json::json!({
             "url": url_str,
             "has_api_key": woc_key.is_some(),
             "api_key_len": woc_key.as_ref().map(|k| k.len()),
             "status": status,
             "body_len": body.len(),
             "body_preview": &body[..body.len().min(500)],
-        }))?));
+        });
+        if let Some(line) = not_read {
+            probe["answer_not_read"] = serde_json::Value::from(line);
+        }
+        return Ok(add_cors_headers(Response::from_json(&probe)?));
     }
 
     // UTXO audit — integrity checks and optional deep validation
@@ -531,10 +583,20 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         return sign_refusal(&too_large, &session);
     }
 
-    // Parse JSON-RPC request
-    let rpc_request: JsonRpcRequest = match serde_json::from_slice(&request_body) {
-        Ok(r) => r,
-        Err(_) => {
+    // Parse JSON-RPC request. A payment's argument, named or positional, is
+    // decoded no further than the payment budget (`door::payment`, the
+    // setting MAX_PAYMENT_BYTES, read above): over it, the call is refused as
+    // a refused argument before any of the payment is parsed.
+    let rpc_request: JsonRpcRequest = match door::payment::parse_request(&request_body, budget) {
+        door::payment::Parsed::Request(r) => r,
+        door::payment::Parsed::Refused { id, size } => {
+            door::payment::log(size, budget, &auth_context.identity_key);
+            let error =
+                door::errors::rpc_error(id, &crate::error::Error::PaymentSize { size, budget });
+            return sign_json_response(&error, 200, &[], &session)
+                .map_err(|e| Error::from(e.to_string()));
+        }
+        door::payment::Parsed::Malformed => {
             let error = JsonRpcError::parse_error();
             return sign_json_response(&error, 200, &[], &session)
                 .map_err(|e| Error::from(e.to_string()));
@@ -583,7 +645,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     // Build the env-selected broadcast/proof provider (BROADCASTER: arc|arcade; proofs
     // always ride ARC → WoC → Bitails with ChainTracks as the canonical-chain authority).
-    let provider = match build_provider(&env) {
+    let provider = match build_provider(&env, budget) {
         Ok(p) => p,
         Err(e) => {
             let response =
@@ -620,7 +682,8 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     let mut storage = StorageD1::new(&db, &blobs, &provider)
         .with_beef_verification(beef_mode, &header_provider)
-        .with_internalize_zero_conf(internalize_zero_conf);
+        .with_internalize_zero_conf(internalize_zero_conf)
+        .with_payment_budget(budget);
     if let Some(at_rest) = at_rest.as_ref() {
         storage = storage.with_beef_at_rest(at_rest);
     }
@@ -661,7 +724,9 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
         }
     };
 
-    let provider = match build_provider(&env) {
+    // The payment figure, read once for this run (`door::payment`).
+    let budget = payment_budget(&env);
+    let provider = match build_provider(&env, budget) {
         Ok(p) => p,
         Err(e) => {
             // A BROADCASTER typo must not silently run the monitor with a guessed

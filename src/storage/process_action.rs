@@ -173,6 +173,9 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 "processAction raw_tx must not be empty".to_string(),
             ));
         }
+        // At most the payment figure of the signed transaction is read
+        // (`crate::door::payment`), before it is hashed, parsed or written.
+        crate::door::payment::admit(raw_tx.len() as u64, self.payment_budget())?;
 
         // =====================================================================
         // Step 2: Verify txid matches raw_tx

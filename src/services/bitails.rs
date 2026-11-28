@@ -24,6 +24,9 @@ pub struct BitailsProvider {
     /// lookups (Bitails itself has no API key in this path). Carrying the
     /// key here keeps the canonical filter identical to WocProvider's.
     woc_api_key: Option<String>,
+    /// The most bytes of a proof read from an answer (`crate::door::payment`,
+    /// the setting `MAX_PAYMENT_BYTES`).
+    payment_budget: u64,
 }
 
 impl BitailsProvider {
@@ -31,7 +34,14 @@ impl BitailsProvider {
         Self {
             chaintracks_url: None,
             woc_api_key: None,
+            payment_budget: crate::door::payment::DEFAULT_MAX_PAYMENT_BYTES,
         }
+    }
+
+    /// The most bytes of a proof read from an answer.
+    pub fn with_payment_budget(mut self, budget: u64) -> Self {
+        self.payment_budget = budget;
+        self
     }
 
     pub fn with_chaintracks_url(mut self, url: Option<String>) -> Self {
@@ -75,7 +85,7 @@ impl ProofService for BitailsProvider {
         // object (not an array) because it prunes old blocks — we don't see
         // the orphan/canonical multi-entry shape WoC produces. Still
         // canonical-filter the result: trust no external source blindly.
-        let proof = match fetch_bitails_tsc_proof(txid).await? {
+        let proof = match fetch_bitails_tsc_proof(txid, self.payment_budget).await? {
             Some(p) => p,
             None => return Ok(None),
         };
@@ -161,7 +171,12 @@ impl ProofService for BitailsProvider {
     }
 }
 
-async fn fetch_bitails_tsc_proof(txid: &str) -> std::result::Result<Option<WocTscProof>, String> {
+/// An answer of more than twice `budget` characters (the proof's nodes travel
+/// as hex) is not parsed: Bitails is taken as unavailable (`door::payment`).
+async fn fetch_bitails_tsc_proof(
+    txid: &str,
+    budget: u64,
+) -> std::result::Result<Option<WocTscProof>, String> {
     let url = format!("{}/tx/{}/proof/tsc", BITAILS_BASE, txid);
     let mut init = worker::RequestInit::new();
     init.with_method(worker::Method::Get);
@@ -183,13 +198,20 @@ async fn fetch_bitails_tsc_proof(txid: &str) -> std::result::Result<Option<WocTs
     // Bitails may return either a single object or an array depending on
     // version. Try object first, then array, then extract the flattened
     // `WocTscProof` payload.
-    let text = response
-        .text()
+    // Read no further than the payment figure's answer bound
+    // (`door::payment::read_answer`), then held to the figure itself.
+    let text = crate::door::payment::read_answer(&mut response, "bitails", "proof", budget)
         .await
-        .map_err(|e| format!("bitails tsc proof read error: {}", e))?;
+        .map_err(|e| match e {
+            crate::door::payment::AnswerError::Over(line) => line,
+            crate::door::payment::AnswerError::Read(e) => {
+                format!("bitails tsc proof read error: {}", e)
+            }
+        })?;
     if text.is_empty() || text == "null" || text == "[]" {
         return Ok(None);
     }
+    crate::door::payment::admit_answer("bitails", "proof", (text.len() / 2) as u64, budget)?;
     if let Ok(single) = serde_json::from_str::<BitailsTscResponse>(&text) {
         return Ok(Some(single.proof));
     }

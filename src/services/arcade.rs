@@ -436,6 +436,9 @@ pub struct ArcadeProvider {
     /// The `/policy` answer, read once for this provider's life: one request,
     /// or one monitor run, however many refused rows it re-announces (#50).
     policy: std::cell::OnceCell<Option<super::policy_refusal::MiningFee>>,
+    /// The payment figure (`crate::door::payment`, MAX_PAYMENT_BYTES): a stored
+    /// record is read no further than its answer bound.
+    payment_budget: u64,
 }
 
 impl ArcadeProvider {
@@ -449,7 +452,14 @@ impl ArcadeProvider {
                 .to_string(),
             callback: None,
             policy: std::cell::OnceCell::new(),
+            payment_budget: crate::door::payment::DEFAULT_MAX_PAYMENT_BYTES,
         }
+    }
+
+    /// The payment figure a stored record is read under.
+    pub fn with_payment_budget(mut self, budget: u64) -> Self {
+        self.payment_budget = budget;
+        self
     }
 
     /// Register the webhook callback `(url, secret_token)` on every submit.
@@ -625,7 +635,24 @@ impl ArcadeProvider {
                 }
             };
             let status = response.status_code();
-            let text = response.text().await.unwrap_or_default();
+            // Read no further than the payment figure's answer bound
+            // (`door::payment::read_answer`): past it, no answer, as when the
+            // fetch fails: asked again, then the outage's fallback.
+            let text = match crate::door::payment::read_answer(
+                &mut response,
+                "arcade",
+                "broadcast",
+                self.payment_budget,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(crate::door::payment::AnswerError::Over(line)) => {
+                    last_error = line;
+                    continue;
+                }
+                Err(crate::door::payment::AnswerError::Read(_)) => String::new(),
+            };
             if status < 400 {
                 // 202 Accepted — the verdict is ASYNC; do NOT read a success out of this.
                 worker::console_log!(
@@ -716,7 +743,24 @@ impl ArcadeProvider {
                 }
             };
             let status = response.status_code();
-            let text = response.text().await.unwrap_or_default();
+            // Read no further than the payment figure's answer bound
+            // (`door::payment::read_answer`): past it, no answer, as when the
+            // fetch fails: asked again, then the outage's fallback.
+            let text = match crate::door::payment::read_answer(
+                &mut response,
+                "arcade",
+                "broadcast",
+                self.payment_budget,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(crate::door::payment::AnswerError::Over(line)) => {
+                    last_error = line;
+                    continue;
+                }
+                Err(crate::door::payment::AnswerError::Read(_)) => String::new(),
+            };
             if status < 400 {
                 worker::console_log!(
                     "Arcade: submitted raw {} → HTTP {} {}",
@@ -854,7 +898,7 @@ impl ArcadeProvider {
 
     /// `GET /tx/{txid}` → the current `txStatus`, if Arcade knows the tx.
     async fn poll_status(&self, txid: &str) -> Option<String> {
-        fetch_tx_record(&self.base_url, txid)
+        fetch_tx_record(&self.base_url, txid, self.payment_budget)
             .await?
             .get("txStatus")
             .and_then(|s| s.as_str())
@@ -866,7 +910,10 @@ impl ArcadeProvider {
 /// MINED — `blockHash`/`blockHeight`/`merklePath`). The webhook proof path uses this as
 /// its belt: a bulk MINED fan-out webhook shares block fields across the block's txids
 /// but cannot carry a per-tx merklePath inline, so the handler re-reads the record.
-pub async fn fetch_tx_record(base_url: &str, txid: &str) -> Option<serde_json::Value> {
+///
+/// The record is read no further than the payment figure `budget`'s answer bound
+/// (`door::payment::read_answer`): past it, `None`, as when Arcade does not answer.
+pub async fn fetch_tx_record(base_url: &str, txid: &str, budget: u64) -> Option<serde_json::Value> {
     let url = format!("{}/tx/{}", base_url.trim_end_matches('/'), txid);
     let mut init = worker::RequestInit::new();
     init.with_method(worker::Method::Get);
@@ -875,7 +922,10 @@ pub async fn fetch_tx_record(base_url: &str, txid: &str) -> Option<serde_json::V
     if response.status_code() >= 400 {
         return None;
     }
-    response.json().await.ok()
+    let text = crate::door::payment::read_answer(&mut response, "arcade", "record", budget)
+        .await
+        .ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 // =============================================================================

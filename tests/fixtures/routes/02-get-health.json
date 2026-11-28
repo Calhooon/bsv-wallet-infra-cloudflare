@@ -12,6 +12,7 @@
     "allowOrigin": "*",
     "body": {
       "broadcaster": "arc",
+      "max_payment_bytes": 614400,
       "rate_limits": {
         "RATE_LIMIT_IDENTITY": "absent",
         "RATE_LIMIT_IP": "absent"
