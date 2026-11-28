@@ -635,7 +635,24 @@ impl ArcadeProvider {
                 }
             };
             let status = response.status_code();
-            let text = response.text().await.unwrap_or_default();
+            // Read no further than the payment figure's answer bound
+            // (`door::payment::read_answer`): past it, no answer, as when the
+            // fetch fails: asked again, then the outage's fallback.
+            let text = match crate::door::payment::read_answer(
+                &mut response,
+                "arcade",
+                "broadcast",
+                self.payment_budget,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(crate::door::payment::AnswerError::Over(line)) => {
+                    last_error = line;
+                    continue;
+                }
+                Err(crate::door::payment::AnswerError::Read(_)) => String::new(),
+            };
             if status < 400 {
                 // 202 Accepted — the verdict is ASYNC; do NOT read a success out of this.
                 worker::console_log!(
@@ -726,7 +743,24 @@ impl ArcadeProvider {
                 }
             };
             let status = response.status_code();
-            let text = response.text().await.unwrap_or_default();
+            // Read no further than the payment figure's answer bound
+            // (`door::payment::read_answer`): past it, no answer, as when the
+            // fetch fails: asked again, then the outage's fallback.
+            let text = match crate::door::payment::read_answer(
+                &mut response,
+                "arcade",
+                "broadcast",
+                self.payment_budget,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(crate::door::payment::AnswerError::Over(line)) => {
+                    last_error = line;
+                    continue;
+                }
+                Err(crate::door::payment::AnswerError::Read(_)) => String::new(),
+            };
             if status < 400 {
                 worker::console_log!(
                     "Arcade: submitted raw {} → HTTP {} {}",

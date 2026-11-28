@@ -190,15 +190,27 @@ impl BroadcastService for WocProvider {
             .map_err(|e| BroadcastError::ServiceError(format!("Broadcast fetch: {}", e)))?;
 
         let status = response.status_code();
+        // Read no further than the payment figure's answer bound
+        // (`door::payment::read_answer`): past it, no answer, the service's
+        // error.
+        let text = match crate::door::payment::read_answer(
+            &mut response,
+            "woc",
+            "broadcast",
+            self.payment_budget,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(crate::door::payment::AnswerError::Over(line)) => {
+                return Err(BroadcastError::ServiceError(line))
+            }
+            Err(crate::door::payment::AnswerError::Read(_)) => String::new(),
+        };
 
         if status == 200 {
             // WoC returns the txid as the response body on success.
-            let txid = response
-                .text()
-                .await
-                .unwrap_or_default()
-                .trim()
-                .replace('"', "");
+            let txid = text.trim().replace('"', "");
             return Ok(BroadcastResult {
                 txid,
                 tx_status: "sent".to_string(),
@@ -207,7 +219,6 @@ impl BroadcastService for WocProvider {
         }
 
         // 400+ -- check if "already known" (not a real rejection)
-        let text = response.text().await.unwrap_or_default();
 
         if status >= 500 {
             // Server error -- transient

@@ -80,12 +80,12 @@ const atBudget = (over = 0) => {
   return paid
 }
 /** A proven AtomicBEEF of one transaction `over` bytes past the budget: its
- * second output a data carrier filling it, its root at HEIGHT + 1. */
+ * second output a data carrier filling it (with `fill`), its root at HEIGHT + 1. */
 const BIG_HEIGHT = HEIGHT + 1
-const oneLarge = (over = 0) => {
+const oneLarge = (over = 0, fill = 0x5a) => {
   const make = data => {
     const sats = Buffer.alloc(8); sats.writeBigUInt64LE(1000n)
-    const carrier = Buffer.concat([Buffer.from([0x00, 0x6a, 0x4e]), u32(data), Buffer.alloc(data, 0x5a)])
+    const carrier = Buffer.concat([Buffer.from([0x00, 0x6a, 0x4e]), u32(data), Buffer.alloc(data, fill)])
     const raw = Buffer.concat([
       u32(1), Buffer.from([1]), Buffer.alloc(32, 0xbb), u32(0), Buffer.from([0]), u32(0xffffffff),
       Buffer.from([2]), sats, Buffer.from([1, 0x51]), Buffer.alloc(8), varint(carrier.length), carrier, u32(0),
@@ -128,9 +128,19 @@ let carry = true
 // is recorded: the host, the content type and length, the bytes' SHA-256.
 let arcAnswers = false
 const posts = []
+// While `arcOver` names an answer, ARC answers each post with it followed by
+// 1,300,000 spaces: past the answer bound (1,294,336 bytes at the default
+// figure), an answer that read whole would accept (`seen`) or refuse (`rejected`).
+let arcOver = null
 const outbound = async request => {
   const url = new URL(request.url)
   out.push(url.host + url.pathname)
+  if (arcOver && url.host.startsWith('arc.') && url.pathname === '/v1/tx' && request.method === 'POST') {
+    try { await request.arrayBuffer() } catch { /* the race's loser, cancelled */ }
+    const txStatus = { seen: 'SEEN_ON_NETWORK', rejected: 'REJECTED' }[arcOver]
+    return new Response(JSON.stringify({ txid: '', txStatus }) + ' '.repeat(1_300_000),
+      { headers: { 'content-type': 'application/json' } })
+  }
   if (arcAnswers && url.host.startsWith('arc.') && url.pathname === '/v1/tx' && request.method === 'POST') {
     let bytes = null
     try { bytes = Buffer.from(await request.arrayBuffer()) } catch { /* the race's loser, cancelled */ }
@@ -277,6 +287,39 @@ print(json.dumps(statements))
     say(`inline, unproven (${beef.length} bytes): accepted ${txid}; posted to ${whole.map(p => p.host).join(' and ')}: application/octet-stream, leading 0200beef, byte for byte the BEEF behind the prefix (${want.bytes} bytes)`)
   }
 
+  // 1c. The broadcaster's answer to a post is read within the answer bound:
+  // past it, no answer, the road of a broadcaster that cannot be reached. An
+  // answer that read whole would accept and one that would refuse each leave
+  // the payment as an unanswered post leaves it: accepted, its row unproven,
+  // its output held, its request unmined; never refused, never taken as seen.
+  {
+    const state = async (r, txid) => {
+      assert.ok(r.result, JSON.stringify(r).slice(0, 600))
+      const tx = await db.prepare('SELECT status FROM transactions WHERE txid = ?').bind(txid).first()
+      const output = await db.prepare('SELECT spendable FROM outputs WHERE txid = ? AND vout = 0').bind(txid).first()
+      const req = await db.prepare('SELECT status FROM proven_tx_reqs WHERE txid = ?').bind(txid).first()
+      return { accepted: r.result.accepted, sent: r.result.sendWithResults, tx: tx?.status, spendable: output?.spendable, req: req?.status }
+    }
+    const unanswered = chain(2, 10)
+    const baseline = await state(await internalize({ tx: unanswered.beef.toString('hex') }, 'bb-1c an unanswered post'), unanswered.txid)
+    assert.equal(baseline.accepted, true)
+    assert.deepEqual(baseline.sent, [{ txid: unanswered.txid, status: 'unproven' }])
+    for (const [answer, pad] of [['seen', 11], ['rejected', 12]]) {
+      const paid = chain(2, pad)
+      const logsBefore = logs.length
+      arcOver = answer
+      const r = await internalize({ tx: paid.beef.toString('hex') }, `bb-1c an answer past the bound (${answer})`)
+      arcOver = null
+      const got = await state(r, paid.txid)
+      assert.deepEqual({ ...got, sent: got.sent.map(s => s.status) }, { ...baseline, sent: baseline.sent.map(s => s.status) }, `${answer}: ${JSON.stringify(got)}`)
+      const deadline = Date.now() + 5000
+      const notRead = () => logs.slice(logsBefore).filter(l => l.startsWith('provider.answer_not_read provider=arc answer=broadcast '))
+      while (notRead().length < 1 && Date.now() < deadline) await new Promise(r => setTimeout(r, 50))
+      assert.ok(notRead().length >= 1, `${answer}: no line names the answer not read`)
+      say(`inline, ARC's answer past the bound (${answer} if read whole): ${JSON.stringify(got)}, as an unanswered post; "${notRead()[0]}"`)
+    }
+  }
+
   // 2 and 3. A chain at rest of exactly the payment budget (9,908 links,
   // 614,400 bytes): accepted, streamed, copied byte for byte.
   const paid = {}
@@ -371,6 +414,61 @@ print(json.dumps(statements))
     const chained = await internalize({ tx: paid[LINKS].beef.toString('hex') }, 'exactly the budget, a chain')
     assert.deepEqual(chained.error, { code: -32602, message: 'the BEEF is too large to process' }, JSON.stringify(chained).slice(0, 600))
     say(`inline, exactly ${exact.beef.length} bytes: accepted ${exact.txid}; the chain of ${LINKS} at ${paid[LINKS].beef.length} bytes meets the measure: -32602 "${chained.error.message}"`)
+  }
+
+  // 3c. The payment budget at rest, from a caller the store has never seen:
+  // a reference one byte over the figure is refused before the caller's user
+  // is looked up, by the pinned sentence and code, counted by one log line,
+  // and no table gains a row, the users table included. A reference of
+  // exactly the figure from a fresh caller is handled as before: accepted,
+  // the caller's user written.
+  {
+    const tables = ['users', 'transactions', 'outputs', 'proven_tx_reqs', 'proven_txs']
+    const counts = async () => {
+      const out = {}
+      for (const t of tables) out[t] = await db.prepare(`SELECT COUNT(*) AS n FROM "${t}"`).first('n')
+      return out
+    }
+    const userRows = key => db.prepare('SELECT COUNT(*) AS n FROM users WHERE identity_key = ?').bind(key).first('n')
+    const freshRpc = async (key, args) => {
+      const body = JSON.stringify({ jsonrpc: '2.0', method: 'internalizeAction', id: ++id, params: [{ identityKey: '' }, args] })
+      const response = await new AuthFetch(new ProtoWallet(key)).fetch(new URL('/', base).toString(), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body,
+      })
+      const text = await response.text()
+      assert.equal(response.status, 200, text)
+      return JSON.parse(text)
+    }
+
+    const overKey = PrivateKey.fromRandom()
+    const overCaller = overKey.toPublicKey().toString()
+    const over = atBudget(1)
+    const reference = await upload('02cc/nl7-fresh-over.beef', over.beef, overCaller)
+    const before = await counts()
+    assert.equal(await userRows(overCaller), 0)
+    const logsBefore = logs.length
+    const r = await freshRpc(overKey, { beefAtRest: reference, outputs, description: 'a fresh caller, over the budget', labels: [], seekPermission: false })
+    assert.deepEqual(r.error, refusalOf(CAP + 1), JSON.stringify(r).slice(0, 600))
+    assert.deepEqual(await counts(), before, 'a refused reference from a fresh caller wrote a row')
+    assert.equal(await userRows(overCaller), 0, 'a refused reference wrote the caller\'s user')
+    const expected = [`payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=${CAP + 1} budget=${CAP} identity_key=${overCaller}`]
+    const notJudged = () => logs.slice(logsBefore).filter(l => l.startsWith('payment.not_judged'))
+    const deadline = Date.now() + 5000
+    while (notJudged().length < expected.length && Date.now() < deadline) await new Promise(r => setTimeout(r, 50))
+    assert.deepEqual(notJudged(), expected)
+    say(`refused, at rest, a fresh caller, ${over.beef.length} bytes: -32602 ${JSON.stringify(r.error.data)}; counted by one line; users ${before.users} before and after, no row for the caller`)
+
+    const exactKey = PrivateKey.fromRandom()
+    const exactCaller = exactKey.toPublicKey().toString()
+    const exact = oneLarge(0, 0x5b)
+    rootAt.set(BIG_HEIGHT, exact.root)
+    const usersBefore = (await counts()).users
+    const accepted = await freshRpc(exactKey, { beefAtRest: await upload('02cc/nl7-fresh-exact.beef', exact.beef, exactCaller), outputs, description: 'a fresh caller, exactly the budget', labels: [], seekPermission: false })
+    assert.ok(accepted.result && accepted.result.accepted, JSON.stringify(accepted).slice(0, 600))
+    assert.equal(accepted.result.txid, exact.txid)
+    assert.equal(await userRows(exactCaller), 1)
+    assert.equal((await counts()).users, usersBefore + 1)
+    say(`at rest, a fresh caller, exactly ${exact.beef.length} bytes: accepted ${exact.txid}; the caller's user written (users ${usersBefore} to ${usersBefore + 1})`)
   }
 
   // 4. A reference the object does not answer to is refused before a byte is read.

@@ -10,12 +10,14 @@ are named by their program and their date, and the manifest then read 0.1.0.
 
 - **A door reads at most the payment figure of a payment's bytes**: the
   Worker's setting `MAX_PAYMENT_BYTES`, in bytes; missing, zero or malformed,
-  614,400 (600 KiB), and a zero or malformed value is named once in the log.
+  614,400 (600 KiB), and a zero or malformed value is named in the log once
+  for each isolate.
   `GET /` shows the figure in force as `max_payment_bytes`. An ordinary
   payment is about a kilobyte; an operator who must take a larger one raises
   the setting. `internalizeAction`'s AtomicBEEF, inline (`tx`, a JSON array of
   bytes or a hex string) or at rest (`beefAtRest`, on the length the reference
-  names), and `processAction`'s signed transaction (`rawTx`) over it are
+  names, before the caller's user is looked up), and `processAction`'s signed
+  transaction (`rawTx`) over it are
   refused before any of it is parsed or verified and before anything is
   written, with the arguments named or positional. A JSON array is decoded no
   further than the figure (an array between the figure and the request's
@@ -30,18 +32,27 @@ are named by their program and their date, and the manifest then read 0.1.0.
   The reference names no such figure (its storage server holds a request's
   bodies at 8 MiB and its arrays at 1,000,000 items); this host differs on
   purpose. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then.
-- **A provider's answer is read within a bound and held to the same figure
-  before it is parsed**: a merkle proof from ARC, WhatsOnChain or Bitails, a
-  raw transaction from WhatsOnChain, Arcade's stored record, and the body of
-  `/arcade/callback` are read no further than twice the figure and 64 KiB
-  (an answer declaring a longer length is not read); the merkle path or
-  transaction inside is then held to the figure. Past either, that provider
+- **A provider's answer that carries a proof, a BEEF, a transaction, a
+  transaction's status or a broadcast's outcome is read within a bound**: a
+  merkle proof from ARC, WhatsOnChain or Bitails, a raw transaction from
+  WhatsOnChain, Arcade's stored record, the answers of ARC, WhatsOnChain and
+  Arcade to a posted transaction, the WhatsOnChain proof `GET
+  /monitor/probe-woc` shows, and the body of `/arcade/callback` are read no
+  further than twice the figure and 64 KiB (an answer declaring a longer
+  length is not read); the merkle path or transaction inside is then held to
+  the figure. Past either, that provider
   is taken as unavailable at that moment, as on its error; each is counted by
   one `provider.answer_not_read` log line. WhatsOnChain's status answers
   (`/txs/status`, the second source asked after a broadcaster's refusal) and
   its spent answers are read within the same bound; past it, the answer is
   WhatsOnChain's error, so after a refusal it is no answer and the rows are
-  held without credit, as in 0.7.6. The lock is unchanged; no migration, no
+  held without credit, as in 0.7.6. A broadcaster's answer to a post past
+  the bound is no answer, the road of a broadcaster that cannot be reached
+  (ARC: the next endpoint, then WhatsOnChain; WhatsOnChain: its service
+  error; Arcade: asked again, then the outage's fallback to ARC and
+  WhatsOnChain), never a refusal and never an acceptance. The answers that
+  carry a block header, a chain height or a fee policy, and Arcade's event
+  stream, are not held to this bound. No dependency moves; no migration, no
   `wrangler.toml` change.
 
 ### Tests
@@ -49,14 +60,21 @@ are named by their program and their date, and the manifest then read 0.1.0.
 - `door::payment`'s and `services::arc`'s unit tests, the setting's fallback
   and its log line, the positional form, the answer bound, and a door under
   another figure; `tests/worker_door_policies.mjs` 1b and 8b-8e,
-  `tests/worker_beef_at_rest.mjs` 3b and `tests/worker_proof_hold.mjs` g-j:
+  `tests/worker_beef_at_rest.mjs` 3b and 3c and `tests/worker_proof_hold.mjs` g-j:
   one byte over refused at each door, named and positional, with no row
   written (the users table included) and the log line pinned, exactly the
   figure passed to the door's own handling, a Worker with
   `MAX_PAYMENT_BYTES = "2000"` following it and one with `"600k"` serving
   the default and saying so once, and a provider's answer over the figure or
   past the bound not read on any proof path. The at-rest suite's accepted
-  chain is one of exactly the figure.
+  chain is one of exactly the figure. 3c: a caller the store has never seen
+  presents a reference one byte over the figure: the pinned refusal and log
+  line, and no table gains a row, the users table included; a fresh caller's
+  reference of exactly the figure is accepted.
+- `tests/worker_beef_at_rest.mjs` 1c: ARC's answer to a post past the bound,
+  one that read whole would accept and one that would refuse: each leaves
+  the payment as an unanswered post leaves it (accepted, its row unproven,
+  its output held), and a line names the answer not read.
 - `tests/worker_tracker_rule.mjs` mk14: the broadcaster refuses and the
   second source's answer passes the bound (one that, read whole, would say
   "not known"): the caller is answered the refusal and the rows are held

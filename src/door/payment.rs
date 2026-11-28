@@ -16,7 +16,8 @@
 //! - `processAction`: the signed transaction in `rawTx` (named, or the
 //!   seventh positional argument), the same way;
 //! - `internalizeAction` at rest: the length the reference names, which the
-//!   object's head must match, before the object is opened.
+//!   object's head must match, before the caller's user is looked up
+//!   (`dispatch`) and again before the object is opened.
 //!
 //! The refusal is the JSON-RPC error of a refused argument (`-32602`) with
 //! [`description`] as its message and [`data`] beside it, and it is counted
@@ -26,8 +27,10 @@
 //! (bsv-blockchain/ts-stack@57c5f13, `StorageServer.ts:547-558, 561-566,
 //! 402-408`); this host differs on purpose.
 //!
-//! An answer a provider sends (a merkle proof, a raw transaction, a stored
-//! transaction record, the broadcaster's callback) is read no further than
+//! An answer a provider sends that carries a proof, a BEEF, a transaction, a
+//! transaction's status or a broadcast's outcome (a merkle proof, a raw
+//! transaction, a stored transaction record, a status, the answer to a
+//! posted transaction), and the broadcaster's callback, is read no further than
 //! [`answer_bound`] ([`read_answer`], [`read_request`]) and is then held to
 //! the same figure before it is parsed ([`admit_answer`]): over either, the
 //! answer is not read and the provider is taken as unavailable at that

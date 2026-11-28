@@ -439,15 +439,26 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             .await
             .map_err(|e| Error::from(e.to_string()))?;
         let status = response.status_code();
-        let body = response.text().await.unwrap_or_default();
-        return Ok(add_cors_headers(Response::from_json(&serde_json::json!({
+        // Read no further than the payment figure's answer bound
+        // (`door::payment::read_answer`): past it, the line that says so.
+        let (body, not_read) =
+            match door::payment::read_answer(&mut response, "woc", "probe", budget).await {
+                Ok(body) => (body, None),
+                Err(door::payment::AnswerError::Over(line)) => (String::new(), Some(line)),
+                Err(door::payment::AnswerError::Read(_)) => (String::new(), None),
+            };
+        let mut probe = serde_json::json!({
             "url": url_str,
             "has_api_key": woc_key.is_some(),
             "api_key_len": woc_key.as_ref().map(|k| k.len()),
             "status": status,
             "body_len": body.len(),
             "body_preview": &body[..body.len().min(500)],
-        }))?));
+        });
+        if let Some(line) = not_read {
+            probe["answer_not_read"] = serde_json::Value::from(line);
+        }
+        return Ok(add_cors_headers(Response::from_json(&probe)?));
     }
 
     // UTXO audit — integrity checks and optional deep validation

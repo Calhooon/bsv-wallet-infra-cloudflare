@@ -61,17 +61,19 @@ carried it) and refuses a larger one before it parses or verifies any of it
 and before anything is written (`door::payment`). The figure is the Worker's
 setting `MAX_PAYMENT_BYTES`, a var in bytes; where it is missing, zero or not
 a whole number it is 614,400 bytes (600 KiB). A zero or malformed value is
-named once in the log (`setting.malformed MAX_PAYMENT_BYTES is not a
-positive whole number of bytes; the figure in force is 614400`), and
-`GET /` shows the figure in force as `max_payment_bytes`. An ordinary payment
+named in the log once for each isolate (`setting.malformed MAX_PAYMENT_BYTES
+is not a positive whole number of bytes; the figure in force is 614400`), and
+`GET /` shows the figure in force as `max_payment_bytes`. An answer's bound
+(below) is twice the figure in force plus 64 KiB, so an operator who changes
+`MAX_PAYMENT_BYTES` changes it too. An ordinary payment
 is about a kilobyte (in 727 real payments the median was 1.2 KB and the
 largest 434 KB); an operator who must take a larger one raises the setting. A
 Worker's isolate is memory-limited and a door bounds what it reads. The
 doors are `internalizeAction`'s AtomicBEEF inline (`tx`, a JSON array of
 bytes or a hex string), `processAction`'s signed transaction (`rawTx`), and
 `internalizeAction`'s BEEF at rest (`beefAtRest`, held on the length its
-reference names, which the object's head must match, before the object is
-opened). The arguments may be named (`{"tx": ...}`) or positional (an array
+reference names, which the object's head must match, before the caller's user
+is looked up and again before the object is opened). The arguments may be named (`{"tx": ...}`) or positional (an array
 in the method's field order: `tx` first, `rawTx` seventh); in either form the
 payment is held as the request is decoded, before the caller's user is
 looked up or anything is written. An array is decoded no further than the
@@ -101,10 +103,18 @@ JSON and binary bodies at 8 MiB and its arrays at 1,000,000 items in the
 standard profile (bsv-blockchain/ts-stack@57c5f13,
 `StorageServer.ts:547-558, 561-566, 402-408`); this host differs on purpose.
 
-An answer a provider sends is read no further than twice the figure (its
-bytes travel as hex) and 64 KiB for its JSON wrapping: an answer that declares
-a longer `Content-Length` is not read, and one that passes the bound as it
-arrives is not read on. What the Worker hands to bsv-rs is then held to the
+A provider's answer that carries a proof, a BEEF, a transaction, a
+transaction's status or a broadcast's outcome (ARC's, WhatsOnChain's and
+Arcade's answers to a posted transaction among them), and the body of the
+broadcaster's callback, is read no further than twice the figure (its bytes
+travel as hex) and 64 KiB for its JSON wrapping: an answer that declares a
+longer `Content-Length` is not read, and one that passes the bound as it
+arrives is not read on. Past the bound, a broadcaster's answer to a post is
+no answer, the road of a broadcaster that cannot be reached (the next
+endpoint or provider is asked, or the transaction is held for the monitor),
+never a refusal and never an acceptance. The answers that carry a block
+header, a chain height or a fee policy, and Arcade's event stream, are not
+held to this bound. What the Worker hands to bsv-rs is then held to the
 same figure before it is parsed: a merkle proof from ARC (its `merklePath`),
 from WhatsOnChain or Bitails (the TSC answer, whose nodes travel as hex, at
 half its length), a raw transaction from WhatsOnChain (`/tx/{txid}/hex`), and
@@ -120,7 +130,7 @@ answer is WhatsOnChain's error: no answer, never "not known". Each is counted
 by one log line:
 `provider.answer_not_read provider=<arc|woc|bitails|arcade> answer=<proof|raw_tx> size=<bytes> budget=<the figure>`,
 or, for an answer not read past the bound,
-`provider.answer_not_read provider=<...> answer=<proof|raw_tx|record|callback|status|spent> <declared|read>=<bytes> bound=<bytes>`.
+`provider.answer_not_read provider=<...> answer=<proof|raw_tx|record|callback|status|spent|broadcast|probe> <declared|read>=<bytes> bound=<bytes>`.
 
 The BRC-31 handshake is answered by the middleware; an authenticated request to any other path is a 404. The
 cron trigger in [wrangler.toml](wrangler.toml) (`*/5 * * * *`) runs the monitor.
