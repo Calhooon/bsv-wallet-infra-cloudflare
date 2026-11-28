@@ -400,15 +400,22 @@ mod tests {
         bsv_sdk::primitives::sha256d(raw)
     }
 
-    /// A BUMP of one level: `txid` at offset 0 and `more` duplicate leaves after it.
+    /// A BUMP of `txid` at offset 0 and `more` duplicate leaves after it, as
+    /// many levels as the offsets need (a tree of height h holds offsets below
+    /// 2^h at level 0), each level above 0 carrying the duplicate sibling the
+    /// txid's path pairs with.
     fn bump(txid: [u8; 32], more: u64) -> Vec<u8> {
-        let mut o = vec![0x01, 0x01];
+        let height = (64 - more.leading_zeros()).max(1) as u8;
+        let mut o = vec![0x01, height];
         varint(1 + more, &mut o);
         o.extend_from_slice(&[0, 2]);
         o.extend_from_slice(&txid);
         for k in 1..=more {
             varint(k, &mut o);
             o.push(1);
+        }
+        for _ in 1..height {
+            o.extend_from_slice(&[1, 1, 1]);
         }
         o
     }
@@ -454,9 +461,20 @@ mod tests {
             txs.iter().map(|t| t.outputs.len() as u64).sum::<u64>()
         );
         assert_eq!(c.bumps, beef.bumps.len() as u64);
-        assert_eq!(c.bump_leaves, 4);
-        assert_eq!(c.max_bump_leaves, 4);
-        assert_eq!(c.bump_levels, 1);
+        // Four leaves at level 0 (offsets 0 to 3, two levels) and the sibling at level 1.
+        let leaves: u64 = beef
+            .bumps
+            .iter()
+            .map(|b| b.path.iter().map(|l| l.len() as u64).sum::<u64>())
+            .sum();
+        assert_eq!(c.bump_leaves, leaves);
+        assert_eq!(c.bump_leaves, 5);
+        assert_eq!(c.max_bump_leaves, 5);
+        assert_eq!(
+            c.bump_levels,
+            beef.bumps.iter().map(|b| b.path.len() as u64).sum::<u64>()
+        );
+        assert_eq!(c.bump_levels, 2);
         assert_eq!(
             c.largest_tx,
             TxCounts {

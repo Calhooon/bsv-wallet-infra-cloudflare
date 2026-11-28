@@ -99,6 +99,19 @@ pub fn path_of(txid: [u8; 32], levels: usize, rng: &mut Rng) -> Vec<Vec<(u64, u8
     path
 }
 
+/// The levels of one BUMP of `n` leaves at level 0: `txid` at offset 0, a
+/// duplicate at every offset after it, and as many levels as the offsets
+/// need (a tree of height h holds offsets below 2^h at level 0), each level
+/// above 0 carrying the duplicate sibling the txid's path pairs with.
+pub fn many_leaves(txid: [u8; 32], n: u64) -> Vec<Vec<(u64, u8, [u8; 32])>> {
+    let height = (64 - n.saturating_sub(1).leading_zeros()).max(1);
+    let mut level0 = vec![(0u64, 2u8, txid)];
+    level0.extend((1..n).map(|k| (k, 1u8, [0u8; 32])));
+    let mut levels = vec![level0];
+    levels.extend((1..height).map(|_| vec![(1u64, 1u8, [0u8; 32])]));
+    levels
+}
+
 /// The one-leaf BUMP of `txid`.
 pub fn bump_of(height: u64, txid: [u8; 32]) -> Vec<u8> {
     bump(height, &[vec![(0, 2, txid)]])
@@ -301,15 +314,18 @@ fn families_only(target: usize, only: Option<usize>) -> Vec<(&'static str, Vec<u
             beef(V2, &bumps, &e),
         ));
     }
-    // One BUMP of many duplicate leaves (2 bytes each) at level 0 over one transaction.
+    // One BUMP of many duplicate leaves (2 bytes each) at level 0 over one transaction,
+    // as tall as its offsets need.
     if only.is_none_or(|o| o == 7) {
         let r = root(&[0], 0);
         let n = target / 2;
-        let mut level0 = vec![(0u64, 2u8, id(&r))];
-        level0.extend((1..n as u64).map(|k| (k, 1u8, [0u8; 32])));
         v.push((
             "one BUMP of many leaves",
-            beef(V2, &[bump(1, &[level0])], &[Entry::Proven(0, r)]),
+            beef(
+                V2,
+                &[bump(1, &many_leaves(id(&r), n as u64))],
+                &[Entry::Proven(0, r)],
+            ),
         ));
     }
     // Many BUMPs, each 64 levels with one leaf on each level.
@@ -423,18 +439,14 @@ fn families_only(target: usize, only: Option<usize>) -> Vec<(&'static str, Vec<u
             .collect();
         v.push(("many transactions of many inputs", beef(V2, &[], &e)));
     }
-    // Many BUMPs of 500 duplicate leaves at level 0, each over its own transaction.
+    // Many BUMPs of 500 duplicate leaves at level 0 (nine levels), each over its own transaction.
     if only.is_none_or(|o| o == 14) {
         let n = (target / (500 * 3 + 120)).max(1);
         let txs: Vec<Vec<u8>> = (0..n).map(|k| root(&[0], k as u32)).collect();
         let bumps: Vec<Vec<u8>> = txs
             .iter()
             .enumerate()
-            .map(|(k, t)| {
-                let mut level0 = vec![(0u64, 2u8, id(t))];
-                level0.extend((1..500u64).map(|o| (o, 1u8, [0u8; 32])));
-                bump(k as u64, &[level0])
-            })
+            .map(|(k, t)| bump(k as u64, &many_leaves(id(t), 500)))
             .collect();
         let e: Vec<Entry> = txs
             .into_iter()
