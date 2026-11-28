@@ -164,6 +164,51 @@ pub(crate) const EXT_SPEND_MARK_SQL: &str =
     "UPDATE outputs SET spendable = 0, spent_by = NULL, updated_at = ? \
      WHERE output_id = ? AND spendable = 1 AND spent_by IS NULL";
 
+/// The mark of a coin at the store of its spender's checked proof: every
+/// user's row at an outpoint the proven transaction's own bytes spend. Run in
+/// the same batch as the store, so the coin is marked exactly when the proof
+/// is written. A row's `spent_by` is filled only with that row's user's own
+/// transactions row for the spender (NULL for a user who holds none), and a
+/// row spent by another transaction is never touched (the same eligibility as
+/// `INTERNALIZE_MARK_INPUT_SQL`).
+/// Binds: spender txid, updated_at, prev_txid, prev_vout, spender txid.
+pub(crate) const PROOF_MARK_SPENT_INPUT_SQL: &str = "UPDATE outputs SET spendable = 0, \
+        spent_by = COALESCE(spent_by, \
+            (SELECT t.transaction_id FROM transactions t \
+             WHERE t.txid = ? AND t.user_id = outputs.user_id)), \
+        updated_at = ? \
+     WHERE txid = ? AND vout = ? AND spendable = 1 \
+       AND (spent_by IS NULL OR spent_by = \
+            (SELECT t.transaction_id FROM transactions t \
+             WHERE t.txid = ? AND t.user_id = outputs.user_id))";
+
+/// The mark of a coin of a user who holds a transactions row for the spender
+/// itself, when the broadcaster takes that spender (`send_waiting`): the
+/// rows a call's own internalize restored while the post was held. Another
+/// user's row is left to the proof's store (`PROOF_MARK_SPENT_INPUT_SQL`).
+/// Binds: spender txid, updated_at, prev_txid, prev_vout, spender txid.
+pub(crate) const TAKEN_MARK_OWN_INPUT_SQL: &str = "UPDATE outputs SET spendable = 0, \
+        spent_by = (SELECT t.transaction_id FROM transactions t \
+             WHERE t.txid = ? AND t.user_id = outputs.user_id), \
+        updated_at = ? \
+     WHERE txid = ? AND vout = ? AND spendable = 1 AND spent_by IS NULL \
+       AND EXISTS (SELECT 1 FROM transactions t \
+             WHERE t.txid = ? AND t.user_id = outputs.user_id)";
+
+/// The outpoints a proven transaction spends, read from its own bytes, and
+/// only when those bytes hash to the txid the proof is for: no bytes, or
+/// bytes of another transaction, mark nothing.
+pub(crate) fn outpoints_spent_by(raw_tx_hex: &Option<String>, txid: &str) -> Vec<(String, u32)> {
+    if raw_tx_matches_txid(raw_tx_hex, txid) != Some(true) {
+        return Vec::new();
+    }
+    raw_tx_hex
+        .as_ref()
+        .and_then(|h| hex::decode(h).ok())
+        .map(|b| parse_input_outpoints(&b))
+        .unwrap_or_default()
+}
+
 /// Cursor persistence (G5) — same `monitor_events` latest-row-wins mechanism
 /// as `'chain_height'`, but UPDATEd in place (single row in steady state;
 /// INSERT only fires the first time). `event_id DESC` tiebreak because
@@ -940,8 +985,23 @@ async fn send_waiting<B: BroadcastService + StreamBroadcast<wasm_bindgen::JsValu
                 );
                 let _ = batch.add(
                     "UPDATE outputs SET spendable = 1, updated_at = ? WHERE txid = ? AND spendable = 0 AND spent_by IS NULL AND (change = 1 OR custom_instructions IS NOT NULL)",
-                    vec![QVal::Text(now), QVal::Text(txid.clone())],
+                    vec![QVal::Text(now.clone()), QVal::Text(txid.clone())],
                 );
+                // Taken: the inputs of a user who holds this transaction
+                // are spent by it again (an internalize held on a policy
+                // refusal restored them).
+                for (prev_txid, prev_vout) in outpoints_spent_by(&row.raw_tx, &txid) {
+                    let _ = batch.add(
+                        TAKEN_MARK_OWN_INPUT_SQL,
+                        vec![
+                            QVal::Text(txid.clone()),
+                            QVal::Text(now.clone()),
+                            QVal::Text(prev_txid),
+                            QVal::Int(prev_vout as i64),
+                            QVal::Text(txid.clone()),
+                        ],
+                    );
+                }
                 let _ = batch.execute().await;
                 sent += 1;
             }
@@ -1623,11 +1683,29 @@ pub(crate) async fn store_proof_result<H: HeaderService>(
         .add(
             "UPDATE outputs SET spendable = 1, updated_at = ? WHERE txid = ? AND spendable = 0 AND spent_by IS NULL AND (change = 1 OR custom_instructions IS NOT NULL)",
             vec![
-                QVal::Text(now),
+                QVal::Text(now.clone()),
                 QVal::Text(txid.to_string()),
             ],
         )
         .map_err(|e| Error::from(e.to_string()))?;
+
+    // The coins the proven transaction spends, every user's, from its own
+    // bytes hashed to the proven txid: marked in the write that stores the
+    // proof.
+    for (prev_txid, prev_vout) in outpoints_spent_by(raw_tx_hex, txid) {
+        batch
+            .add(
+                PROOF_MARK_SPENT_INPUT_SQL,
+                vec![
+                    QVal::Text(txid.to_string()),
+                    QVal::Text(now.clone()),
+                    QVal::Text(prev_txid),
+                    QVal::Int(prev_vout as i64),
+                    QVal::Text(txid.to_string()),
+                ],
+            )
+            .map_err(|e| Error::from(e.to_string()))?;
+    }
 
     batch
         .execute()
