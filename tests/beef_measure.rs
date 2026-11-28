@@ -6,15 +6,17 @@
 //!
 //! 1. the estimate at or over the measured heap of `Beef::from_binary` and
 //!    `Beef::sort_txs` on every family of `support/beef_shapes.rs` at sizes
-//!    from 10 KB to 1.5 MB, on random valid BEEFs (V1, V2, AtomicBEEF), and on
-//!    a pair merged as processAction merges it;
+//!    from 10 KB to 1.5 MB and at the payment figure, the BUMP families at
+//!    the sizes between, on random valid BEEFs (V1, V2, AtomicBEEF), and on a
+//!    pair merged as processAction merges it;
 //! 2. each door's request under the ceiling, through the steps the Worker takes
 //!    for it: the body, the JSON-RPC parse, the argument's clone and decode,
 //!    then, for `internalizeAction`, the measure, the parse, its clone and
 //!    `verify_valid`, and the Extended Format conversion of the broadcast; for
 //!    `processAction`, the measure, the signed transaction's parse, the merge
 //!    into the stored BEEF and the conversion. Each family at the body bound,
-//!    and the largest one the measure admits;
+//!    the largest one the measure admits, and the largest one the measure
+//!    admits within the payment figure;
 //! 3. the refusal's wire shape, the same as a BEEF the parser refuses;
 //! 4. with `BEEF_MEASURE_ROWS` naming a JSONL file of stored requests
 //!    (`txid`, `raw_tx`, `input_beef` in hex), every row admitted as each
@@ -34,6 +36,7 @@ use rust_wallet_infra::door::beef_measure::{
 };
 use rust_wallet_infra::door::bounds::MAX_JSON_BODY_BYTES;
 use rust_wallet_infra::door::errors::{public_parts, rpc_error};
+use rust_wallet_infra::door::payment::DEFAULT_MAX_PAYMENT_BYTES;
 use rust_wallet_infra::json_rpc::JsonRpcRequest;
 use rust_wallet_infra::services::arcade::beef_to_ef_batch;
 use rust_wallet_infra::storage::internalize_action::parse_inline_beef;
@@ -115,6 +118,32 @@ fn merge_peak(stored: &[u8], raw: &[u8]) -> usize {
     .1
 }
 
+/// The families made of BUMPs (`support/beef_shapes.rs`).
+const BUMP_FAMILIES: [usize; 8] = [7, 8, 14, 17, 18, 19, 20, 21];
+
+/// Hold the estimate of `bytes` at or over its parse's heap; the estimate
+/// over the heap.
+fn bounded(name: &str, bytes: &[u8]) -> f64 {
+    let m = measure(bytes);
+    assert!(m.readable, "{name}: the measure reads the whole BEEF");
+    let (parsed, peak) = parse_peak(bytes);
+    assert!(parsed, "{name}: the BEEF parses");
+    let est = estimate(&m.counts);
+    println!(
+        "{name} ({} bytes): parse {:.2} MiB, estimate {:.2} MiB ({:.2}x)",
+        bytes.len(),
+        mib(peak as u64),
+        mib(est),
+        est as f64 / peak as f64
+    );
+    assert!(
+        est >= peak as u64,
+        "{name} at {} bytes: the estimate {est} and the parse's {peak}",
+        bytes.len()
+    );
+    est as f64 / peak as f64
+}
+
 /// The estimate is at or over the parse's heap on every family and size.
 #[test]
 fn the_estimate_bounds_the_parse() {
@@ -123,26 +152,24 @@ fn the_estimate_bounds_the_parse() {
     let mut target = 10_000f64;
     while target < 1_600_000.0 {
         for (name, bytes) in families(target as usize) {
-            let m = measure(&bytes);
-            assert!(m.readable, "{name}: the measure reads the whole BEEF");
-            let (parsed, peak) = parse_peak(&bytes);
-            assert!(parsed, "{name}: the BEEF parses");
-            let est = estimate(&m.counts);
-            println!(
-                "{name} ({} bytes): parse {:.2} MiB, estimate {:.2} MiB ({:.2}x)",
-                bytes.len(),
-                mib(peak as u64),
-                mib(est),
-                est as f64 / peak as f64
-            );
-            assert!(
-                est >= peak as u64,
-                "{name} at {} bytes: the estimate {est} is under the parse's {peak}",
-                bytes.len()
-            );
-            worst = worst.min(est as f64 / peak as f64);
+            worst = worst.min(bounded(name, &bytes));
         }
         target *= 1.7;
+    }
+    // Each family as large as the payment figure holds, and the BUMP families
+    // at the sizes between.
+    let figure = DEFAULT_MAX_PAYMENT_BYTES as usize;
+    for k in 0..FAMILIES {
+        let (name, bytes) = family_within(k, figure);
+        worst = worst.min(bounded(name, &bytes));
+    }
+    for k in BUMP_FAMILIES {
+        for target in [100_000, 200_000, 262_144, 400_000, 500_000] {
+            let (name, bytes) = family(k, target);
+            if bytes.len() <= figure {
+                worst = worst.min(bounded(name, &bytes));
+            }
+        }
     }
     let mut rng = Rng(0x00be_ef00);
     for k in 0..300 {
@@ -395,6 +422,55 @@ fn the_inline_door_holds_its_request_under_the_ceiling() {
     println!(
         "internalize: the largest admitted request held {:.1} MiB",
         mib(worst_admitted as u64)
+    );
+}
+
+/// A payment a door reads is at most the payment figure. Each family as large
+/// as the figure and the measure admit is parsed through internalizeAction's
+/// steps, `tx` as hex and as an array of bytes, under the ceiling.
+#[test]
+fn the_largest_payment_the_doors_admit_stays_under_the_ceiling() {
+    let _one = lock();
+    let figure = DEFAULT_MAX_PAYMENT_BYTES as usize;
+    let (mut worst, mut worst_name) = (0usize, "");
+    for k in 0..FAMILIES {
+        // The family at the figure where the measure admits it there, else
+        // the largest the measure admits.
+        let (name, at_figure) = family_within(k, figure - 36);
+        let at_figure = atomic_of(&at_figure);
+        assert!(at_figure.len() <= figure);
+        let largest = if admit_beef(&at_figure).is_ok() {
+            at_figure
+        } else {
+            largest_admitted(k, atomic_of).expect("a small one is admitted")
+        };
+        assert!(largest.len() <= figure, "{name}: {} bytes", largest.len());
+        let est = estimate(&measure(&largest).counts);
+        assert!(est <= PARSE_BUDGET);
+        for as_array in [false, true] {
+            let (outcome, peak) = internalize_peak(&internalize_body(&largest, as_array));
+            println!(
+                "internalize within the payment figure, {name} ({} bytes, estimate {:.1} MiB{}): {outcome:?}, peak {:.1} MiB",
+                largest.len(),
+                mib(est),
+                if as_array { ", tx as an array" } else { "" },
+                mib(peak as u64)
+            );
+            assert_eq!(outcome, Outcome::Parsed);
+            assert!(
+                peak <= REQUEST_CEILING,
+                "{name}: an admitted request held {:.1} MiB",
+                mib(peak as u64)
+            );
+            if peak > worst {
+                (worst, worst_name) = (peak, name);
+            }
+        }
+    }
+    println!(
+        "internalize within the payment figure: the largest admitted request held {:.1} MiB ({worst_name}), the ceiling {:.0} MiB",
+        mib(worst as u64),
+        mib(REQUEST_CEILING as u64)
     );
 }
 

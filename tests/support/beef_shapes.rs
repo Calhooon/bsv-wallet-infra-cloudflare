@@ -112,6 +112,90 @@ pub fn many_leaves(txid: [u8; 32], n: u64) -> Vec<Vec<(u64, u8, [u8; 32])>> {
     levels
 }
 
+/// The levels of one BUMP of `levels` levels with leaves on every level:
+/// `txid` at offset 0 of level 0, and on each level up to `per_level`
+/// duplicates from offset 1 on, as many as the level holds (level l of a
+/// tree of height h holds offsets below 2^(h-l)).
+pub fn leaves_on_levels(
+    txid: [u8; 32],
+    levels: usize,
+    per_level: u64,
+) -> Vec<Vec<(u64, u8, [u8; 32])>> {
+    (0..levels)
+        .map(|l| {
+            let room = match levels - l {
+                s if s >= 64 => u64::MAX,
+                s => (1u64 << s) - 1,
+            };
+            let mut level = Vec::new();
+            if l == 0 {
+                level.push((0u64, 2u8, txid));
+            }
+            level.extend((1..=per_level.min(room)).map(|k| (k, 1u8, [0u8; 32])));
+            level
+        })
+        .collect()
+}
+
+/// The levels of one BUMP whose level 0 is `n` txids in a row from offset 0
+/// (`txid` the first, the others made up), as tall as they need; where a
+/// level's row is odd, the duplicate that pairs its last node.
+pub fn txid_leaves(txid: [u8; 32], n: u64) -> Vec<Vec<(u64, u8, [u8; 32])>> {
+    let n = n.max(2);
+    let height = 64 - (n - 1).leading_zeros();
+    let mut level0: Vec<(u64, u8, [u8; 32])> = (0..n)
+        .map(|k| {
+            let mut t = [0x5Au8; 32];
+            t[..8].copy_from_slice(&k.to_le_bytes());
+            (k, 2u8, if k == 0 { txid } else { t })
+        })
+        .collect();
+    if n % 2 == 1 {
+        level0.push((n, 1, [0u8; 32]));
+    }
+    let mut levels = vec![level0];
+    let mut row = n;
+    for _ in 1..height {
+        row = row.div_ceil(2);
+        levels.push(if row % 2 == 1 && row > 1 {
+            vec![(row, 1u8, [0u8; 32])]
+        } else {
+            Vec::new()
+        });
+    }
+    levels
+}
+
+/// The levels of one BUMP that proves `n` txids of one block (`txid` the
+/// first, the others made up), each alone on its path for `apart` levels with
+/// a duplicate for its sibling on each of them, then a row: a compound proof.
+pub fn txids_apart(txid: [u8; 32], n: u64, apart: usize) -> Vec<Vec<(u64, u8, [u8; 32])>> {
+    let mut levels = Vec::new();
+    for l in 0..apart {
+        let mut level = Vec::new();
+        for k in 0..n {
+            let at = (k << apart) >> l;
+            if l == 0 {
+                let mut t = [0x5Au8; 32];
+                t[..8].copy_from_slice(&k.to_le_bytes());
+                level.push((at, 2u8, if k == 0 { txid } else { t }));
+            }
+            level.push((at ^ 1, 1u8, [0u8; 32]));
+        }
+        levels.push(level);
+    }
+    let mut row = n;
+    while row > 1 {
+        levels.push(if row % 2 == 1 {
+            vec![(row, 1u8, [0u8; 32])]
+        } else {
+            Vec::new()
+        });
+        row = row.div_ceil(2);
+    }
+    levels
+}
+
 /// The one-leaf BUMP of `txid`.
 pub fn bump_of(height: u64, txid: [u8; 32]) -> Vec<u8> {
     bump(height, &[vec![(0, 2, txid)]])
@@ -170,11 +254,23 @@ pub fn atomic(subject: [u8; 32], beef: &[u8]) -> Vec<u8> {
 }
 
 /// How many families there are.
-pub const FAMILIES: usize = 17;
+pub const FAMILIES: usize = 22;
 
 /// The families, each filled to about `target` bytes.
 pub fn families(target: usize) -> Vec<(&'static str, Vec<u8>)> {
     families_only(target, None)
+}
+
+/// Family `k` alone, as large as it goes within `limit` bytes.
+pub fn family_within(k: usize, limit: usize) -> (&'static str, Vec<u8>) {
+    let mut target = limit;
+    loop {
+        let (name, bytes) = family(k, target);
+        if bytes.len() <= limit {
+            return (name, bytes);
+        }
+        target -= (target / 200).max(1);
+    }
 }
 
 /// Family `k` alone, filled to about `target` bytes.
@@ -488,6 +584,76 @@ fn families_only(target: usize, only: Option<usize>) -> Vec<(&'static str, Vec<u
         v.push((
             "repeated txid-only entries, atomic",
             atomic([1u8; 32], &beef(V2, &[], &e)),
+        ));
+    }
+    // One BUMP whose level 0 is a row of txids (35 bytes each or fewer).
+    if only.is_none_or(|o| o == 17) {
+        let r = root(&[0], 0);
+        let n = (target / 37).max(2);
+        v.push((
+            "one BUMP of many txids",
+            beef(
+                V2,
+                &[bump(1, &txid_leaves(id(&r), n as u64))],
+                &[Entry::Proven(0, r)],
+            ),
+        ));
+    }
+    // One BUMP of 64 levels, the duplicate leaves spread over every level.
+    if only.is_none_or(|o| o == 18) {
+        let r = root(&[0], 0);
+        let width = |per: usize| match per {
+            0..=252 => 2,
+            253..=65_535 => 4,
+            _ => 6,
+        };
+        let mut per = target / (64 * 2);
+        per = target / (64 * width(per));
+        per = target / (64 * width(per));
+        v.push((
+            "one BUMP of 64 levels, leaves on every level",
+            beef(
+                V2,
+                &[bump(1, &leaves_on_levels(id(&r), 64, per.max(1) as u64))],
+                &[Entry::Proven(0, r)],
+            ),
+        ));
+    }
+    // Many BUMPs of 64 levels, 129 duplicate leaves (2 bytes each) on every level that holds them.
+    if only.is_none_or(|o| o == 19) {
+        let r = root(&[0], 0);
+        let levels = leaves_on_levels(id(&r), 64, 129);
+        let per = bump(0, &levels).len();
+        let n = (target / per).max(1);
+        let bumps: Vec<Vec<u8>> = (0..n as u64).map(|h| bump(h, &levels)).collect();
+        v.push((
+            "many BUMPs of 64 levels, leaves on every level",
+            beef(V2, &bumps, &[Entry::Proven(0, r)]),
+        ));
+    }
+    // One BUMP that proves many txids of one block, each 12 levels apart from the next.
+    if only.is_none_or(|o| o == 20) {
+        let r = root(&[0], 0);
+        let n = (target / 100).max(2);
+        v.push((
+            "one BUMP of many txids on paths apart",
+            beef(
+                V2,
+                &[bump(1, &txids_apart(id(&r), n as u64, 12))],
+                &[Entry::Proven(0, r)],
+            ),
+        ));
+    }
+    // Many BUMPs, each proving 129 txids of its block 2 levels apart.
+    if only.is_none_or(|o| o == 21) {
+        let r = root(&[0], 0);
+        let levels = txids_apart(id(&r), 129, 2);
+        let per = bump(0, &levels).len() + 4;
+        let n = (target / per).max(1);
+        let bumps: Vec<Vec<u8>> = (0..n as u64).map(|h| bump(h, &levels)).collect();
+        v.push((
+            "many BUMPs of many txids on paths apart",
+            beef(V2, &bumps, &[Entry::Proven(0, r)]),
         ));
     }
     v
