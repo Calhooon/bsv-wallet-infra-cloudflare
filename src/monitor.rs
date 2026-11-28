@@ -3194,9 +3194,11 @@ pub(crate) enum ReorgStep {
     /// Write the proof the gate passed, with the gate's height, idx and root.
     Store(deep_reorg::PathFacts),
     /// The header service says the stored root is not the chain's at its
-    /// height and no proof the gate passes is at hand: the row's proof fields
-    /// are cleared and its request goes back to `unmined` to be asked again.
-    Demote,
+    /// height and no proof the gate passes is at hand: the row and its
+    /// request are left exactly as they are and the row is recorded
+    /// (`deep_reorg_unrepaired`), as the deep sweep does for the same event.
+    /// The deep sweep re-checks the row and asks for a proof on its passes.
+    Unrepaired,
 }
 
 /// The shallow sweep's step for a provider's proof whose block hash differs
@@ -3213,7 +3215,7 @@ pub(crate) fn shallow_step(gate: &deep_reorg::StoreGate) -> ReorgStep {
 /// `gate` is the store gate's verdict on a provider's proof (`None`: no
 /// provider gave one). A stored root that is still the chain's, or that the
 /// header service could not judge, is never lowered, whatever a provider
-/// says.
+/// says. A stored proof is only ever replaced by one the gate passed, or left.
 pub(crate) fn reorg_step(
     stored: &deep_reorg::RootVerdict,
     gate: Option<&deep_reorg::StoreGate>,
@@ -3222,7 +3224,7 @@ pub(crate) fn reorg_step(
         deep_reorg::RootVerdict::Canonical | deep_reorg::RootVerdict::Unknown(_) => ReorgStep::Keep,
         deep_reorg::RootVerdict::Orphan => match gate {
             Some(deep_reorg::StoreGate::Store(f)) => ReorgStep::Store(f.clone()),
-            _ => ReorgStep::Demote,
+            _ => ReorgStep::Unrepaired,
         },
     }
 }
@@ -3246,26 +3248,12 @@ pub(crate) fn proof_not_stored_line(
     format!("{pass}: proof for {txid} from {provider} not stored: {reason}")
 }
 
-/// `handle_reorg`'s candidates: stored proofs above the new tip. Rows whose
-/// proof fields were already cleared (block_hash = '') are owned by
-/// check_for_proofs.
+/// `handle_reorg`'s candidates: stored proofs above the new tip, with the
+/// stored root for the pass's record. A row with no stored block hash
+/// (block_hash = '') holds no proof to judge and is skipped.
 pub(crate) const REORG_AFFECTED_SQL: &str =
-    "SELECT proven_tx_id, txid, height, block_hash, hex(merkle_path) AS merkle_path \
-     FROM proven_txs WHERE height > ? AND block_hash IS NOT NULL AND block_hash != ''";
-
-/// The demotion's proof write: the proof fields cleared, the row and raw_tx
-/// kept for ancestry. `merkle_path` is NOT NULL in the schema (0001), so the
-/// cleared path is the empty blob, which every reader takes as no path.
-/// Binds: updated_at, proven_tx_id.
-pub(crate) const REORG_DEMOTE_PROOF_SQL: &str =
-    "UPDATE proven_txs SET block_hash = '', merkle_root = '', merkle_path = X'', \
-     updated_at = ? WHERE proven_tx_id = ?";
-
-/// The demotion's request write: back to `unmined` with a fresh attempt
-/// clock, so check_for_proofs asks again. Binds: updated_at, proven_tx_id.
-pub(crate) const REORG_DEMOTE_REQ_SQL: &str =
-    "UPDATE proven_tx_reqs SET status = 'unmined', proven_tx_id = NULL, \
-     attempts = 0, updated_at = ? WHERE proven_tx_id = ?";
+    "SELECT proven_tx_id, txid, height, block_hash, merkle_root, hex(merkle_path) AS merkle_path \
+     FROM proven_txs WHERE height > ? AND block_hash != ''";
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -3302,6 +3290,7 @@ struct ReorgCandidateRow {
     txid: Option<String>,
     height: Option<f64>,
     block_hash: Option<String>,
+    merkle_root: Option<String>,
     merkle_path: Option<String>,
 }
 
@@ -3314,10 +3303,13 @@ struct ReorgCandidateRow {
 /// - The header service cannot be asked: nothing is lowered and nothing is
 ///   stored (a hold); the row is left for the deep sweep.
 /// - Not the chain's root there: a provider's proof is stored if the store
-///   gate passes it (the gate's height, idx and root); otherwise the proof
-///   fields are cleared and the request goes back to `unmined`, so
-///   check_for_proofs asks again. The transaction's status and its outputs
-///   are not touched, and nothing is failed.
+///   gate passes it (the gate's height, idx and root); otherwise the row and
+///   its request are left as they are, the row is recorded
+///   (`deep_reorg_unrepaired`), and the deep sweep asks for a proof again on
+///   each of its passes.
+///
+/// This pass writes only a checked proof (through `write_checked_proof`) and
+/// that record: no request, transaction or output row.
 async fn handle_reorg<P: ProofService, H: HeaderService>(
     db: &D1Database,
     blobs: &worker::Bucket,
@@ -3348,7 +3340,6 @@ async fn handle_reorg<P: ProofService, H: HeaderService>(
         current_height
     );
 
-    let now = Utc::now().to_rfc3339();
     let mut reverified = 0u32;
     let mut cache = deep_reorg::RunRootCache::default();
 
@@ -3363,6 +3354,17 @@ async fn handle_reorg<P: ProofService, H: HeaderService>(
         }
         let row_height = row.height.unwrap_or(0.0) as u32;
         let row_hash = row.block_hash.clone().unwrap_or_default();
+        let row_root = row.merkle_root.clone().unwrap_or_default();
+        let unrepaired = |reason: &str| {
+            deep_reorg::unrepaired_details(
+                &txid,
+                proven_tx_id,
+                row_height,
+                &row_hash,
+                &row_root,
+                reason,
+            )
+        };
 
         // The stored proof's own root, computed from its path for this txid.
         let stored = match deep_reorg::stored_path(blobs, proven_tx_id, row.merkle_path.as_deref())
@@ -3422,6 +3424,7 @@ async fn handle_reorg<P: ProofService, H: HeaderService>(
             stored.height
         );
 
+        let mut no_answer = String::from("no canonical proof available");
         let answer = match proof_service.get_proof(&txid).await {
             Ok(Some(p)) => {
                 let gate = deep_reorg::gate_proof_for_store(headers, &txid, &p).await;
@@ -3433,6 +3436,7 @@ async fn handle_reorg<P: ProofService, H: HeaderService>(
             }
             Err(e) => {
                 console_error!("handle_reorg: {} get_proof: {}", txid, e);
+                no_answer = format!("get_proof: {e}");
                 None
             }
         };
@@ -3464,57 +3468,41 @@ async fn handle_reorg<P: ProofService, H: HeaderService>(
                         reverified += 1;
                     }
                     // Left for the deep sweep, which checks this root again.
-                    Err(e) => console_error!(
-                        "{}",
-                        proof_not_stored_line(
-                            "handle_reorg",
-                            &txid,
-                            p.provider,
-                            &format!("write: {e}")
-                        )
-                    ),
+                    Err(e) => {
+                        let reason = format!("write: {e}");
+                        console_error!(
+                            "{}",
+                            proof_not_stored_line("handle_reorg", &txid, p.provider, &reason)
+                        );
+                        deep_reorg::record_unrepaired(db, &unrepaired(&reason)).await;
+                    }
                 }
             }
-            (ReorgStep::Demote, answer) => {
-                if let Some((p, gate)) = answer {
-                    console_error!(
-                        "{}",
-                        proof_not_stored_line(
-                            "handle_reorg",
-                            &txid,
-                            p.provider,
-                            &gate_reason(gate)
-                        )
-                    );
-                }
-                // MATCH REFERENCE (bsv-wallet-toolbox-rs ReorgTask): DO NOT
-                // delete the proven_tx row — raw_tx stored there is needed for
-                // ancestry reconstruction on later broadcasts. Clear the proof
-                // fields and put the request back to 'unmined' with a fresh
-                // attempt clock (Go reference: reorg sets req status +
-                // attempts=0 and touches nothing else — known_tx.go:685-695).
-                //
-                // Deliberately NOT touched (audit M3):
-                //  * transactions.status — a SEEN tx is final per the owner
-                //    rule; neither reference demotes the tx here.
-                //  * outputs.spendable — clamping on a guess understated the
-                //    balance and could strand basket-insertion outputs.
+            (ReorgStep::Unrepaired, answer) => {
+                let reason = match answer {
+                    Some((p, gate)) => {
+                        let reason = gate_reason(gate);
+                        console_error!(
+                            "{}",
+                            proof_not_stored_line("handle_reorg", &txid, p.provider, &reason)
+                        );
+                        reason
+                    }
+                    None => no_answer.clone(),
+                };
+                // As the deep sweep does for a proof it could not repair: the
+                // row (raw_tx and path kept for ancestry) and its request stay
+                // exactly as they are, the transaction and its outputs are not
+                // read or written, and the row is recorded. The deep sweep
+                // finds this root off the chain again and re-proves the row
+                // through the gate on each of its passes.
                 console_error!(
-                    "Reorg INVALIDATED: txid={} (was at height {}) — clearing proof, request back to unmined",
+                    "handle_reorg: {} left unrepaired (was at height {}): {}; row and request left for the deep sweep",
                     txid,
-                    row_height
+                    row_height,
+                    reason
                 );
-                let mut batch = BatchCollector::new(db);
-                let _ = batch.add(
-                    REORG_DEMOTE_PROOF_SQL,
-                    vec![QVal::Text(now.clone()), QVal::Int(proven_tx_id)],
-                );
-                let _ = batch.add(
-                    REORG_DEMOTE_REQ_SQL,
-                    vec![QVal::Text(now.clone()), QVal::Int(proven_tx_id)],
-                );
-                let _ = batch.execute().await;
-                reverified += 1;
+                deep_reorg::record_unrepaired(db, &unrepaired(&reason)).await;
             }
             _ => {}
         }
@@ -5776,35 +5764,25 @@ mod tests {
         assert!(sql.contains("proven_tx_id = ?"));
     }
 
+    /// Audit M3, kept: a height drop never moves a transaction or an output.
+    /// Without a proof the store gate passed, the stored proof is left and
+    /// recorded (the deep sweep's record); no request row is written.
     #[test]
-    fn test_reorg_invalidation_demotes_req() {
-        let sql = REORG_DEMOTE_REQ_SQL;
-        assert!(sql.contains("'unmined'"));
-        assert!(sql.contains("proven_tx_id = NULL"));
-        assert!(
-            sql.contains("attempts = 0"),
-            "reorg demote restarts the attempt clock (Go known_tx.go:685-695)"
-        );
-    }
-
-    /// Audit M3: a reorg proof-miss demotes ONLY the req. The transaction
-    /// stays at its status and outputs are NOT clamped — a missing proof
-    /// mid-reorg is provider lag, not evidence; the old spendable=0 clamp
-    /// permanently stranded basket-insertion outputs (the re-enable filter
-    /// only matches change/derivation outputs). Neither reference touches
-    /// transactions or outputs on reorg (TS TaskReorg.ts:69-84 re-proves
-    /// with retries; Go resets the req only).
-    #[test]
-    fn test_reorg_invalidation_touches_only_req_and_proof() {
-        // The reorg batch must contain exactly: proven_txs proof-null +
-        // proven_tx_reqs demote. Neither a transactions demote nor an
-        // outputs clamp may reappear.
-        let proof_null_sql = REORG_DEMOTE_PROOF_SQL;
-        assert!(proof_null_sql.contains("merkle_path = X''"));
-        assert!(
-            !proof_null_sql.contains("DELETE"),
-            "raw_tx must be preserved for ancestry"
-        );
+    fn test_reorg_without_a_checked_proof_leaves_the_row() {
+        use deep_reorg::{RootVerdict, StoreGate};
+        for gate in [
+            None,
+            Some(StoreGate::Reject("refused".into())),
+            Some(StoreGate::Hold("no answer".into())),
+        ] {
+            assert_eq!(
+                reorg_step(&RootVerdict::Orphan, gate.as_ref()),
+                ReorgStep::Unrepaired
+            );
+        }
+        let sql = deep_reorg::UNREPAIRED_EVENT_SQL;
+        assert!(sql.starts_with("INSERT INTO monitor_events"));
+        assert!(sql.contains("'deep_reorg_unrepaired'"));
     }
 
     #[test]
@@ -6622,14 +6600,18 @@ mod reorg_gate_tests {
                     .unwrap();
                 assert_eq!(n, 1);
             }
-            ReorgStep::Demote => {
-                // One batch on the Worker (`BatchCollector`): one transaction here.
-                conn.execute_batch("BEGIN").unwrap();
-                conn.execute(REORG_DEMOTE_PROOF_SQL, rusqlite::params![NOW, 1i64])
+            ReorgStep::Unrepaired => {
+                // The pass's only write for this step: the record.
+                let details = deep_reorg::unrepaired_details(
+                    OURS,
+                    1,
+                    STORED_H,
+                    STORED_HASH,
+                    &stored_facts(conn).root,
+                    "no canonical proof available",
+                );
+                conn.execute(deep_reorg::UNREPAIRED_EVENT_SQL, [details])
                     .unwrap();
-                conn.execute(REORG_DEMOTE_REQ_SQL, rusqlite::params![NOW, 1i64])
-                    .unwrap();
-                conn.execute_batch("COMMIT").unwrap();
             }
         }
     }
@@ -6768,11 +6750,29 @@ mod reorg_gate_tests {
         assert_eq!(snapshot(&conn), before);
     }
 
-    #[tokio::test]
-    async fn reorg_demotes_when_the_header_service_says_the_stored_root_is_not_the_chains() {
-        let (conn, _) = db();
+    /// The `deep_reorg_unrepaired` records, as (txid, proven_tx_id, height).
+    fn unrepaired_records(conn: &rusqlite::Connection) -> Vec<(String, i64, u32)> {
+        conn.prepare("SELECT details FROM monitor_events WHERE event = 'deep_reorg_unrepaired'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|d| {
+                let v: serde_json::Value = serde_json::from_str(&d.unwrap()).unwrap();
+                (
+                    v["txid"].as_str().unwrap().to_string(),
+                    v["proven_tx_id"].as_i64().unwrap(),
+                    v["height"].as_u64().unwrap() as u32,
+                )
+            })
+            .collect()
+    }
+
+    /// The stored root is no longer the chain's and no provider's proof passes
+    /// the gate: every row is left byte-equal, one record is written, and the
+    /// row is still a stored proof the passes read (candidates above a tip).
+    async fn keeps_and_records(conn: &rusqlite::Connection) {
         let h = headers(&[(STORED_H, &"dd".repeat(32))], true);
-        let f = stored_facts(&conn);
+        let f = stored_facts(conn);
         let verdict = RunRootCache::default().verdict(&h, &f.root, f.height).await;
         assert_eq!(verdict, RootVerdict::Orphan);
 
@@ -6788,58 +6788,52 @@ mod reorg_gate_tests {
         let gate = deep_reorg::gate_proof_for_store(&h, OURS, &p).await;
         assert!(matches!(gate, StoreGate::Reject(_)));
         let step = reorg_step(&verdict, Some(&gate));
-        assert_eq!(step, ReorgStep::Demote);
-        assert_eq!(reorg_step(&verdict, None), ReorgStep::Demote);
+        assert_eq!(step, ReorgStep::Unrepaired);
+        assert_eq!(reorg_step(&verdict, None), ReorgStep::Unrepaired);
+        assert_eq!(
+            reorg_step(&verdict, Some(&StoreGate::Hold("503".into()))),
+            ReorgStep::Unrepaired
+        );
 
-        let outputs_before: Vec<(i64, i64)> = conn
-            .prepare("SELECT output_id, spendable FROM outputs")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        apply(&conn, &step, &p);
-
-        let proof: (String, String, Vec<u8>, Vec<u8>) = conn
-            .query_row(
-                "SELECT block_hash, merkle_root, merkle_path, raw_tx FROM proven_txs WHERE proven_tx_id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(proof, (String::new(), String::new(), vec![], vec![1, 0]));
-        let req: (String, Option<i64>, i64) = conn
-            .query_row(
-                "SELECT status, proven_tx_id, attempts FROM proven_tx_reqs WHERE txid = ?",
-                [OURS],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(req, ("unmined".to_string(), None, 0));
-        // Never failed; the coins' rows as the demotion leaves them (untouched).
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM transactions WHERE transaction_id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "completed");
-        let outputs_after: Vec<(i64, i64)> = conn
-            .prepare("SELECT output_id, spendable FROM outputs")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(outputs_after, outputs_before);
-        // A cleared row is no longer a candidate for the next height drop.
+        let before = snapshot(conn);
+        apply(conn, &step, &p);
+        assert_eq!(snapshot(conn), before);
+        assert_eq!(
+            unrepaired_records(conn),
+            vec![(OURS.to_string(), 1, STORED_H)]
+        );
         let n: i64 = conn
             .query_row(
                 &format!("SELECT COUNT(*) FROM ({REORG_AFFECTED_SQL})"),
                 [STORED_H - 10],
                 |r| r.get(0),
             )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn reorg_keeps_the_row_and_records_it_when_the_stored_root_is_not_the_chains_and_no_checked_proof_is_at_hand(
+    ) {
+        let (conn, _) = db();
+        keeps_and_records(&conn).await;
+        let status: (String, String) = conn
+            .query_row(
+                "SELECT t.status, r.status FROM transactions t, proven_tx_reqs r WHERE t.transaction_id = 1 AND r.txid = t.txid",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, ("completed".to_string(), "completed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reorg_keeps_the_row_and_records_it_when_its_request_is_no_longer_held() {
+        let (conn, _) = db();
+        conn.execute("DELETE FROM proven_tx_reqs", []).unwrap();
+        keeps_and_records(&conn).await;
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM proven_tx_reqs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
     }

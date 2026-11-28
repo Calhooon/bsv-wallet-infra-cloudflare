@@ -695,23 +695,56 @@ async fn repair_row<P: ProofService, H: HeaderService>(
     };
 
     if let Some(reason) = reason {
-        let details = serde_json::json!({
-            "txid": txid,
-            "proven_tx_id": id,
-            "height": pair.height,
-            "block_hash": pair.block_hash,
-            "merkle_root": pair.merkle_root,
-            "reason": reason,
-        })
-        .to_string();
-        let _ = Query::new(
-            "INSERT INTO monitor_events (event, details, created_at, updated_at) \
-             VALUES ('deep_reorg_unrepaired', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        record_unrepaired(
+            db,
+            &unrepaired_details(
+                &txid,
+                id,
+                pair.height,
+                &pair.block_hash,
+                &pair.merkle_root,
+                &reason,
+            ),
         )
-        .bind(details.as_str())
-        .execute(db)
         .await;
     }
+}
+
+/// The record of a stored proof that a pass found off the chain and could not
+/// replace with a checked one. The row and its request are left as they are;
+/// the deep sweep re-checks the row on each of its passes. Binds: details.
+pub(crate) const UNREPAIRED_EVENT_SQL: &str =
+    "INSERT INTO monitor_events (event, details, created_at, updated_at) \
+     VALUES ('deep_reorg_unrepaired', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)";
+
+/// The details of a `deep_reorg_unrepaired` record: the row as it is stored,
+/// and the reason no checked proof was written.
+pub(crate) fn unrepaired_details(
+    txid: &str,
+    id: i64,
+    height: u32,
+    block_hash: &str,
+    merkle_root: &str,
+    reason: &str,
+) -> String {
+    serde_json::json!({
+        "txid": txid,
+        "proven_tx_id": id,
+        "height": height,
+        "block_hash": block_hash,
+        "merkle_root": merkle_root,
+        "reason": reason,
+    })
+    .to_string()
+}
+
+/// Write one `deep_reorg_unrepaired` record (best effort, as the deep sweep
+/// has always written it). Shared by the deep sweep and `handle_reorg`.
+pub(crate) async fn record_unrepaired(db: &D1Database, details: &str) {
+    let _ = Query::new(UNREPAIRED_EVENT_SQL)
+        .bind(details)
+        .execute(db)
+        .await;
 }
 
 /// The write of a checked proof over a stored one: height, idx and root are
