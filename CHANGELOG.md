@@ -4,6 +4,50 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.6, 2026-11-28: a coin's row is marked from a checked proof of its spender
+
+### Changed
+
+- **`internalizeAction`: a coin's row is marked from a checked proof of its
+  spender.** A call marks the internalizing user's own rows at the subject
+  transaction's inputs. Any other user's row at an outpoint the subject spends
+  is marked when the subject's checked proof is stored, from the stored bytes
+  of the subject, and only when those bytes hash to the proven txid. Nothing
+  changes for a row that another transaction already spends.
+- **`internalizeAction`: a call's own transitions are restored unless its
+  transaction is taken.** What the call marked at the subject's inputs is
+  restored on every outcome of the broadcast except acceptance: a double-spend
+  or invalid refusal, a policy refusal (460 to 475), and a transient fault
+  under either `INTERNALIZE_ZERO_CONF` setting. When the broadcaster later
+  accepts a policy-held transaction on a re-announce, the monitor marks those
+  inputs again.
+- **`internalizeAction`: a transaction whose inputs' parents are absent is
+  refused.** If the subject of a BEEF passed in the call's `tx` carries no
+  merkle proof and names an input whose parent the BEEF does not hold, the
+  call is refused with `-32602` and the reference's message, "The tx parameter
+  must be valid AtomicBEEF". The refusal comes before any write or broadcast,
+  under every `BEEF_VERIFICATION` setting.
+- **`internalizeAction`: a refused payment fails only the internalizing user's
+  own row.** The compensation after a broadcaster's refusal fails only the
+  internalizing call's own transactions row. It never touches a row that is
+  `completed` or carries a proof, and it zeroes that row's outputs only while
+  the row reads `failed`. The compensation runs even when the restore of the
+  call's inputs returns a storage error, and the call then answers that error.
+- **`internalizeAction`: a refusal the second source cannot answer holds the
+  rows without credit.** If the broadcaster refuses the subject and the second
+  source cannot be asked (an error rather than an answer), the caller is
+  answered as before, with the refusal (`-32602`, "Transaction <txid> rejected
+  by network (...)"). The transaction's rows are held without credit, its row
+  `unproven`, its outputs `spendable = 0` and its request `unmined`, until one
+  of three endings: its checked proof is stored (its outputs are credited
+  then, once); the broadcaster accepts it on the monitor's re-announce (its
+  outputs are credited then, as a taken transaction's are); or it fails by the
+  request's own road (nothing of it was ever offered). A later presentation of
+  the same transaction while it is held is answered the same refusal, without
+  a broadcast: by the same user before any write, and by another user once
+  that user's own rows are written, which are held the same way, without
+  credit.
+
 ## 0.7.5, 2026-11-28: the script check runs under a stack-memory budget
 
 ### Changed
