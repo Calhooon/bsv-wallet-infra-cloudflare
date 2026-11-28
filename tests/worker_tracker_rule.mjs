@@ -561,5 +561,155 @@ try {
     assert.equal(zeroPosts, posts)
   })
 } finally { await zero.mf.dispose() }
+
+// A coin's row is marked from a checked proof of its spender, and a call takes back what it
+// wrote unless its transaction is taken: two users, production's settings. The owner (B, the
+// fixture's user) holds a confirmed coin; the caller (A, another identity) internalizes a
+// transaction naming it. Every row of the owner and its balance are read before and after.
+let markArcade = 'accept', markWoc = 'unknown', markPosts = 0
+const markProofs = new Map(), markMined = new Set()
+const marks = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.test', CHAINTRACKS_URL: 'https://headers.test', BEEF_VERIFICATION: 'strict', INTERNALIZE_ZERO_CONF: 'true' }, async request => {
+  const url = new URL(request.url)
+  const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+  if (url.host === 'arcade.test' && request.method === 'POST' && ['/tx', '/txs'].includes(url.pathname)) {
+    markPosts++
+    if (markArcade === 'invalid') return json({ error: 'local fixture structural refusal' }, 400)
+    if (markArcade === 'policy') return json({ error: 'transaction failed validation', reason: 'local fixture policy refusal 465', status: 465, title: 'fixture' }, 400)
+    return json({ txStatus: 'RECEIVED' }, 202)
+  }
+  if (url.host === 'arcade.test' && url.pathname === '/events') {
+    const txStatus = { accept: 'SEEN_ON_NETWORK', double: 'DOUBLE_SPEND_ATTEMPTED', unverified: 'RECEIVED' }[markArcade] ?? 'RECEIVED'
+    return new Response(`data: ${JSON.stringify({ txid: url.searchParams.get('callbackToken'), txStatus })}\n\n`, { headers: { 'content-type': 'text/event-stream' } })
+  }
+  if (url.host === 'arcade.test' && url.pathname === '/policy') return json({ policy: { miningFee: { satoshis: 100, bytes: 1000 } } })
+  if (url.host === 'headers.test' && url.pathname === '/findHeaderHexForHeight') {
+    const height = Number(url.searchParams.get('height'))
+    return json({ status: 'success', value: { merkleRoot: roots.get(height) ?? '00'.repeat(32), height } })
+  }
+  if (url.host === 'api.whatsonchain.com' && request.method === 'POST' && url.pathname.endsWith('/txs/status')) {
+    const { txids } = JSON.parse(await request.text())
+    if (markWoc === 'error' && !txids.some(t => markMined.has(t))) return new Response('local fixture refusal', { status: 400 })
+    return json(txids.map(t => markMined.has(t) ? { txid: t, blockhash: 'cd'.repeat(32), blockheight: 900100, confirmations: 1 } : { txid: t, error: 'unknown' }))
+  }
+  const m = url.pathname.match(/^\/v1\/tx\/([0-9a-f]{64})$/)
+  if (url.host.startsWith('arc.') && request.method === 'GET' && m && markProofs.has(m[1])) {
+    const p = markProofs.get(m[1])
+    return json({ txid: m[1], txStatus: 'MINED', blockHeight: p.height, blockHash: 'cd'.repeat(32), merklePath: p.hex })
+  }
+  return new Response('not found', { status: 404 })
+})
+try {
+  const display = b => Buffer.from(b).reverse().toString('hex')
+  const owner = (await marks.db.prepare('SELECT user_id FROM users ORDER BY user_id LIMIT 1').first()).user_id
+  const ownerBasket = (await marks.db.prepare("SELECT basket_id FROM output_baskets WHERE user_id = ? AND name = 'default'").bind(owner).first()).basket_id
+  const callerKey = PrivateKey.fromRandom()
+  const caller = marks.session(callerKey)
+  await caller('findOrInsertUser', [callerKey.toPublicKey().toString()])
+  const ownerBalance = async () => (await marks.rpc('getBalance', [{ identityKey: '' }, { basket: 'default' }])).result.balance
+  const ownerRows = async () => JSON.stringify([
+    (await marks.db.prepare('SELECT transaction_id, status, proven_tx_id, txid FROM transactions WHERE user_id = ? ORDER BY transaction_id').bind(owner).all()).results,
+    (await marks.db.prepare('SELECT output_id, spendable, spent_by, satoshis, basket_id FROM outputs WHERE user_id = ? ORDER BY output_id').bind(owner).all()).results])
+  // The owner's confirmed coin at output 0 of a parent proven at 810000 + n.
+  const coin = async n => {
+    const parent = raw(Buffer.alloc(32, n), 0x51, n)
+    roots.set(810000 + n, display(hash(parent)))
+    await marks.exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx) VALUES (?, ?, 'completed', 0, 'owner coin', ?, ?)", owner, `coin-${n}`, txid(parent), parent)
+    const tx = (await marks.db.prepare('SELECT transaction_id FROM transactions WHERE reference = ?').bind(`coin-${n}`).first()).transaction_id
+    await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", owner, tx, ownerBasket, txid(parent), Buffer.from([0x51]))
+    const output = (await marks.db.prepare('SELECT output_id FROM outputs WHERE transaction_id = ?').bind(tx).first()).output_id
+    return { parent, height: 810000 + n, output }
+  }
+  const spendOf = (c, marker) => raw(hash(c.parent), 0x51, marker)
+  const withParent = (c, subject) => Buffer.concat([u32(0x01010101), hash(subject), bumped(c.parent, c.height), Buffer.from([2, 1, 0]), c.parent, Buffer.from([0]), subject])
+  const bare = subject => Buffer.concat([u32(0x01010101), hash(subject), u32(0xefbe0002), Buffer.from([0, 1, 0]), subject])
+  const take = (atomic, n) => caller('internalizeAction', [{ identityKey: '' }, { tx: atomic.toString('hex'), outputs: [{ outputIndex: 0, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: 'cHJlZml4', derivationSuffix: Buffer.from(`m${n}`).toString('base64'), senderIdentityKey: sender } }], description: 'marks', labels: [], seekPermission: false }])
+  const coinRow = c => marks.db.prepare('SELECT spendable, spent_by FROM outputs WHERE output_id = ?').bind(c.output).first()
+  const callerTx = t => marks.db.prepare('SELECT t.status FROM transactions t JOIN users u ON u.user_id = t.user_id WHERE t.txid = ? AND u.identity_key = ?').bind(t, callerKey.toPublicKey().toString()).first()
+  const unchanged = async (label, f) => {
+    const rows = await ownerRows(), balance = await ownerBalance()
+    const r = await f()
+    assert.equal(await ownerRows(), rows, `${label}: the owner's rows moved`)
+    assert.equal(await ownerBalance(), balance, `${label}: the owner's balance moved`)
+    return r
+  }
+  await check('mk1 B1: a subject with neither proof nor parent, naming another user\'s coin, refused before any write as the reference refuses it; the owner\'s rows and balance as they were', async () => {
+    markArcade = 'invalid'; markWoc = 'unknown'
+    const c = await coin(201); const subject = spendOf(c, 202)
+    const posts = markPosts
+    const r = await unchanged('B1', () => take(bare(subject), 201))
+    assert.deepEqual(r.error, { code: -32602, message: 'The tx parameter must be valid AtomicBEEF' }, JSON.stringify(r))
+    assert.equal(await callerTx(txid(subject)), null); assert.equal(markPosts, posts)
+  })
+  for (const [label, arcadeAnswer] of [['invalid', 'invalid'], ['double-spend', 'double']]) {
+    await check(`mk2 B1 with the parent: the broadcaster's ${label} and the second source's "not known" leave the owner's rows and balance as they were; the caller's own row is failed`, async () => {
+      markArcade = arcadeAnswer; markWoc = 'unknown'
+      const c = await coin(arcadeAnswer === 'invalid' ? 211 : 221); const subject = spendOf(c, arcadeAnswer === 'invalid' ? 212 : 222)
+      const r = await unchanged(`B1 ${label}`, () => take(withParent(c, subject), arcadeAnswer === 'invalid' ? 211 : 221))
+      assert.ok(r.error, JSON.stringify(r)); assert.match(r.error.message, /rejected by network/)
+      assert.equal((await callerTx(txid(subject))).status, 'failed')
+    })
+  }
+  await check('mk3 B1\': a policy refusal (465) leaves the owner\'s rows and balance as they were', async () => {
+    markArcade = 'policy'; markWoc = 'unknown'
+    const c = await coin(231); const subject = spendOf(c, 232)
+    const r = await unchanged('B1\' policy', () => take(withParent(c, subject), 231))
+    assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+    assert.equal((await callerTx(txid(subject))).status, 'sending')
+  })
+  await check('mk4 B1\': no verdict under INTERNALIZE_ZERO_CONF=true leaves the owner\'s rows and balance as they were; the caller\'s payment is credited as before', async () => {
+    markArcade = 'unverified'; markWoc = 'unknown'
+    const c = await coin(241); const subject = spendOf(c, 242)
+    const r = await unchanged('B1\' transient', () => take(withParent(c, subject), 241))
+    assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+    const credit = await marks.db.prepare('SELECT spendable FROM outputs WHERE txid = ?').bind(txid(subject)).first()
+    assert.equal(credit.spendable, 1)
+  })
+  for (const [label, woc] of [['errs', 'error'], ['answers "not known"', 'unknown']]) {
+    await check(`mk5 B4: the owner's mined payment, proven, its request purged; another user internalizes its bytes, the broadcaster refuses, the second source ${label}: the owner's rows and balance as they were`, async () => {
+      markArcade = 'invalid'; markWoc = woc
+      const n = woc === 'error' ? 251 : 261
+      const c = await coin(n)
+      // The owner's own payment T spends the coin; T is mined and proven, its change is the owner's.
+      const t = spendOf(c, n + 1)
+      await marks.exec('UPDATE outputs SET spendable = 0 WHERE output_id = ?', c.output)
+      await marks.exec("INSERT INTO proven_txs (txid, height, idx, block_hash, merkle_root, merkle_path, raw_tx) VALUES (?, 900200, 0, ?, ?, ?, ?)", txid(t), 'cd'.repeat(32), display(hash(t)), Buffer.from([0]), t)
+      const proven = (await marks.db.prepare('SELECT proven_tx_id FROM proven_txs WHERE txid = ?').bind(txid(t)).first()).proven_tx_id
+      await marks.exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx, proven_tx_id) VALUES (?, ?, 'completed', 1, 'owner payment', ?, ?, ?)", owner, `pay-${n}`, txid(t), t, proven)
+      const tx = (await marks.db.prepare('SELECT transaction_id FROM transactions WHERE reference = ?').bind(`pay-${n}`).first()).transaction_id
+      await marks.exec('UPDATE outputs SET spent_by = ? WHERE output_id = ?', tx, c.output)
+      await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", owner, tx, ownerBasket, txid(t), Buffer.from([0x51]))
+      const r = await unchanged(`B4 ${label}`, () => take(withParent(c, t), n))
+      if (woc === 'error') {
+        // A refusal the second source could not answer: held, the caller's output not credited.
+        assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+        const held = await marks.db.prepare('SELECT o.spendable FROM outputs o JOIN users u ON u.user_id = o.user_id WHERE o.txid = ? AND u.identity_key = ?').bind(txid(t), callerKey.toPublicKey().toString()).first()
+        assert.equal(held.spendable, 0)
+      }
+      else { assert.ok(r.error, JSON.stringify(r)); assert.equal((await callerTx(txid(t))).status, 'failed') }
+    })
+  }
+  let real
+  await check('mk6 a real spend of another user\'s coin: the call leaves the owner\'s coin as it was', async () => {
+    markArcade = 'accept'; markWoc = 'unknown'
+    const c = await coin(271); const subject = spendOf(c, 272)
+    real = { c, subject }
+    const r = await unchanged('real spend, at the call', () => take(withParent(c, subject), 271))
+    assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+  })
+  await check('mk7 the same spend is marked when its checked proof is stored', async () => {
+    assert.ok(real, 'no spend from mk6')
+    const id = txid(real.subject), leaf = hash(real.subject), sibling = Buffer.alloc(32, 0x5b)
+    const height = 900100
+    const path = Buffer.concat([Buffer.from([0xfe]), u32(height), Buffer.from([1, 2, 0, 2]), leaf, Buffer.from([1, 0]), sibling])
+    roots.set(height, display(hash(Buffer.concat([leaf, sibling]))))
+    markProofs.set(id, { hex: path.toString('hex'), height }); markMined.add(id)
+    const balance = await ownerBalance()
+    const response = await marks.mf.dispatchFetch(new URL('/monitor/run?key=fixture-monitor', marks.base), { method: 'POST' })
+    assert.equal(response.status, 200, await response.text())
+    assert.ok(await marks.db.prepare('SELECT 1 FROM proven_txs WHERE txid = ?').bind(id).first(), 'the proof was not stored')
+    assert.deepEqual({ ...(await coinRow(real.c)) }, { spendable: 0, spent_by: null })
+    assert.equal(await ownerBalance(), balance - 1000)
+  })
+} finally { await marks.mf.dispose() }
 console.log(`Tracker Worker witnesses: ${ran - failed} passed; ${failed} failed`)
 if (failed) process.exitCode = 1
