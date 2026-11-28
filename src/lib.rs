@@ -531,10 +531,18 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         return sign_refusal(&too_large, &session);
     }
 
-    // Parse JSON-RPC request
-    let rpc_request: JsonRpcRequest = match serde_json::from_slice(&request_body) {
-        Ok(r) => r,
-        Err(_) => {
+    // Parse JSON-RPC request. A payment's argument is decoded no further than
+    // the payment budget (`door::payment`): over it, the call is refused as
+    // a refused argument before any of the payment is parsed.
+    let rpc_request: JsonRpcRequest = match door::payment::parse_request(&request_body) {
+        door::payment::Parsed::Request(r) => r,
+        door::payment::Parsed::Refused { id, size } => {
+            door::payment::log(size, &auth_context.identity_key);
+            let error = door::errors::rpc_error(id, &crate::error::Error::PaymentSize { size });
+            return sign_json_response(&error, 200, &[], &session)
+                .map_err(|e| Error::from(e.to_string()));
+        }
+        door::payment::Parsed::Malformed => {
             let error = JsonRpcError::parse_error();
             return sign_json_response(&error, 200, &[], &session)
                 .map_err(|e| Error::from(e.to_string()));

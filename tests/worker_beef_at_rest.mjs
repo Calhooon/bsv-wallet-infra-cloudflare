@@ -32,11 +32,14 @@ const varint = n => {
   const b = Buffer.alloc(5); b[0] = 0xfe; b.writeUInt32LE(n, 1); return b
 }
 const u32 = n => { const b = Buffer.alloc(4); b.writeUInt32LE(n >>> 0); return b }
-const spend = (prev, outputs) => {
+// `pad` bytes of OP_0 after the OP_1 of the first output's script (a payment of
+// an exact length; at most 251).
+const spend = (prev, outputs, pad = 0) => {
   const parts = [u32(1), Buffer.from([1]), prev, u32(0), Buffer.from([0]), u32(0xffffffff), varint(outputs)]
   for (let i = 0; i < outputs; i++) {
     const sats = Buffer.alloc(8); sats.writeBigUInt64LE(1000n)
-    parts.push(sats, Buffer.from([1, 0x51]))
+    const extra = i === 0 ? pad : 0
+    parts.push(sats, Buffer.from([1 + extra, 0x51]), Buffer.alloc(extra))
   }
   parts.push(u32(0))
   return Buffer.concat(parts)
@@ -44,13 +47,16 @@ const spend = (prev, outputs) => {
 const funding = spend(Buffer.alloc(32, 0xaa), 2)
 const fundingRoot = sha256d(funding)
 
-/** The AtomicBEEF of the chain of `n` transactions, and its subject. */
-const chain = n => {
+/** The AtomicBEEF of the chain of `n` transactions, and its subject (its
+ * script padded by `pad` bytes). */
+const chain = (n, pad = 0) => {
   const txs = [Buffer.concat([Buffer.from([1, 0]), funding])]
   let prev = fundingRoot
+  let subject = funding
   for (let i = 1; i < n; i++) {
-    const raw = spend(prev, 1)
+    const raw = spend(prev, 1, i === n - 1 ? pad : 0)
     prev = sha256d(raw)
+    subject = raw
     txs.push(Buffer.concat([Buffer.from([0]), raw]))
   }
   const head = Buffer.concat([
@@ -58,14 +64,61 @@ const chain = n => {
     u32(0xefbe0002), Buffer.from([1]), varint(HEIGHT), Buffer.from([1, 1, 0, 2]), fundingRoot,
     varint(n),
   ])
-  return { beef: Buffer.concat([head, ...txs]), txid: display(prev) }
+  return { beef: Buffer.concat([head, ...txs]), txid: display(prev), raw: subject }
 }
+
+// The payment budget (door::payment): at most a mebibyte of a payment is read.
+const CAP = 1048576
+const LINKS = 16910
+/** The chain of LINKS transactions `over` bytes past the budget (0: exactly it). */
+const atBudget = (over = 0) => {
+  const pad = CAP - chain(LINKS).beef.length + over
+  const paid = chain(LINKS, pad)
+  assert.equal(paid.beef.length, CAP + over)
+  return paid
+}
+/** A proven AtomicBEEF of one transaction `over` bytes past the budget: its
+ * second output a data carrier filling it, its root at HEIGHT + 1. */
+const BIG_HEIGHT = HEIGHT + 1
+const oneLarge = (over = 0) => {
+  const make = data => {
+    const sats = Buffer.alloc(8); sats.writeBigUInt64LE(1000n)
+    const carrier = Buffer.concat([Buffer.from([0x00, 0x6a, 0x4e]), u32(data), Buffer.alloc(data, 0x5a)])
+    const raw = Buffer.concat([
+      u32(1), Buffer.from([1]), Buffer.alloc(32, 0xbb), u32(0), Buffer.from([0]), u32(0xffffffff),
+      Buffer.from([2]), sats, Buffer.from([1, 0x51]), Buffer.alloc(8), varint(carrier.length), carrier, u32(0),
+    ])
+    const root = sha256d(raw)
+    const beef = Buffer.concat([
+      u32(0x01010101), root,
+      u32(0xefbe0002), Buffer.from([1]), varint(BIG_HEIGHT), Buffer.from([1, 1, 0, 2]), root,
+      Buffer.from([1]), Buffer.from([1, 0]), raw,
+    ])
+    return { beef, root, txid: display(root) }
+  }
+  const first = make(CAP - 200)
+  const paid = make(CAP - 200 + (CAP + over - first.beef.length))
+  assert.equal(paid.beef.length, CAP + over)
+  return paid
+}
+const pinned = size => size === undefined
+  ? `Not judged: this payment is more than ${CAP} bytes, the most this host reads of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.`
+  : `Not judged: this payment is ${size} bytes, and this host reads at most ${CAP} bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.`
+const refusalOf = size => ({
+  code: -32602,
+  message: pinned(size),
+  data: size === undefined ? { code: 'ERR_PAYMENT_SIZE', budget: CAP } : { code: 'ERR_PAYMENT_SIZE', budget: CAP, size },
+})
 
 // ---------------------------------------------------------------------------
 // The Worker
 // ---------------------------------------------------------------------------
 
 const BUCKET = 'bsv-messagebox-beefs'
+// The roots the header service carries, by height.
+const rootAt = new Map([[HEIGHT, fundingRoot]])
+// The Worker's log lines (each refusal of a payment's size is counted by one).
+const logs = []
 const MONITOR_KEY = 'nl7c-local'
 const out = []
 let carry = true
@@ -92,7 +145,8 @@ const outbound = async request => {
   }
   if (url.host === 'headers.test' && url.pathname === '/findHeaderHexForHeight') {
     const height = Number(url.searchParams.get('height'))
-    const merkleRoot = carry && height === HEIGHT ? display(fundingRoot) : '00'.repeat(32)
+    const root = carry ? rootAt.get(height) : undefined
+    const merkleRoot = root ? display(root) : '00'.repeat(32)
     return new Response(JSON.stringify({ status: 'success', value: { merkleRoot, height } }),
       { headers: { 'content-type': 'application/json' } })
   }
@@ -127,6 +181,7 @@ const options = {
   kvPersist: join(persist, 'kv'),
   r2Persist: join(persist, 'r2'),
   outboundService: outbound,
+  handleStructuredLogs: ({ message }) => { logs.push(String(message).trim()) },
 }
 const mf = new Miniflare(options)
 
@@ -220,11 +275,11 @@ print(json.dumps(statements))
     say(`inline, unproven (${beef.length} bytes): accepted ${txid}; posted to ${whole.map(p => p.host).join(' and ')}: application/octet-stream, leading 0200beef, byte for byte the BEEF behind the prefix (${want.bytes} bytes)`)
   }
 
-  // 2 and 3. The relay's two shapes at rest: the 100,000-link payment and the
-  // first chain over the relay's 8 MiB line (DRAIN_INLINE_BYTES).
+  // 2 and 3. A chain at rest of exactly the payment budget (16,910 links,
+  // 1,048,576 bytes): accepted, streamed, copied byte for byte.
   const paid = {}
-  for (const [n, key] of [[100000, '02aa/nl7-100k.beef'], [135299, '02aa/nl7-over-8mib.beef']]) {
-    const { beef, txid } = chain(n)
+  for (const [n, key] of [[LINKS, '02aa/nl7-at-budget.beef']]) {
+    const { beef, txid, raw } = atBudget()
     paid[n] = { beef, txid }
     const reference = await upload(key, beef)
     const t0 = Date.now()
@@ -244,11 +299,76 @@ print(json.dumps(statements))
     assert.equal(sha256(stored), sha256(beef))
     const req = await db.prepare('SELECT proven_tx_req_id, status, length(raw_tx) AS raw FROM proven_tx_reqs WHERE txid = ?').bind(txid).first()
     assert.equal(req.status, 'unmined')
-    assert.equal(req.raw, 61)
+    assert.equal(req.raw, raw.length)
     assert.equal(sha256(await blobBytes(`proven_tx_reqs/${req.proven_tx_req_id}/input_beef`)), sha256(beef))
     const output = await db.prepare('SELECT o.satoshis, o.spendable, b.name FROM outputs o JOIN output_baskets b ON b.basket_id = o.basket_id WHERE o.txid = ? AND o.vout = 0').bind(txid).first()
     assert.deepEqual([output.satoshis, output.spendable, output.name], [1000, 0, 'nl7'])
     say(`at rest, ${n} links (${beef.length} bytes): accepted ${txid} in ${ms} ms; the BEEF copied into BLOBS twice byte for byte; the output in nl7, held until the monitor sees it`)
+  }
+
+  // 3b. The payment budget (door::payment): exactly a mebibyte passes to the
+  // door's own handling, inline and at rest; one byte more is refused before any of it is
+  // parsed or read, by the pinned sentence and code, counted by one log line,
+  // and no row is written and nothing is copied.
+  {
+    const counts = async () => {
+      const out = {}
+      for (const t of ['transactions', 'outputs', 'proven_tx_reqs', 'proven_txs']) {
+        out[t] = await db.prepare(`SELECT COUNT(*) AS n FROM "${t}"`).first('n')
+      }
+      return out
+    }
+    const counted = []
+    const line = size => `payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=${size ?? 'none'} budget=${CAP} identity_key=${caller}`
+    const refused = async (name, r, size) => {
+      assert.deepEqual(r.error, refusalOf(size), `${name}: ${JSON.stringify(r).slice(0, 600)}`)
+      assert.deepEqual(Object.keys(r).sort(), ['error', 'id', 'jsonrpc'])
+      counted.push(line(size))
+      say(`refused, ${name}: -32602 ${JSON.stringify(r.error.data)} "${r.error.message.slice(0, 64)}..."`)
+    }
+    const before = await counts()
+    const blobsBefore = (await blobs.list()).objects.length
+    const logsBefore = logs.length
+
+    // Inline, one byte over: as hex (its size known) and as an array of bytes
+    // (read no further than the budget, its size not known).
+    const big = oneLarge(1)
+    rootAt.set(BIG_HEIGHT, big.root)
+    await refused(`inline, ${big.beef.length} bytes as hex`, await internalize({ tx: big.beef.toString('hex') }, 'over the budget'), CAP + 1)
+    await refused(`inline, ${big.beef.length} bytes as an array`, await internalize({ tx: [...big.beef] }, 'over the budget'), undefined)
+
+    // At rest, one byte over, and the 100,000-link payment: refused on the
+    // length the reference names, which the object's head matches. Bytes that
+    // are no BEEF at all, one byte over, are refused the same way: never read.
+    const over = atBudget(1)
+    await refused(`at rest, ${over.beef.length} bytes`, await internalize({ beefAtRest: await upload('02aa/nl7-over-budget.beef', over.beef) }, 'over the budget'), CAP + 1)
+    const hundred = chain(100000)
+    await refused(`at rest, the 100000-link payment (${hundred.beef.length} bytes)`, await internalize({ beefAtRest: await upload('02aa/nl7-100k.beef', hundred.beef) }, 'over the budget'), hundred.beef.length)
+    const garbage = Buffer.alloc(CAP + 1, 0x5a)
+    await refused('at rest, bytes that are no BEEF, one byte over', await internalize({ beefAtRest: await upload('02aa/nl7-garbage-over.beef', garbage) }, 'over the budget'), CAP + 1)
+
+    assert.deepEqual(await counts(), before, 'a refused payment wrote a row')
+    assert.equal((await blobs.list()).objects.length, blobsBefore, 'a refused payment was copied into BLOBS')
+    for (const txid of [big.txid, over.txid, hundred.txid]) {
+      assert.equal(await db.prepare('SELECT COUNT(*) AS n FROM transactions WHERE txid = ?').bind(txid).first('n'), 0)
+    }
+    // The log lines arrive on the runtime's stream: give it a moment.
+    const deadline = Date.now() + 5000
+    const notJudged = () => logs.slice(logsBefore).filter(l => l.startsWith('payment.not_judged'))
+    while (notJudged().length < counted.length && Date.now() < deadline) await new Promise(r => setTimeout(r, 50))
+    assert.deepEqual(notJudged(), counted)
+    say(`counted: ${counted.length} lines, the first "${counted[0]}"`)
+
+    // Exactly the budget, inline: the one-transaction payment is accepted; the
+    // chain of 16,910 meets the measure (its parse over the measure's budget).
+    const exact = oneLarge(0)
+    rootAt.set(BIG_HEIGHT, exact.root)
+    const r = await internalize({ tx: exact.beef.toString('hex') }, 'exactly the budget')
+    assert.ok(r.result && r.result.accepted, JSON.stringify(r).slice(0, 600))
+    assert.equal(r.result.txid, exact.txid)
+    const chained = await internalize({ tx: paid[LINKS].beef.toString('hex') }, 'exactly the budget, a chain')
+    assert.deepEqual(chained.error, { code: -32602, message: 'the BEEF is too large to process' }, JSON.stringify(chained).slice(0, 600))
+    say(`inline, exactly ${exact.beef.length} bytes: accepted ${exact.txid}; the chain of ${LINKS} at ${paid[LINKS].beef.length} bytes meets the measure: -32602 "${chained.error.message}"`)
   }
 
   // 4. A reference the object does not answer to is refused before a byte is read.
@@ -358,7 +478,7 @@ print(json.dumps(statements))
   // Rebroadcast hands it (`unsent`). Under BROADCASTER arc, then arcade
   // (Arcade's /tx takes no BEEF: the stream goes to ARC).
   {
-    const { beef, txid } = paid[100000]
+    const { beef, txid } = paid[LINKS]
     const want = { bytes: beef.length - 36, sha: sha256(beef.subarray(36)) }
     for (const broadcaster of ['arc', 'arcade']) {
       if (broadcaster === 'arcade') {
@@ -389,7 +509,7 @@ print(json.dumps(statements))
       assert.equal(req.status, 'unmined')
       const arcade = out.slice(before).filter(u => u.startsWith('arcade.test/tx'))
       assert.deepEqual(arcade, [], `${broadcaster}: the BEEF went to Arcade's /tx`)
-      say(`monitor, ${broadcaster}: the 100000-link subject at rest posted as a stream in ${ms} ms to ${whole.map(p => p.host).join(' and ')}: application/octet-stream, content-length ${want.bytes}, byte for byte the BEEF behind the prefix; the row unmined`)
+      say(`monitor, ${broadcaster}: the ${LINKS}-link subject at rest posted as a stream in ${ms} ms to ${whole.map(p => p.host).join(' and ')}: application/octet-stream, content-length ${want.bytes}, byte for byte the BEEF behind the prefix; the row unmined`)
     }
   }
 

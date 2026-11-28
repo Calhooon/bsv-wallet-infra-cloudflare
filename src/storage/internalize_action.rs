@@ -419,7 +419,9 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         user_id: i64,
         args: InternalizeActionArgs,
     ) -> Result<StorageInternalizeActionResult> {
-        // Step 1: Parse and validate the AtomicBEEF (measured first).
+        // Step 1: Parse and validate the AtomicBEEF: at most a mebibyte of
+        // it (`crate::door::payment`), then measured, then parsed.
+        crate::door::payment::admit(args.tx.len() as u64)?;
         let beef = parse_inline_beef(&args.tx)?;
 
         let txid = beef.atomic_txid.clone().ok_or_else(|| {
@@ -506,6 +508,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         args: InternalizeActionArgs,
         reference: BeefAtRest,
     ) -> Result<StorageInternalizeActionResult> {
+        // At most a mebibyte of a payment is read (`crate::door::payment`):
+        // the length the reference names, which the object's head must
+        // match, is held to it before the object is opened.
+        crate::door::payment::admit(reference.size)?;
         let store = self.beef_at_rest.ok_or_else(|| {
             Error::ValidationError(
                 "beefAtRest: no bucket is bound here for bytes at rest (BEEF_AT_REST)".to_string(),

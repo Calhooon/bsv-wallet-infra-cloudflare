@@ -53,6 +53,42 @@ binding is the soft inner rail, and `GET /` names each binding `bound` or
 wallet's store (#54, #28), and the daily budget switch (#55) is the hard
 bound.
 
+### A payment's bytes
+
+A door that takes a payment's bytes from a caller reads at most one mebibyte
+of them, 1,048,576 bytes of the payment itself (the BEEF or the transaction as
+bytes, whatever encoding carried it), and refuses a larger one before it
+parses or verifies any of it and before anything is written
+(`door::payment::MAX_PAYMENT_BYTES`). A Worker's isolate is memory-limited
+and a door bounds what it reads. The doors are `internalizeAction`'s
+AtomicBEEF inline (`tx`, a JSON array of bytes or a hex string),
+`processAction`'s signed transaction (`rawTx`), and `internalizeAction`'s
+BEEF at rest (`beefAtRest`, held on the length its reference names, which the
+object's head must match, before the object is opened). An array is decoded
+no further than the budget and a hex string is held on its length before it
+is decoded; a request's other arguments keep their own limits. The figure is
+provisional: it is read again at this crate's next bsv-rs pin and raised to
+the door's natural figure then.
+
+The refusal is the JSON-RPC error of a refused argument, `-32602`, its
+`message` one of two sentences with the door's values, and its `data` the
+typed code with the budget and, where the door knows it, the size:
+
+```json
+{"code": -32602,
+ "message": "Not judged: this payment is 1048577 bytes, and this host reads at most 1048576 bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.",
+ "data": {"code": "ERR_PAYMENT_SIZE", "budget": 1048576, "size": 1048577}}
+```
+
+Where the payment is an array whose length is read only as it is decoded,
+`size` is absent and the message reads `Not judged: this payment is more than
+1048576 bytes, the most this host reads of a payment: ...` with the same
+close. The door reads and keeps nothing of a refused payment. Each refusal is
+counted by one log line:
+`payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=<bytes or none> budget=1048576 identity_key=<the caller's public identity key>`.
+The reference's servers run under a process with no isolate ceiling and name
+no such figure; this host differs on purpose.
+
 The BRC-31 handshake is answered by the middleware; an authenticated request to any other path is a 404. The
 cron trigger in [wrangler.toml](wrangler.toml) (`*/5 * * * *`) runs the monitor.
 

@@ -82,7 +82,10 @@ const options = {
     RATE_LIMIT_IDENTITY: { simple: IDENTITY_LIMIT },
   },
   outboundService: outbound,
+  handleStructuredLogs: ({ message }) => { logs.push(String(message).trim()) },
 }
+// The Worker's log lines (each refusal of a payment's size is counted by one).
+const logs = []
 const mf = new Miniflare(options)
 
 const say = line => console.log(line)
@@ -346,6 +349,60 @@ print(json.dumps(statements))
     const row = await db.prepare('SELECT status, txid, raw_tx FROM transactions WHERE reference = ?').bind(reference).first()
     assert.deepEqual(row, { status: 'unsigned', txid: null, raw_tx: null })
     say(`measure: internalizeAction's AtomicBEEF of ${n} txid-only entries (hex and array) -32602 "${refused.error.message}", as a malformed BEEF is (-32602 "${malformed.error.message.slice(0, 26)}..."); processAction's ${raw.length}-byte transaction -32602 "${processRefused.error.message}"; no table gained or lost a row, the action stays unsigned`)
+
+    // 8c. The payment budget (door::payment): processAction's signed
+    // transaction one byte over a mebibyte, as the array of bytes a client
+    // sends, is refused before it is hashed or parsed (-32602, the pinned
+    // sentence, ERR_PAYMENT_SIZE with the budget; its size is not known where
+    // the array is read no further than the budget), counted by one log line,
+    // and nothing is written. Exactly a mebibyte passes the budget to the
+    // storage's own handling.
+    const CAP = 1048576
+    const pinnedMore = `Not judged: this payment is more than ${CAP} bytes, the most this host reads of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.`
+    const pinnedIs = size => `Not judged: this payment is ${size} bytes, and this host reads at most ${CAP} bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.`
+    // A signed transaction of `length` bytes: one input, one output whose
+    // script is one push filling it.
+    const signed = length => {
+      const data = length - 64 - 5
+      return [...le32(1), 1, ...new Array(36).fill(0x44), 0, ...le32(0xffffffff), 1,
+        ...new Array(8).fill(0), 0xfe, ...le32(data + 5), 0x4e, ...le32(data), ...new Array(data).fill(0x5a), ...le32(0)]
+    }
+    const budgetRef = 'budget-reference'
+    await db.prepare("INSERT INTO transactions (user_id, status, reference, is_outgoing, description) VALUES (?, 'unsigned', ?, 1, 'an action')").bind(userId, budgetRef).run()
+    const processOf = rawTx => {
+      const txid = Buffer.from(sha(sha(Buffer.from(rawTx)))).reverse().toString('hex')
+      return rpc('processAction', [{ identityKey: caller }, {
+        isNewTx: true, isSendWith: false, isNoSend: false, isDelayed: false, reference: budgetRef, txid, rawTx, sendWith: [],
+      }])
+    }
+    const logsBefore = logs.length
+    const beforeBudget = await counts()
+    const over = signed(CAP + 1)
+    assert.equal(over.length, CAP + 1)
+    const overRefused = await processOf(over)
+    assert.deepEqual(overRefused.error, { code: -32602, message: pinnedMore, data: { code: 'ERR_PAYMENT_SIZE', budget: CAP } }, JSON.stringify(overRefused).slice(0, 600))
+    assert.deepEqual(Object.keys(overRefused).sort(), ['error', 'id', 'jsonrpc'])
+    // internalizeAction's AtomicBEEF one byte over, as hex: its size known.
+    const overBeef = Buffer.concat([Buffer.from(beef.slice(0, 44)), Buffer.alloc(CAP + 1 - 44, 0x22)])
+    const beefRefused = await internalize(overBeef.toString('hex'))
+    assert.deepEqual(beefRefused.error, { code: -32602, message: pinnedIs(CAP + 1), data: { code: 'ERR_PAYMENT_SIZE', budget: CAP, size: CAP + 1 } }, JSON.stringify(beefRefused).slice(0, 600))
+    assert.deepEqual(await counts(), beforeBudget)
+    assert.deepEqual(await db.prepare('SELECT status, txid, raw_tx FROM transactions WHERE reference = ?').bind(budgetRef).first(), { status: 'unsigned', txid: null, raw_tx: null })
+    const expected = [
+      `payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=none budget=${CAP} identity_key=${caller}`,
+      `payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=${CAP + 1} budget=${CAP} identity_key=${caller}`,
+    ]
+    const notJudged = () => logs.slice(logsBefore).filter(l => l.startsWith('payment.not_judged'))
+    const deadline = Date.now() + 5000
+    while (notJudged().length < expected.length && Date.now() < deadline) await new Promise(r => setTimeout(r, 50))
+    assert.deepEqual(notJudged(), expected)
+    const exact = signed(CAP)
+    assert.equal(exact.length, CAP)
+    const handled = await processOf(exact)
+    assert.notEqual(handled.error?.data?.code, 'ERR_PAYMENT_SIZE', JSON.stringify(handled).slice(0, 600))
+    assert.notEqual(handled.error?.message, 'the transaction is too large to process', JSON.stringify(handled).slice(0, 600))
+    assert.equal(notJudged().length, expected.length)
+    say(`payment budget: processAction's ${over.length}-byte transaction (array) -32602 ${JSON.stringify(overRefused.error.data)}; internalizeAction's ${overBeef.length}-byte AtomicBEEF (hex) -32602 ${JSON.stringify(beefRefused.error.data)}; counted "${expected[0]}"; no table gained or lost a row; the ${exact.length}-byte transaction passed to the storage: ${JSON.stringify(handled.error ?? handled.result).slice(0, 160)}`)
   }
 
   // 9. The two rate limits, in one window of the limiter (aligned to its period).

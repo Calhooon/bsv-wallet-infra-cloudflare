@@ -22,18 +22,24 @@ pub fn public_parts(e: &Error) -> (i32, String) {
         Error::DatabaseError(_) | Error::InternalError(_) => {
             (INTERNAL_ERROR, INTERNAL_TEXT.to_string())
         }
+        Error::PaymentSize { size } => (INVALID_PARAMS, super::payment::description(*size)),
     }
 }
 
 /// The JSON-RPC error answer of the call `id` failing with `e`; a collapsed
-/// fault is logged with its own text.
+/// fault is logged with its own text. A payment over the budget carries
+/// `data`: the code `ERR_PAYMENT_SIZE`, the `budget` and the `size` where known.
 pub fn rpc_error(id: Value, e: &Error) -> Value {
     #[cfg(target_arch = "wasm32")]
     if matches!(e, Error::DatabaseError(_) | Error::InternalError(_)) {
         worker::console_error!("rpc fault (collapsed on the wire): {e}");
     }
     let (code, message) = public_parts(e);
-    serde_json::to_value(JsonRpcError::new(id, code, message)).unwrap_or(Value::Null)
+    let mut answer = JsonRpcError::new(id, code, message);
+    if let Error::PaymentSize { size } = e {
+        answer.error.data = Some(super::payment::data(*size));
+    }
+    serde_json::to_value(answer).unwrap_or(Value::Null)
 }
 
 #[cfg(test)]
@@ -59,5 +65,36 @@ mod tests {
             public_parts(&Error::NotFound("output 99".into())),
             (NOT_FOUND, "output 99".to_string())
         );
+    }
+
+    #[test]
+    fn a_payment_over_the_budget_is_a_refused_argument_with_its_data() {
+        let answer = rpc_error(
+            json!(3),
+            &Error::PaymentSize {
+                size: Some(1_048_577),
+            },
+        );
+        assert_eq!(
+            answer,
+            json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32602,
+                    "message": crate::door::payment::description(Some(1_048_577)),
+                    "data": { "code": "ERR_PAYMENT_SIZE", "budget": 1_048_576, "size": 1_048_577 },
+                },
+                "id": 3,
+            })
+        );
+        let unknown = rpc_error(json!(3), &Error::PaymentSize { size: None });
+        assert_eq!(
+            unknown["error"]["data"],
+            json!({ "code": "ERR_PAYMENT_SIZE", "budget": 1_048_576 })
+        );
+        assert!(unknown["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Not judged: this payment is more than 1048576 bytes"));
     }
 }

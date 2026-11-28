@@ -131,7 +131,13 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
     // A fault's own text goes to the log, never to the wire (#22, door::errors).
     match result {
         Ok(val) => val,
-        Err(e) => crate::door::errors::rpc_error(id, &e),
+        Err(e) => {
+            if let Error::PaymentSize { size } = &e {
+                let identity_key = auth.map_or("none", |a| a.identity_key.as_str());
+                crate::door::payment::log(*size, identity_key);
+            }
+            crate::door::errors::rpc_error(id, &e)
+        }
     }
 }
 
