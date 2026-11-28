@@ -531,7 +531,19 @@ impl ProofService for WocProvider {
                         return Err(format!("WoC get_status_for_txids HTTP {}", status));
                     }
 
-                    success = Some(response.text().await.map_err(|e| e.to_string())?);
+                    // Read no further than the payment figure's answer bound
+                    // (`door::payment::read_answer`): past it, WoC's error,
+                    // which the caller takes as no answer.
+                    success = Some(
+                        crate::door::payment::read_answer(
+                            &mut response,
+                            "woc",
+                            "status",
+                            self.payment_budget,
+                        )
+                        .await
+                        .map_err(String::from)?,
+                    );
                     break;
                 }
                 match success {
@@ -631,7 +643,17 @@ impl ProofService for WocProvider {
                 return Err(format!("WoC get_spent_status HTTP {}", status));
             }
 
-            let text = response.text().await.map_err(|e| e.to_string())?;
+            // Read no further than the payment figure's answer bound
+            // (`door::payment::read_answer`): past it, WoC's error, neither
+            // spent nor unspent.
+            let text = crate::door::payment::read_answer(
+                &mut response,
+                "woc",
+                "spent",
+                self.payment_budget,
+            )
+            .await
+            .map_err(String::from)?;
             return parse_spent_response(&text);
         }
 

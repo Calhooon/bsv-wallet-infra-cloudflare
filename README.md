@@ -112,11 +112,15 @@ the merkle path the broadcaster's callback (`/arcade/callback`) carries or
 its stored record names. Over the figure the answer is not parsed and that
 provider is taken as unavailable at that moment, the road a provider's error
 already takes (the next provider is asked, the request is held for the
-monitor's next run); it is never a verdict on a transaction. Each is counted
+monitor's next run); it is never a verdict on a transaction. WhatsOnChain's
+status answers (`/txs/status`, the second source asked after a broadcaster's
+refusal and the monitor's triage) and its spent answers
+(`/tx/{txid}/{vout}/spent`) are read within the same bound; past it, that
+answer is WhatsOnChain's error: no answer, never "not known". Each is counted
 by one log line:
 `provider.answer_not_read provider=<arc|woc|bitails|arcade> answer=<proof|raw_tx> size=<bytes> budget=<the figure>`,
 or, for an answer not read past the bound,
-`provider.answer_not_read provider=<...> answer=<proof|raw_tx|record|callback> <declared|read>=<bytes> bound=<bytes>`.
+`provider.answer_not_read provider=<...> answer=<proof|raw_tx|record|callback|status|spent> <declared|read>=<bytes> bound=<bytes>`.
 
 The BRC-31 handshake is answered by the middleware; an authenticated request to any other path is a 404. The
 cron trigger in [wrangler.toml](wrangler.toml) (`*/5 * * * *`) runs the monitor.
