@@ -140,6 +140,7 @@ impl ProofService for BitailsProvider {
             block_height: header.height,
             block_hash: proof.target.clone(),
             merkle_root: header.merkle_root.unwrap_or_default(),
+            provider: "bitails",
         }))
     }
 

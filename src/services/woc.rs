@@ -378,6 +378,7 @@ impl ProofService for WocProvider {
                 block_height: header.height,
                 block_hash: header.hash,
                 merkle_root: header.merkleroot,
+                provider: "woc",
             }));
         }
 
@@ -1306,6 +1307,7 @@ mod tests {
             block_height: 800000,
             block_hash: "0000abc".to_string(),
             merkle_root: "deadbeef".to_string(),
+            provider: "woc",
         };
         assert_eq!(result.txid, "def456");
         assert_eq!(result.merkle_path_binary, vec![1, 2, 3]);
