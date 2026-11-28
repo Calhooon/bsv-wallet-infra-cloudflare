@@ -107,7 +107,9 @@ jobs:
 
         node tests/worker_list_pages.mjs
 
-        node tests/worker_tracker_rule.mjs'
+        node tests/worker_tracker_rule.mjs
+
+        node tests/worker_reorg_gate.mjs'
   scrub:
     name: scrub
     runs-on: ubuntu-latest
