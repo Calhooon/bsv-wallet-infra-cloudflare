@@ -4,6 +4,34 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.5, 2026-11-28: bsv-rs 0.8.14
+
+### Changed
+
+- **bsv-rs `0.8.14`** (the caret, from `0.8.11`), the newest 0.8 on the index;
+  bsv-middleware-cloudflare stays `=0.7.2` and the lock holds one bsv-rs. The
+  lock moves bsv-rs and this crate's own version, nothing else. No source
+  change. Of the advisories 0.8.14 closes, these reach the features this
+  crate builds (`auth`, `wallet`, `messages`, `transaction`, `script`,
+  `primitives`, `block`, `wasm`): GHSA-wh67-gjx6-4qqh, GHSA-56fp-4337-6vfh,
+  GHSA-7vx5-cf5p-5c48, GHSA-63w6-rpmj-r9gg, GHSA-grrj-gwrr-v7r3,
+  GHSA-mqr8-3gvc-hhg3, GHSA-fm3p-cmwv-rf6h and GHSA-4gp5-q4cj-4qjf. The
+  `overlay` and `compat` features stay off, so GHSA-33px-hj7f-4cpj and
+  GHSA-43mf-m7fg-m74w reach no code here.
+- **What a client sees.** An honest request is answered as on 0.8.11. A BUMP
+  whose offset lies outside its tree no longer parses: an inline BEEF carrying
+  one is refused as any BEEF the parser cannot read is, `-32602`
+  `Failed to parse AtomicBEEF: ...`. A signature with the Chronicle sighash
+  at transaction version 1 no longer verifies in bsv-rs's default mode.
+- **The test fixtures of many BUMP leaves are well-formed.** The families
+  "one BUMP of many leaves" and "many BUMPs of many leaves"
+  (`tests/support/beef_shapes.rs`), the measure's own test BUMP
+  (`src/door/beef_measure.rs`, `#[cfg(test)]`) and a TSC proof of the
+  monitor's tests (`src/monitor.rs`, `#[cfg(test)]`) carry as many levels as
+  their offsets need, so each parses on 0.8.11 and on 0.8.14. The memory
+  assertions are unchanged; the measure's counts test reads the BUMP's leaves
+  and levels from the parse.
+
 ## 0.7.4, 2026-11-27: one row per payment under concurrent calls
 
 ### Changed

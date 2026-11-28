@@ -166,9 +166,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.8.11"
+version = "0.8.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7641f339ea4b6e3a084d7649a641be8d05775d3c2d98cd17f348b4a4019ecef3"
+checksum = "9320af937dc8336b8e519b4c2c180099ef2ab8ea37fd4e5b5d04b4f2afa9debd"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-wallet-infra-cloudflare"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "base64",
  "bsv-middleware-cloudflare",
