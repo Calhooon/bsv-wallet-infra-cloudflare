@@ -1188,25 +1188,43 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 {
                     Ok(post) => post,
                     Err(e) => {
-                        self.restore_internalized_inputs(&input_transitions, now)
-                            .await?;
+                        // The call answers the first error; a restore that
+                        // also fails is logged.
+                        if let Err(restore_err) = self
+                            .restore_internalized_inputs(&input_transitions, now)
+                            .await
+                        {
+                            worker::console_error!(
+                                "internalize: restore of inputs for txid={} failed: {}",
+                                txid,
+                                restore_err
+                            );
+                        }
                         return Err(e);
                     }
                 };
                 // Every outcome but a take gives back what step 7b
                 // transitioned: the refusals, the policy hold and the
                 // transient fault under either INTERNALIZE_ZERO_CONF setting.
-                if post != PostOutcome::Sent {
+                // The restore and the steps after it are independent: when the
+                // restore errs, the credit of a transaction that was not taken
+                // is still taken back below, and the call then answers the
+                // restore's error.
+                let restore = if post != PostOutcome::Sent {
                     self.restore_internalized_inputs(&input_transitions, now)
-                        .await?;
-                }
+                        .await
+                } else {
+                    Ok(())
+                };
                 if let PostOutcome::Rejected(reason) = &post {
-                    // COMPENSATE: the call already wrote its transaction row
-                    // and its spendable=1 outputs (D1 has no rollback; audit
-                    // C1 — reference internalizes transactionally,
+                    // The call already wrote its transaction row and its
+                    // spendable=1 outputs, and D1 has no rollback: the
+                    // compensation takes this call's credit back explicitly
+                    // (the reference internalizes in one transaction,
                     // internalizeAction.ts:417-437).
                     self.compensate_rejected_internalize(&txid, &raw_tx, transaction_id, user_id)
                         .await;
+                    restore?;
                     return Err(Error::ValidationError(reason.clone()));
                 }
                 // A policy refusal (B5, #50) demotes whatever INTERNALIZE_ZERO_CONF
@@ -1242,14 +1260,19 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                                             // hard-rejects upstream in create_proven_tx_req, and a policy
                                             // refusal is demoted under either setting; only the transient
                                             // ServiceError path keeps its outputs here.
-                    Query::new(
+                    if let Err(e) = Query::new(
                         "UPDATE outputs SET spendable = 0, updated_at = ? WHERE transaction_id = ? AND user_id = ?",
                     )
                     .bind(now)
                     .bind(transaction_id)
                     .bind(user_id)
                     .execute(self.db)
-                    .await?;
+                    .await
+                    {
+                        // The first error is answered.
+                        restore?;
+                        return Err(e);
+                    }
                     // #22: the step-7b flips were rolled back above
                     // (internalizeAction.ts:120-128, :626-636). A policy
                     // refusal is re-announced by the monitor: the row reads
@@ -1257,13 +1280,17 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     // status) until send_waiting's accepted arm moves it to
                     // `unproven` and marks the caller's inputs again.
                     if post == PostOutcome::PolicyHeld {
-                        Query::new(
+                        if let Err(e) = Query::new(
                             "UPDATE transactions SET status = 'sending', updated_at = ? WHERE transaction_id = ? AND status = 'unproven'",
                         )
                         .bind(now)
                         .bind(transaction_id)
                         .execute(self.db)
-                        .await?;
+                        .await
+                        {
+                            restore?;
+                            return Err(e);
+                        }
                     }
                 } else if post == PostOutcome::Transient {
                     worker::console_log!(
@@ -1271,6 +1298,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         txid
                     );
                 }
+                restore?;
             }
         }
 
