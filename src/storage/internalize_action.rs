@@ -44,36 +44,35 @@ const BASKET_INSERTION_PROTOCOL: &str = "basket insertion";
 // restoreInputsToSpendable. The consts live at module scope so the rusqlite
 // harness below runs the REAL SQL against the REAL migrations (g5 pattern).
 
-/// All storage rows at one consumed-input outpoint — deliberately NO user
-/// filter: an on-chain spend invalidates the coin for EVERY user holding a
-/// row at that outpoint (internalizeAction.ts:39-42, :80-84). `user_tx_id`
-/// is the subject tx's transaction_id IN THAT ROW'S USER'S SCOPE (review H3:
-/// transactions.txid is not unique across users), NULL for users with no
-/// record of the subject tx.
-/// Binds: subject_txid, prev_txid, prev_vout.
+/// The internalizing user's own rows at one consumed-input outpoint. A call
+/// writes no row of another user: another user's coin at that outpoint is
+/// marked where the subject's checked proof is stored, from the proven bytes
+/// (`crate::monitor::PROOF_MARK_SPENT_INPUT_SQL`). `user_tx_id` is the
+/// subject tx's transaction_id in the user's scope (review H3:
+/// transactions.txid is not unique across users).
+/// Binds: subject_txid, prev_txid, prev_vout, user_id.
 const INTERNALIZE_INPUT_ROWS_SQL: &str = "SELECT o.output_id, o.spendable, o.spent_by, \
         (SELECT t.transaction_id FROM transactions t \
          WHERE t.txid = ? AND t.user_id = o.user_id) AS user_tx_id \
-     FROM outputs o WHERE o.txid = ? AND o.vout = ?";
+     FROM outputs o WHERE o.txid = ? AND o.vout = ? AND o.user_id = ?";
 
-/// Flip one eligible row to consumed (internalizeAction.ts:89-93).
-/// spent_by uses the COALESCE-with-per-user-scalar-subquery idiom
-/// (monitor.rs::remark_inputs_spent): never clobbers an existing link, and
-/// naturally yields NULL for users without their own transactions row for
-/// the subject txid — a foreign row's spent_by must reference THAT user's
-/// transactions, never the internalizer's. NEVER writes
+/// Flip one eligible row of the internalizing user to consumed
+/// (internalizeAction.ts:89-93). spent_by uses the
+/// COALESCE-with-per-user-scalar-subquery idiom
+/// (monitor.rs::remark_inputs_spent): never clobbers an existing link. The
+/// row must be the caller's own (`user_id = ?`). NEVER writes
 /// spending_description (contrast createAction). The WHERE guard re-checks
 /// eligibility write-time: only a live spendable row whose spent_by is NULL
 /// or already the subject tx (idempotence; a competing spend is never
 /// overwritten, internalizeAction.ts:86-87). Guarded no-ops keep audit
 /// Case A (spendable=1 AND spent_by set) unreachable from this path.
-/// Binds: subject_txid, updated_at, output_id, subject_txid.
+/// Binds: subject_txid, updated_at, output_id, user_id, subject_txid.
 const INTERNALIZE_MARK_INPUT_SQL: &str = "UPDATE outputs SET spendable = 0, \
         spent_by = COALESCE(spent_by, \
             (SELECT t.transaction_id FROM transactions t \
              WHERE t.txid = ? AND t.user_id = outputs.user_id)), \
         updated_at = ? \
-     WHERE output_id = ? AND spendable = 1 \
+     WHERE output_id = ? AND user_id = ? AND spendable = 1 \
        AND (spent_by IS NULL OR spent_by = \
             (SELECT t.transaction_id FROM transactions t \
              WHERE t.txid = ? AND t.user_id = outputs.user_id))";
@@ -97,6 +96,113 @@ const INTERNALIZE_RESTORE_SPENT_BY_SQL: &str = "UPDATE outputs \
 const INTERNALIZE_RESTORE_SPENDABLE_SQL: &str = "UPDATE outputs \
      SET spendable = 1, updated_at = ? \
      WHERE output_id = ? AND spent_by IS NULL AND basket_id IS NOT NULL";
+
+// =============================================================================
+// A refused internalize: the caller's own row, and nothing proven
+// =============================================================================
+
+/// The reference's message for an AtomicBEEF that is not valid
+/// (`WERR_INVALID_PARAMETER` of `tx`, "valid AtomicBEEF",
+/// `internalizeActionCore.ts` validateAtomicBeef, the text of
+/// `WERR_errors.ts:105`). Answered here for a subject that carries no proof
+/// and names an input whose parent the BEEF does not hold: a
+/// `ValidationError`, `-32602` on the wire.
+const VALID_ATOMIC_BEEF_TEXT: &str = "The tx parameter must be valid AtomicBEEF";
+
+/// The internalizing call's own transactions row, failed on the network's
+/// refusal: never a row that is `completed` or carries a proof.
+/// Binds: updated_at, transaction_id, user_id.
+const COMPENSATE_FAIL_TX_SQL: &str = "UPDATE transactions SET status = 'failed', updated_at = ? \
+     WHERE transaction_id = ? AND user_id = ? \
+       AND status != 'completed' AND proven_tx_id IS NULL";
+
+/// The outputs of that row, and only while the row reads `failed`.
+/// Binds: updated_at, transaction_id, user_id.
+const COMPENSATE_ZERO_OUTPUTS_SQL: &str = "UPDATE outputs SET spendable = 0, updated_at = ? \
+     WHERE transaction_id = ? AND user_id = ? \
+       AND EXISTS (SELECT 1 FROM transactions t \
+             WHERE t.transaction_id = outputs.transaction_id AND t.status = 'failed')";
+
+/// The canary's request for a refused txid, when none stands (review H2c).
+/// Binds: txid, raw_tx, created_at, updated_at, txid.
+const COMPENSATE_REQ_SQL: &str = "INSERT INTO proven_tx_reqs ( \
+        txid, status, attempts, history, notify, notified, raw_tx, input_beef, created_at, updated_at \
+     ) SELECT ?, 'invalid', 0, '{}', '{}', 0, ?, NULL, ?, ? \
+       WHERE NOT EXISTS (SELECT 1 FROM proven_tx_reqs WHERE txid = ?)";
+
+/// A refusal held on the request for its txid: the answer the call gave,
+/// kept under the history's own `refusalHeld` key (the notes, which keep the
+/// newest 32, are not where it lives). Never on a `completed` request.
+/// Binds: when, answer, txid.
+const RECORD_REFUSAL_HELD_SQL: &str = "UPDATE proven_tx_reqs SET history = json_set(\
+    CASE WHEN json_valid(history) AND json_type(history) = 'object' THEN history \
+         ELSE json_object('previous', history) END, \
+    '$.refusalHeld', json_object('when', ?, 'answer', ?)) \
+     WHERE txid = ? AND status != 'completed'";
+
+/// The answer a held refusal gave, while the request for the txid is not
+/// `completed` and the caller's row (bound second) is neither `completed`
+/// nor proven. `REFUSAL_HELD_ON_MERGE_SQL` holds while none of that row's
+/// outputs is credited; `REFUSAL_HELD_ON_NEW_ROW_SQL`, for a row just
+/// written, while no other row's output of the txid is.
+/// Binds: txid, transaction_id, transaction_id.
+macro_rules! refusal_held_answer_sql {
+    ($outputs:literal) => {
+        concat!(
+            "SELECT json_extract(r.history, '$.refusalHeld.answer') AS answer \
+             FROM proven_tx_reqs r \
+             WHERE r.txid = ? AND r.status != 'completed' \
+               AND json_valid(r.history) AND json_type(r.history, '$.refusalHeld.answer') = 'text' \
+               AND NOT EXISTS (SELECT 1 FROM transactions t \
+                     WHERE t.transaction_id = ? AND (t.status = 'completed' OR t.proven_tx_id IS NOT NULL)) \
+               AND NOT EXISTS (SELECT 1 FROM outputs o \
+                     WHERE o.txid = r.txid AND o.spendable = 1 AND o.transaction_id ",
+            $outputs,
+            " ?) LIMIT 1"
+        )
+    };
+}
+const REFUSAL_HELD_ON_MERGE_SQL: &str = refusal_held_answer_sql!("=");
+const REFUSAL_HELD_ON_NEW_ROW_SQL: &str = refusal_held_answer_sql!("!=");
+
+/// What the second source says of a txid the broadcaster refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NetworkWord {
+    /// Known or mined.
+    Knows,
+    /// Answered, and not known.
+    DoesNotKnow,
+    /// No answer (an error): a hold, never "not known".
+    Unavailable,
+}
+
+fn network_word(
+    answer: std::result::Result<Vec<crate::services::TxStatusDetail>, String>,
+) -> NetworkWord {
+    match answer.ok().and_then(|v| v.into_iter().next()) {
+        Some(s) if s.status == "known" || s.status == "mined" => NetworkWord::Knows,
+        Some(s) if s.status == "unknown" => NetworkWord::DoesNotKnow,
+        _ => NetworkWord::Unavailable,
+    }
+}
+
+/// A subject with no proof of its own whose input names a parent the BEEF
+/// does not hold (no entry, or a txid alone with no BUMP): the reference's
+/// BEEF validity refuses it (`Beef.verifyValid`, missing inputs).
+fn unproven_subject_lacks_a_parent(beef: &Beef, txid: &str, inputs: &[String]) -> bool {
+    if beef.find_bump(txid).is_some() {
+        return false;
+    }
+    inputs.iter().any(|parent| {
+        if parent.chars().all(|c| c == '0') {
+            return false; // a coinbase input names no parent
+        }
+        match beef.find_txid(parent) {
+            None => true,
+            Some(entry) => entry.tx().is_none() && beef.find_bump(parent).is_none(),
+        }
+    })
+}
 
 // =============================================================================
 // One row per payment: the subject's rows are written by guarded inserts
@@ -204,7 +310,7 @@ const INTERNALIZE_INSERT_REQ_SQL: &str = "INSERT INTO proven_tx_reqs ( \
      ON CONFLICT(txid) DO NOTHING";
 
 /// What an internalize broadcast left for the caller.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum PostOutcome {
     /// Accepted, already known, or proven: nothing to hold.
     Sent,
@@ -213,6 +319,16 @@ enum PostOutcome {
     /// A policy refusal (B5, #50): outputs demoted, inputs held, the req
     /// queued `unsent` for the monitor's re-announce.
     PolicyHeld,
+    /// The broadcaster refused it (double-spend or invalid) and the second
+    /// source could not be asked (an error): the rows are held, as a
+    /// transient fault's are, but never credited, whatever
+    /// INTERNALIZE_ZERO_CONF says, and the call is answered with this
+    /// message, the refusal's own.
+    RefusalHeld(String),
+    /// The broadcaster refused it (double-spend or invalid) and the second
+    /// source answered that it does not know it: the call is refused with
+    /// this message.
+    Rejected(String),
 }
 
 /// The subject of an AtomicBEEF, as the storage needs it.
@@ -455,6 +571,19 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 Error::ValidationError(format!("Transaction {} is txid-only in BEEF", txid))
             })?;
 
+            // A subject that carries no proof of its own is internalized only
+            // with the parent of each of its inputs: the reference's BEEF
+            // validity (`validateAtomicBeef`) refuses one that lacks a parent,
+            // before any write and any broadcast.
+            let parents: Vec<String> = tx
+                .inputs
+                .iter()
+                .filter_map(|i| i.get_source_txid().ok())
+                .collect();
+            if unproven_subject_lacks_a_parent(&beef, &txid, &parents) {
+                return Err(Error::ValidationError(VALID_ATOMIC_BEEF_TEXT.to_string()));
+            }
+
             // The local script check (#72, #50): each input against its parent
             // in this BEEF. A script that fails under every era is refused here,
             // before any write and any broadcast; a missing parent is no verdict.
@@ -591,6 +720,15 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
         if let Some(ref etx) = existing_tx {
             validate_merge_status(&etx.status)?;
+            // A row held on a refusal, with nothing credited: the call is
+            // answered as the presentation that wrote it was, before any
+            // write.
+            if let Some(answer) = self
+                .refusal_held_answer(REFUSAL_HELD_ON_MERGE_SQL, &txid, etx.transaction_id)
+                .await?
+            {
+                return Err(Error::ValidationError(answer));
+            }
         }
 
         // Step 4: Extract and validate output specifications
@@ -815,18 +953,20 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             new_tx_id
         };
 
-        // Step 7b (#22, btc-relay #16): mark the internalized tx's consumed
-        // INPUTS spent — AFTER the subject transactions row exists (spent_by
+        // Step 7b (#22, btc-relay #16): mark the internalizing user's own
+        // consumed INPUTS spent (another user's coin is marked where the
+        // subject's checked proof is stored) — AFTER the subject
+        // transactions row exists (spent_by
         // needs its transaction_id) and BEFORE the broadcast attempt in
         // step 10 (internalizeAction.ts:593-595). The merge path also lands
         // here and marks idempotently — a nosend can be merged from a sender
         // that doesn't share storage (internalizeAction.ts:496-504) — but
-        // never restores (only the step-10 broadcast-failure branch does).
+        // never restores (only step 10's outcomes other than a take do).
         // Without this, the consumed coins stay spendable=1 and the next
         // listOutputs re-serves an already-spent coin (the 2026-07-22
         // double-spend outage class).
         let input_transitions = self
-            .mark_internalized_inputs_spent(&txid, &raw_tx, now)
+            .mark_internalized_inputs_spent(user_id, &txid, &raw_tx, now)
             .await?;
 
         // Step 8: Add labels
@@ -1094,9 +1234,51 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             // find the already-mined proof. For !has_proof, it will broadcast and
             // watch for confirmation.
             if !linked {
-                let post = self
-                    .create_proven_tx_req(&txid, &raw_tx, &beef, has_proof)
-                    .await?;
+                let post = match self
+                    .create_proven_tx_req(&txid, &raw_tx, &beef, has_proof, transaction_id)
+                    .await
+                {
+                    Ok(post) => post,
+                    Err(e) => {
+                        // The call answers the first error; a restore that
+                        // also fails is logged.
+                        if let Err(restore_err) = self
+                            .restore_internalized_inputs(&input_transitions, now)
+                            .await
+                        {
+                            worker::console_error!(
+                                "internalize: restore of inputs for txid={} failed: {}",
+                                txid,
+                                restore_err
+                            );
+                        }
+                        return Err(e);
+                    }
+                };
+                // Every outcome but a take gives back what step 7b
+                // transitioned: the refusals, the policy hold and the
+                // transient fault under either INTERNALIZE_ZERO_CONF setting.
+                // The restore and the steps after it are independent: when the
+                // restore errs, the credit of a transaction that was not taken
+                // is still taken back below, and the call then answers the
+                // restore's error.
+                let restore = if post != PostOutcome::Sent {
+                    self.restore_internalized_inputs(&input_transitions, now)
+                        .await
+                } else {
+                    Ok(())
+                };
+                if let PostOutcome::Rejected(reason) = &post {
+                    // The call already wrote its transaction row and its
+                    // spendable=1 outputs, and D1 has no rollback: the
+                    // compensation takes this call's credit back explicitly
+                    // (the reference internalizes in one transaction,
+                    // internalizeAction.ts:417-437).
+                    self.compensate_rejected_internalize(&txid, &raw_tx, transaction_id, user_id)
+                        .await;
+                    restore?;
+                    return Err(Error::ValidationError(reason.clone()));
+                }
                 // A policy refusal (B5, #50) demotes whatever INTERNALIZE_ZERO_CONF
                 // says: Arcade files a script failure under 461 and an input sum
                 // short of the outputs under 465, so a refused payment is not
@@ -1104,9 +1286,9 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 // SEEN_ON_NETWORK on a later announce or a checked proof (the
                 // monitor's promotions), makes its outputs spendable.
                 let demote = match post {
-                    PostOutcome::Sent => false,
+                    PostOutcome::Sent | PostOutcome::Rejected(_) => false,
                     PostOutcome::Transient => !self.internalize_zero_conf,
-                    PostOutcome::PolicyHeld => true,
+                    PostOutcome::PolicyHeld | PostOutcome::RefusalHeld(_) => true,
                 };
 
                 if demote {
@@ -1130,41 +1312,49 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                                             // hard-rejects upstream in create_proven_tx_req, and a policy
                                             // refusal is demoted under either setting; only the transient
                                             // ServiceError path keeps its outputs here.
-                    Query::new(
+                    if let Err(e) = Query::new(
                         "UPDATE outputs SET spendable = 0, updated_at = ? WHERE transaction_id = ? AND user_id = ?",
                     )
                     .bind(now)
                     .bind(transaction_id)
                     .bind(user_id)
                     .execute(self.db)
-                    .await?;
-                    // #22: roll back the step-7b spendable→0 flips on the
-                    // consumed INPUTS so the payer can retry with the same
-                    // UTXOs (internalizeAction.ts:120-128, :626-636).
-                    // Touches ONLY the rows this call flipped — a competing
-                    // spent_by recorded since is never clobbered, and a
-                    // double-restore is harmless (guards in the consts).
-                    // A policy refusal is re-announced by the monitor: its
-                    // inputs stay held (B5, #50), and the row reads `sending`
-                    // (`unsent` is the req's word, no transaction status) until
-                    // send_waiting's accepted arm moves it to `unproven`.
-                    if post == PostOutcome::Transient {
-                        self.restore_internalized_inputs(&input_transitions, now)
-                            .await?;
-                    } else {
-                        Query::new(
+                    .await
+                    {
+                        // The first error is answered.
+                        restore?;
+                        return Err(e);
+                    }
+                    // #22: the step-7b flips were rolled back above
+                    // (internalizeAction.ts:120-128, :626-636). A policy
+                    // refusal is re-announced by the monitor: the row reads
+                    // `sending` (`unsent` is the req's word, no transaction
+                    // status) until send_waiting's accepted arm moves it to
+                    // `unproven` and marks the caller's inputs again.
+                    if post == PostOutcome::PolicyHeld {
+                        if let Err(e) = Query::new(
                             "UPDATE transactions SET status = 'sending', updated_at = ? WHERE transaction_id = ? AND status = 'unproven'",
                         )
                         .bind(now)
                         .bind(transaction_id)
                         .execute(self.db)
-                        .await?;
+                        .await
+                        {
+                            restore?;
+                            return Err(e);
+                        }
                     }
                 } else if post == PostOutcome::Transient {
                     worker::console_log!(
                         "internalize: broadcast ServiceError for {} but INTERNALIZE_ZERO_CONF=true — keeping outputs spendable (0-conf)",
                         txid
                     );
+                }
+                restore?;
+                if let PostOutcome::RefusalHeld(reason) = post {
+                    // The rows stay held without credit; the caller is
+                    // answered the refusal.
+                    return Err(Error::ValidationError(reason));
                 }
             }
         }
@@ -1293,17 +1483,19 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         Ok(od)
     }
 
-    /// Mark every storage row at each of the subject tx's consumed-input
-    /// outpoints as spent — across ALL users tracking those outpoints
-    /// (internalizeAction.ts markUserInputsSpent, :73-93). Returns the exact
+    /// Mark the internalizing user's own rows at each of the subject tx's
+    /// consumed-input outpoints as spent (internalizeAction.ts
+    /// markUserInputsSpent, :73-93, for the caller's rows; another user's
+    /// row waits for the subject's checked proof). Returns the exact
     /// per-row transitions so `restore_internalized_inputs` can roll them
-    /// back on broadcast failure. Idempotent: already-unspendable rows and
+    /// back on every outcome but a take. Idempotent: already-unspendable rows and
     /// rows spent by a different tx are skipped. D1 has no transactions —
     /// best-effort sequential writes, matching this file's existing idiom;
     /// each write is individually guarded so a partial pass never produces
     /// an inconsistent row.
     async fn mark_internalized_inputs_spent(
         &self,
+        user_id: i64,
         txid: &str,
         raw_tx: &[u8],
         now: chrono::DateTime<Utc>,
@@ -1321,6 +1513,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .bind(txid)
                 .bind(prev_txid.as_str())
                 .bind(prev_vout as i64)
+                .bind(user_id)
                 .fetch_all(self.db)
                 .await?;
 
@@ -1342,6 +1535,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     .bind(txid)
                     .bind(now)
                     .bind(output_id)
+                    .bind(user_id)
                     .bind(txid)
                     .execute(self.db)
                     .await?;
@@ -1361,8 +1555,8 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
     /// Revert the spendable→0 transitions performed by
     /// `mark_internalized_inputs_spent` (internalizeAction.ts
-    /// restoreInputsToSpendable, :120-128). Only ever called on broadcast
-    /// non-success. Undoes exactly what was changed: spendable=1 always;
+    /// restoreInputsToSpendable, :120-128). Called on every outcome of the
+    /// post but a take. Undoes exactly what was changed: spendable=1 always;
     /// spent_by cleared only when the original transition stamped it. The
     /// SQL guards make a double restore a no-op and refuse to clobber a
     /// competing spend or resurrect a since-relinquished row.
@@ -1415,6 +1609,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         raw_tx: &[u8],
         input_beef: &BeefBlob<'_>,
         has_verified_proof: bool,
+        transaction_id: i64,
     ) -> Result<PostOutcome> {
         #[derive(Deserialize)]
         #[allow(dead_code)]
@@ -1429,6 +1624,17 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .await?;
 
         if existing.is_some() {
+            // A refusal held on the standing request, with nothing credited:
+            // this call's rows are held as that call's were, and it is
+            // answered the same.
+            if !has_verified_proof {
+                if let Some(answer) = self
+                    .refusal_held_answer(REFUSAL_HELD_ON_NEW_ROW_SQL, txid, transaction_id)
+                    .await?
+                {
+                    return Ok(PostOutcome::RefusalHeld(answer));
+                }
+            }
             return Ok(PostOutcome::Sent);
         }
 
@@ -1471,7 +1677,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 // and the caller treats it so (INTERNALIZE_ZERO_CONF decides
                 // whether the outputs stay spendable meanwhile).
                 BeefBlob::AtRest { .. } => {
-                    if self.network_knows_txid(txid).await {
+                    if self.network_knows_txid(txid).await == NetworkWord::Knows {
                         Ok(crate::services::BroadcastResult {
                             txid: txid.to_string(),
                             tx_status: "known to the network, broadcast skipped".to_string(),
@@ -1501,39 +1707,50 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 // come back "inputs missing/spent" — spent by ITSELF. Only
                 // compensate when the network genuinely doesn't know the
                 // txid; a known/mined tx proceeds as an accepted payment.
-                if self.network_knows_txid(txid).await {
-                    worker::console_log!(
-                        "internalize: ARC said double-spend for {} but the network knows it — treating as accepted",
-                        txid
-                    );
-                    PostOutcome::Sent
-                } else {
-                    // COMPENSATE: the caller already wrote the transaction
-                    // row and its spendable=1 outputs (D1 has no rollback;
-                    // audit C1 — reference internalizes transactionally,
-                    // internalizeAction.ts:417-437).
-                    self.compensate_rejected_internalize(txid, raw_tx).await;
-                    return Err(Error::ValidationError(format!(
+                match self.network_knows_txid(txid).await {
+                    NetworkWord::Knows => {
+                        worker::console_log!(
+                            "internalize: ARC said double-spend for {} but the network knows it — treating as accepted",
+                            txid
+                        );
+                        PostOutcome::Sent
+                    }
+                    // The second source gave no answer: the rows are held, as
+                    // a transient fault's are, and the caller is answered the
+                    // refusal; the monitor re-asks.
+                    NetworkWord::Unavailable => PostOutcome::RefusalHeld(format!(
                         "Transaction {} rejected by network (double-spend): {}",
                         txid, msg
-                    )));
+                    )),
+                    NetworkWord::DoesNotKnow => {
+                        return Ok(PostOutcome::Rejected(format!(
+                            "Transaction {} rejected by network (double-spend): {}",
+                            txid, msg
+                        )))
+                    }
                 }
             }
             Err(crate::services::BroadcastError::InvalidTx(msg)) => {
                 // Same chain-truth gate + compensation as the double-spend
                 // arm (audit C1 + review H2).
-                if self.network_knows_txid(txid).await {
-                    worker::console_log!(
-                        "internalize: ARC said invalid-tx for {} but the network knows it — treating as accepted",
-                        txid
-                    );
-                    PostOutcome::Sent
-                } else {
-                    self.compensate_rejected_internalize(txid, raw_tx).await;
-                    return Err(Error::ValidationError(format!(
+                match self.network_knows_txid(txid).await {
+                    NetworkWord::Knows => {
+                        worker::console_log!(
+                            "internalize: ARC said invalid-tx for {} but the network knows it — treating as accepted",
+                            txid
+                        );
+                        PostOutcome::Sent
+                    }
+                    NetworkWord::Unavailable => PostOutcome::RefusalHeld(format!(
                         "Transaction {} rejected by network (invalid tx): {}",
                         txid, msg
-                    )));
+                    )),
+                    NetworkWord::DoesNotKnow => {
+                        return Ok(PostOutcome::Rejected(format!(
+                            "Transaction {} rejected by network (invalid tx): {}",
+                            txid, msg
+                        )))
+                    }
                 }
             }
             Err(crate::services::BroadcastError::ServiceError(_)) => {
@@ -1595,43 +1812,87 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         if let Some(note) = policy_hint {
             super::tracker_rule::append_note(self.db, txid, note).await?;
         }
+        if let PostOutcome::RefusalHeld(answer) = &post {
+            // Best-effort: the caller's rows are held below whatever this
+            // write returns.
+            if let Err(e) = Query::new(RECORD_REFUSAL_HELD_SQL)
+                .bind(now.to_rfc3339())
+                .bind(answer.as_str())
+                .bind(txid)
+                .execute(self.db)
+                .await
+            {
+                worker::console_error!(
+                    "internalize: the held refusal of {} was not recorded on its request: {}",
+                    txid,
+                    e
+                );
+            }
+        }
 
         Ok(post)
     }
 
-    /// Compensation for an internalize whose broadcast came back with a
-    /// positive ARC reject (DoubleSpend/InvalidTx) AFTER the transaction and
-    /// output rows were written (audit C1). D1 exposes no real transactions
-    /// to roll back, so undo the credit explicitly:
-    ///   * transactions.status → 'failed' (factual: ARC hard-rejected it);
-    ///   * its created outputs → spendable=0 (they will never exist
-    ///     on-chain — leaving them spendable is phantom balance forever,
-    ///     since no proven_tx_req exists yet for the monitor to police).
-    ///
-    /// Keyed on txid across users: a network-rejected tx is rejected for
-    /// every row that references it. Best-effort (errors logged, not
-    /// propagated — the caller is already returning the reject).
-    async fn network_knows_txid(&self, txid: &str) -> bool {
-        self.broadcast
-            .get_status_for_txids(&[txid.to_string()])
-            .await
-            .ok()
-            .and_then(|v| v.into_iter().next())
-            .map(|s| s.status == "known" || s.status == "mined")
-            .unwrap_or(false)
+    /// The answer of a refusal held on the request for `txid`, for the
+    /// caller's row `transaction_id` (`refusal_held_answer_sql!`).
+    async fn refusal_held_answer(
+        &self,
+        sql: &str,
+        txid: &str,
+        transaction_id: i64,
+    ) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct AnswerRow {
+            answer: Option<String>,
+        }
+        let row: Option<AnswerRow> = Query::new(sql)
+            .bind(txid)
+            .bind(transaction_id)
+            .bind(transaction_id)
+            .fetch_optional(self.db)
+            .await?;
+        Ok(row.and_then(|r| r.answer))
     }
 
-    async fn compensate_rejected_internalize(&self, txid: &str, raw_tx: &[u8]) {
+    /// The second source's word on a txid the broadcaster refused: known,
+    /// not known, or no answer (an error), which is a hold.
+    async fn network_knows_txid(&self, txid: &str) -> NetworkWord {
+        network_word(
+            self.broadcast
+                .get_status_for_txids(&[txid.to_string()])
+                .await,
+        )
+    }
+
+    /// Compensation for an internalize whose broadcast came back with a
+    /// positive ARC reject (DoubleSpend/InvalidTx), the second source
+    /// answering that it does not know the txid, AFTER the transaction and
+    /// output rows were written (audit C1). D1 exposes no real transactions
+    /// to roll back, so undo this call's credit explicitly:
+    ///   * this call's transactions row → 'failed', unless it is
+    ///     `completed` or carries a proof;
+    ///   * that row's outputs → spendable=0, only while it reads `failed`.
+    ///
+    /// No row of another user is touched. Best-effort (errors logged, not
+    /// propagated — the caller is already returning the reject).
+    async fn compensate_rejected_internalize(
+        &self,
+        txid: &str,
+        raw_tx: &[u8],
+        transaction_id: i64,
+        user_id: i64,
+    ) {
         let now = Utc::now();
-        let r1 =
-            Query::new("UPDATE transactions SET status = 'failed', updated_at = ? WHERE txid = ?")
-                .bind(now)
-                .bind(txid)
-                .execute(self.db)
-                .await;
-        let r2 = Query::new("UPDATE outputs SET spendable = 0, updated_at = ? WHERE txid = ?")
+        let r1 = Query::new(COMPENSATE_FAIL_TX_SQL)
             .bind(now)
-            .bind(txid)
+            .bind(transaction_id)
+            .bind(user_id)
+            .execute(self.db)
+            .await;
+        let r2 = Query::new(COMPENSATE_ZERO_OUTPUTS_SQL)
+            .bind(now)
+            .bind(transaction_id)
+            .bind(user_id)
             .execute(self.db)
             .await;
         // Canary coverage (review H2c): the auto-unfail sweep JOINs on
@@ -1639,19 +1900,14 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         // permanently invisible to self-correction. INSERT OR IGNORE keyed
         // on the txid uniqueness in practice (existing row = already
         // covered).
-        let _ = Query::new(
-            r#"INSERT INTO proven_tx_reqs (
-                txid, status, attempts, history, notify, notified, raw_tx, input_beef, created_at, updated_at
-            ) SELECT ?, 'invalid', 0, '{}', '{}', 0, ?, NULL, ?, ?
-              WHERE NOT EXISTS (SELECT 1 FROM proven_tx_reqs WHERE txid = ?)"#,
-        )
-        .bind(txid)
-        .bind(raw_tx)
-        .bind(now)
-        .bind(now)
-        .bind(txid)
-        .execute(self.db)
-        .await;
+        let _ = Query::new(COMPENSATE_REQ_SQL)
+            .bind(txid)
+            .bind(raw_tx)
+            .bind(now)
+            .bind(now)
+            .bind(txid)
+            .execute(self.db)
+            .await;
         if r1.is_err() || r2.is_err() {
             worker::console_error!(
                 "internalize compensation for rejected txid={} incomplete: tx={:?} outputs={:?}",
@@ -2068,17 +2324,32 @@ mod tests {
         conn
     }
 
-    /// Native mirror of mark_internalized_inputs_spent: the real SELECT →
-    /// the real decision fn → the real guarded UPDATE, recording transitions
-    /// only when the write changed the row.
+    /// The internalizing user of the #22 fixtures.
+    const I22_USER: i64 = 1;
+
+    /// Native mirror of mark_internalized_inputs_spent for the fixtures'
+    /// internalizer (user 1).
     fn i22_mark(conn: &rusqlite::Connection) -> Vec<SpentInputTransition> {
+        mark_inputs_for(conn, I22_USER, I22_SUBJECT_TXID, I22_OUTPOINTS)
+    }
+
+    /// Native mirror of mark_internalized_inputs_spent: the real SELECT →
+    /// the real decision fn → the real guarded UPDATE, for the rows of
+    /// `user` alone, recording transitions only when the write changed the
+    /// row.
+    fn mark_inputs_for(
+        conn: &rusqlite::Connection,
+        user: i64,
+        subject: &str,
+        outpoints: &[(&str, i64)],
+    ) -> Vec<SpentInputTransition> {
         let mut transitions = Vec::new();
-        for (prev_txid, prev_vout) in I22_OUTPOINTS {
+        for (prev_txid, prev_vout) in outpoints {
             let rows: Vec<(i64, bool, Option<i64>, Option<i64>)> = {
                 let mut stmt = conn.prepare(INTERNALIZE_INPUT_ROWS_SQL).unwrap();
                 let rows = stmt
                     .query_map(
-                        rusqlite::params![I22_SUBJECT_TXID, prev_txid, prev_vout],
+                        rusqlite::params![subject, prev_txid, prev_vout, user],
                         |r| {
                             Ok((
                                 r.get::<_, i64>(0)?,
@@ -2101,7 +2372,7 @@ mod tests {
                 let changes = conn
                     .execute(
                         INTERNALIZE_MARK_INPUT_SQL,
-                        rusqlite::params![I22_SUBJECT_TXID, "t-mark", output_id, I22_SUBJECT_TXID],
+                        rusqlite::params![subject, "t-mark", output_id, user, subject],
                     )
                     .unwrap();
                 if changes > 0 {
@@ -2179,13 +2450,16 @@ mod tests {
     #[test]
     fn test_i22_foreign_outpoint_and_unrelated_rows_noop() {
         // (b) dd01:0 has no rows → contributes nothing; rows at outpoints
-        // the tx does not consume (output 6) are untouched. Exactly the
-        // three eligible rows transition — nothing else.
+        // the tx does not consume (output 6) are untouched, and so are the
+        // rows of users 2 and 3 at aa01:0. Exactly the internalizer's one
+        // eligible row transitions — nothing else.
         let conn = i22_db();
         let transitions = i22_mark(&conn);
         let mut flipped: Vec<i64> = transitions.iter().map(|t| t.output_id).collect();
         flipped.sort_unstable();
-        assert_eq!(flipped, vec![1, 2, 3]);
+        assert_eq!(flipped, vec![1]);
+        assert_eq!(i22_row(&conn, 2), (1, None));
+        assert_eq!(i22_row(&conn, 3), (1, None));
         assert_eq!(i22_row(&conn, 6), (1, None));
     }
 
@@ -2203,7 +2477,13 @@ mod tests {
         let changes = conn
             .execute(
                 INTERNALIZE_MARK_INPUT_SQL,
-                rusqlite::params![I22_SUBJECT_TXID, "t-direct", 4i64, I22_SUBJECT_TXID],
+                rusqlite::params![
+                    I22_SUBJECT_TXID,
+                    "t-direct",
+                    4i64,
+                    I22_USER,
+                    I22_SUBJECT_TXID
+                ],
             )
             .unwrap();
         assert_eq!(changes, 0);
@@ -2222,31 +2502,61 @@ mod tests {
         let changes = conn
             .execute(
                 INTERNALIZE_MARK_INPUT_SQL,
-                rusqlite::params![I22_SUBJECT_TXID, "t-direct", 7i64, I22_SUBJECT_TXID],
+                rusqlite::params![I22_SUBJECT_TXID, "t-direct", 7i64, 2i64, I22_SUBJECT_TXID],
             )
             .unwrap();
         assert_eq!(changes, 0);
+        // Driven directly at another user's row under the internalizer's id:
+        // the statement's own user guard refuses it.
+        let changes = conn
+            .execute(
+                INTERNALIZE_MARK_INPUT_SQL,
+                rusqlite::params![
+                    I22_SUBJECT_TXID,
+                    "t-direct",
+                    2i64,
+                    I22_USER,
+                    I22_SUBJECT_TXID
+                ],
+            )
+            .unwrap();
+        assert_eq!(changes, 0);
+        assert_eq!(i22_row(&conn, 2), (1, None));
     }
 
     #[test]
     fn test_i22_cross_user_semantics() {
-        // (d) An on-chain spend invalidates the outpoint for EVERY user's
-        // row. A user without their own record of the subject tx gets
-        // spendable=0 only (spent_by must reference THEIR transactions);
-        // a user WITH their own record gets THEIR transaction_id — never
-        // the internalizer's (review H3).
+        // (d) The call writes no row of another user. The spend reaches
+        // every user's row at the store of the subject's checked proof
+        // (monitor::PROOF_MARK_SPENT_INPUT_SQL): a user without their own
+        // record of the subject tx gets spendable=0 only (spent_by must
+        // reference THEIR transactions); a user WITH their own record gets
+        // THEIR transaction_id — never the internalizer's (review H3).
         let conn = i22_db();
         let transitions = i22_mark(&conn);
+        assert_eq!(i22_row(&conn, 2), (1, None));
+        assert_eq!(i22_row(&conn, 3), (1, None));
+        assert!(!transitions
+            .iter()
+            .any(|t| t.output_id == 2 || t.output_id == 3));
+        for (prev_txid, prev_vout) in I22_OUTPOINTS {
+            conn.execute(
+                crate::monitor::PROOF_MARK_SPENT_INPUT_SQL,
+                rusqlite::params![
+                    I22_SUBJECT_TXID,
+                    "t-proof",
+                    prev_txid,
+                    prev_vout,
+                    I22_SUBJECT_TXID
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(i22_row(&conn, 1), (0, Some(10)));
         assert_eq!(i22_row(&conn, 2), (0, None));
-        assert!(transitions.contains(&SpentInputTransition {
-            output_id: 2,
-            set_spent_by: None
-        }));
         assert_eq!(i22_row(&conn, 3), (0, Some(12)));
-        assert!(transitions.contains(&SpentInputTransition {
-            output_id: 3,
-            set_spent_by: Some(12)
-        }));
+        assert_eq!(i22_row(&conn, 4), (0, Some(3))); // a competing lock intact
+        assert_eq!(i22_row(&conn, 6), (1, None)); // not an outpoint the bytes spend
         i22_assert_no_case_a(&conn);
     }
 
@@ -2281,20 +2591,39 @@ mod tests {
         // the spent_by = <stamped> guard refuses to clobber it.
         conn.execute_batch("UPDATE outputs SET spent_by = 3 WHERE output_id = 1")
             .unwrap();
-        // Row 2: the monitor stamped spent_by after our spendable-only flip —
-        // the spent_by IS NULL guard refuses (re-enabling would mint Case A).
-        conn.execute_batch("UPDATE outputs SET spent_by = 2 WHERE output_id = 2")
-            .unwrap();
-        // Row 3: relinquished in the window — the basket_id guard refuses
-        // (a GONE row stays GONE, abort_action G5 idiom).
-        conn.execute_batch("UPDATE outputs SET basket_id = NULL WHERE output_id = 3")
-            .unwrap();
 
         i22_restore(&conn, &transitions);
         assert_eq!(i22_row(&conn, 1), (0, Some(3)));
-        assert_eq!(i22_row(&conn, 2), (0, Some(2)));
-        assert_eq!(i22_row(&conn, 3), (0, Some(12)));
         assert_eq!(i22_row(&conn, 5), (0, None)); // never resurrected
+        i22_assert_no_case_a(&conn);
+
+        // A spendable-only flip (the row already named the subject) that the
+        // monitor re-stamped in the window: the spent_by IS NULL guard
+        // refuses (re-enabling would mint Case A).
+        let conn = i22_db();
+        conn.execute_batch("UPDATE outputs SET spent_by = 10 WHERE output_id = 1")
+            .unwrap();
+        let transitions = i22_mark(&conn);
+        assert_eq!(
+            transitions,
+            vec![SpentInputTransition {
+                output_id: 1,
+                set_spent_by: None
+            }]
+        );
+        conn.execute_batch("UPDATE outputs SET spent_by = 3 WHERE output_id = 1")
+            .unwrap();
+        i22_restore(&conn, &transitions);
+        assert_eq!(i22_row(&conn, 1), (0, Some(3)));
+
+        // Relinquished in the window — the basket_id guard refuses (a GONE
+        // row stays GONE, abort_action G5 idiom).
+        let conn = i22_db();
+        let transitions = i22_mark(&conn);
+        conn.execute_batch("UPDATE outputs SET basket_id = NULL WHERE output_id = 1")
+            .unwrap();
+        i22_restore(&conn, &transitions);
+        assert_eq!(i22_row(&conn, 1), (0, Some(10)));
         i22_assert_no_case_a(&conn);
     }
 
@@ -2328,7 +2657,7 @@ mod tests {
         // flip.
         let conn = i22_db();
         let first = i22_mark(&conn);
-        assert_eq!(first.len(), 3);
+        assert_eq!(first.len(), 1);
         let state: Vec<(i64, Option<i64>)> = (1..=6).map(|id| i22_row(&conn, id)).collect();
         let second = i22_mark(&conn);
         assert!(second.is_empty());
@@ -3005,5 +3334,664 @@ mod tests {
             )
             .unwrap();
         assert_eq!((rows, status.as_str()), (1, "unmined"));
+    }
+
+    // =========================================================================
+    // A coin's row is marked from a checked proof of its spender; a call
+    // takes back what it wrote unless its transaction is taken. The
+    // statements one internalize call runs, over the real migrations, in the
+    // order it runs them, for each outcome of its post.
+    // =========================================================================
+
+    /// The other user (B), who holds the coin, and the caller (A).
+    const MK_OWNER: i64 = 1;
+    const MK_CALLER: i64 = 2;
+    const MK_OWNER_BASKET: i64 = 10;
+    const MK_CALLER_BASKET: i64 = 20;
+
+    /// One transaction's bytes: one input spending `prev` (display hex) at
+    /// `vout` with an empty unlocking script, one output of 1,000 sats, and
+    /// `marker` as its lock time. Returns (raw hex, txid display hex).
+    fn mk_raw(prev: &str, vout: u32, marker: u32) -> (String, String) {
+        let mut prev_le = hex::decode(prev).unwrap();
+        prev_le.reverse();
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.push(1);
+        b.extend_from_slice(&prev_le);
+        b.extend_from_slice(&vout.to_le_bytes());
+        b.push(0);
+        b.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        b.push(1);
+        b.extend_from_slice(&1000u64.to_le_bytes());
+        b.extend_from_slice(&[1, 0x51]);
+        b.extend_from_slice(&marker.to_le_bytes());
+        let mut id = bsv_sdk::sha256d(&b).to_vec();
+        id.reverse();
+        (hex::encode(&b), hex::encode(id))
+    }
+
+    fn mk_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            include_str!("../../migrations/0001_initial.sql"),
+            include_str!("../../migrations/0002_add_indexes.sql"),
+            include_str!("../../migrations/0003_add_output_reservations.sql"),
+            include_str!("../../migrations/0004_proven_txs_height_pair_index.sql"),
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(&format!(
+            "INSERT INTO users (user_id, identity_key) VALUES ({MK_OWNER}, '02b0'), ({MK_CALLER}, '02a0');
+             INSERT INTO output_baskets (basket_id, user_id, name)
+             VALUES ({MK_OWNER_BASKET}, {MK_OWNER}, 'default'), ({MK_CALLER_BASKET}, {MK_CALLER}, 'default');"
+        ))
+        .unwrap();
+        conn
+    }
+
+    /// A user's balance as getBalance sums it (readers.rs,
+    /// BALANCE_OUTPUT_STATUSES, every basket).
+    fn mk_balance(conn: &rusqlite::Connection, user: i64) -> i64 {
+        conn.query_row(
+            "SELECT COALESCE(SUM(o.satoshis), 0) FROM outputs o JOIN transactions t ON t.transaction_id = o.transaction_id
+             WHERE o.user_id = ? AND o.spendable = 1 AND t.status IN ('completed', 'unproven', 'sending')",
+            [user],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Every row of `user`, as a stable text, to compare before and after.
+    fn mk_rows(conn: &rusqlite::Connection, user: i64) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stmt = conn
+            .prepare("SELECT transaction_id, status, proven_tx_id FROM transactions WHERE user_id = ? ORDER BY transaction_id")
+            .unwrap();
+        for r in stmt
+            .query_map([user], |r| {
+                Ok(format!(
+                    "tx {} {} {:?}",
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?
+                ))
+            })
+            .unwrap()
+        {
+            out.push(r.unwrap());
+        }
+        let mut stmt = conn
+            .prepare("SELECT output_id, spendable, spent_by, satoshis FROM outputs WHERE user_id = ? ORDER BY output_id")
+            .unwrap();
+        for r in stmt
+            .query_map([user], |r| {
+                Ok(format!(
+                    "out {} {} {:?} {}",
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, i64>(3)?
+                ))
+            })
+            .unwrap()
+        {
+            out.push(r.unwrap());
+        }
+        out
+    }
+
+    /// The owner's coin: a confirmed parent (`completed`) of 50,000 sats at
+    /// output 0, in the owner's default basket. Returns its output_id.
+    fn mk_owner_coin(conn: &rusqlite::Connection, parent: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO transactions (user_id, status, reference, is_outgoing, description, txid)
+             VALUES (?, 'completed', 'ref-parent', 0, 'parent', ?)",
+            rusqlite::params![MK_OWNER, parent],
+        )
+        .unwrap();
+        let tx = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO outputs (user_id, transaction_id, basket_id, spendable, change, vout, satoshis,
+                                  provided_by, purpose, type, txid)
+             VALUES (?, ?, ?, 1, 1, 0, 50000, 'storage', 'change', 'P2PKH', ?)",
+            rusqlite::params![MK_OWNER, tx, MK_OWNER_BASKET, parent],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// What the post left, as the call reads it.
+    #[derive(Clone, Copy, Debug)]
+    enum MkPost {
+        /// Taken.
+        Sent,
+        /// Double-spend or invalid, the second source answering "not known".
+        Rejected,
+        /// A policy refusal (460 to 475 but 466).
+        PolicyHeld,
+        /// No verdict, under INTERNALIZE_ZERO_CONF = true.
+        TransientZeroConf,
+        /// No verdict, under INTERNALIZE_ZERO_CONF = false.
+        Transient,
+    }
+
+    /// What `create_proven_tx_req` makes of a broadcaster's refusal
+    /// (double-spend or invalid) given the second source's answer.
+    fn mk_post_after_refusal(
+        answer: std::result::Result<Vec<crate::services::TxStatusDetail>, String>,
+        zero_conf: bool,
+    ) -> MkPost {
+        let _ = zero_conf; // a refusal held is demoted under either setting
+        match network_word(answer) {
+            NetworkWord::Knows => MkPost::Sent,
+            NetworkWord::DoesNotKnow => MkPost::Rejected,
+            NetworkWord::Unavailable => MkPost::Transient,
+        }
+    }
+
+    /// The caller's internalizeAction of `subject` (spending `outpoints`),
+    /// as a wallet payment of its output 0, statement after statement as
+    /// `internalize_subject` runs them (step 7, 7b, 9, 10), for the outcome
+    /// `post`. Returns the caller's transactions row.
+    fn mk_internalize(
+        conn: &rusqlite::Connection,
+        subject: &str,
+        raw_hex: &str,
+        outpoints: &[(&str, i64)],
+        post: MkPost,
+    ) -> i64 {
+        // Step 7.
+        let changes = conn
+            .execute(
+                INTERNALIZE_INSERT_TX_SQL,
+                rusqlite::params![
+                    MK_CALLER,
+                    subject,
+                    "unproven",
+                    "ref-subject",
+                    "pay",
+                    1000,
+                    1,
+                    0,
+                    "t7",
+                    "t7",
+                    MK_CALLER,
+                    subject
+                ],
+            )
+            .unwrap();
+        assert_eq!(changes, 1);
+        let tx = conn.last_insert_rowid();
+        // Step 7b.
+        let transitions = mark_inputs_for(conn, MK_CALLER, subject, outpoints);
+        // Step 9.
+        conn.execute(
+            INTERNALIZE_INSERT_PAYMENT_OUTPUT_SQL,
+            rusqlite::params![
+                MK_CALLER,
+                tx,
+                MK_CALLER_BASKET,
+                subject,
+                0,
+                1000,
+                25,
+                "p",
+                "s",
+                "02cc",
+                "t9",
+                "t9"
+            ],
+        )
+        .unwrap();
+        // Step 10.
+        if !matches!(post, MkPost::Sent) {
+            i22_restore(conn, &transitions);
+        }
+        match post {
+            MkPost::Sent | MkPost::TransientZeroConf => {}
+            MkPost::Rejected => {
+                conn.execute(
+                    COMPENSATE_FAIL_TX_SQL,
+                    rusqlite::params!["tc", tx, MK_CALLER],
+                )
+                .unwrap();
+                conn.execute(
+                    COMPENSATE_ZERO_OUTPUTS_SQL,
+                    rusqlite::params!["tc", tx, MK_CALLER],
+                )
+                .unwrap();
+                conn.execute(
+                    COMPENSATE_REQ_SQL,
+                    rusqlite::params![subject, hex::decode(raw_hex).unwrap(), "tc", "tc", subject],
+                )
+                .unwrap();
+            }
+            MkPost::PolicyHeld | MkPost::Transient => {
+                conn.execute(
+                    "UPDATE outputs SET spendable = 0, updated_at = ? WHERE transaction_id = ? AND user_id = ?",
+                    rusqlite::params!["td", tx, MK_CALLER],
+                )
+                .unwrap();
+                if matches!(post, MkPost::PolicyHeld) {
+                    conn.execute(
+                        "UPDATE transactions SET status = 'sending', updated_at = ? WHERE transaction_id = ? AND status = 'unproven'",
+                        rusqlite::params!["td", tx],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        tx
+    }
+
+    /// The store of the subject's checked proof (monitor::store_proof_result's
+    /// batch): the subject's rows completed, and every user's coin at an
+    /// outpoint the stored bytes spend marked.
+    fn mk_store_proof(conn: &rusqlite::Connection, subject: &str, raw_hex: &str) {
+        conn.execute(
+            "INSERT INTO proven_txs (txid, height, idx, block_hash, merkle_root, merkle_path, raw_tx)
+             VALUES (?, 900000, 0, 'bh', 'root', X'00', ?)",
+            rusqlite::params![subject, hex::decode(raw_hex).unwrap()],
+        )
+        .unwrap();
+        let proven = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE transactions SET status = 'completed', proven_tx_id = ?, updated_at = ? WHERE txid = ?",
+            rusqlite::params![proven, "tp", subject],
+        )
+        .unwrap();
+        for (prev_txid, prev_vout) in
+            crate::monitor::outpoints_spent_by(&Some(raw_hex.to_string()), subject)
+        {
+            conn.execute(
+                crate::monitor::PROOF_MARK_SPENT_INPUT_SQL,
+                rusqlite::params![subject, "tp", prev_txid, prev_vout as i64, subject],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_marks_another_users_coin_is_left_on_every_outcome() {
+        // The caller names the owner's coin as an input
+        // of its subject; the call writes nothing of the owner's on any
+        // outcome of its post, and its own transitions are taken back on
+        // every outcome but a take.
+        for post in [
+            MkPost::Rejected,
+            MkPost::PolicyHeld,
+            MkPost::TransientZeroConf,
+            MkPost::Transient,
+            MkPost::Sent,
+        ] {
+            let conn = mk_db();
+            let parent = "aa".repeat(32);
+            let coin = mk_owner_coin(&conn, &parent);
+            let before = mk_rows(&conn, MK_OWNER);
+            assert_eq!(mk_balance(&conn, MK_OWNER), 50000);
+            let (raw, subject) = mk_raw(&parent, 0, 1);
+            mk_internalize(&conn, &subject, &raw, &[(parent.as_str(), 0)], post);
+            assert_eq!(
+                mk_rows(&conn, MK_OWNER),
+                before,
+                "{post:?}: the owner's rows moved"
+            );
+            assert_eq!(
+                mk_balance(&conn, MK_OWNER),
+                50000,
+                "{post:?}: the owner's balance"
+            );
+            assert_eq!(i22_row(&conn, coin), (1, None), "{post:?}");
+        }
+    }
+
+    #[test]
+    fn test_marks_the_callers_own_coin_is_restored_unless_taken() {
+        // The caller's own coin at the subject's input: marked by the call,
+        // given back on every outcome but a take.
+        for (post, end) in [
+            (MkPost::Rejected, (1, None)),
+            (MkPost::PolicyHeld, (1, None)),
+            (MkPost::TransientZeroConf, (1, None)),
+            (MkPost::Transient, (1, None)),
+            (MkPost::Sent, (0, Some(2))),
+        ] {
+            let conn = mk_db();
+            let parent = "ab".repeat(32);
+            conn.execute(
+                "INSERT INTO transactions (transaction_id, user_id, status, reference, is_outgoing, description, txid)
+                 VALUES (1, ?, 'completed', 'ref-own', 0, 'own parent', ?)",
+                rusqlite::params![MK_CALLER, parent],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO outputs (output_id, user_id, transaction_id, basket_id, spendable, change, vout, satoshis,
+                                      provided_by, purpose, type, txid)
+                 VALUES (500, ?, 1, ?, 1, 1, 0, 7000, 'storage', 'change', 'P2PKH', ?)",
+                rusqlite::params![MK_CALLER, MK_CALLER_BASKET, parent],
+            )
+            .unwrap();
+            let (raw, subject) = mk_raw(&parent, 0, 2);
+            let tx = mk_internalize(&conn, &subject, &raw, &[(parent.as_str(), 0)], post);
+            assert_eq!(tx, 2);
+            assert_eq!(i22_row(&conn, 500), end, "{post:?}");
+            i22_assert_no_case_a(&conn);
+        }
+    }
+
+    #[test]
+    fn test_marks_a_real_spend_is_marked_at_its_proof() {
+        // The legitimate spend of the owner's coin: the call leaves the
+        // owner's row; the store of the subject's checked proof marks it,
+        // from the stored bytes that hash to the proven txid.
+        let conn = mk_db();
+        let parent = "ac".repeat(32);
+        let coin = mk_owner_coin(&conn, &parent);
+        let (raw, subject) = mk_raw(&parent, 0, 3);
+        mk_internalize(&conn, &subject, &raw, &[(parent.as_str(), 0)], MkPost::Sent);
+        assert_eq!(i22_row(&conn, coin), (1, None));
+        mk_store_proof(&conn, &subject, &raw);
+        assert_eq!(i22_row(&conn, coin), (0, None));
+        assert_eq!(mk_balance(&conn, MK_OWNER), 0);
+        i22_assert_no_case_a(&conn);
+    }
+
+    #[test]
+    fn test_marks_the_proof_marks_only_from_bytes_that_hash_to_its_txid() {
+        let parent = "ad".repeat(32);
+        let (raw, subject) = mk_raw(&parent, 0, 4);
+        assert_eq!(
+            crate::monitor::outpoints_spent_by(&Some(raw.clone()), &subject),
+            vec![(parent.clone(), 0)]
+        );
+        // Bytes of another transaction, or none: nothing to mark.
+        let (other, _) = mk_raw(&parent, 0, 5);
+        assert!(crate::monitor::outpoints_spent_by(&Some(other), &subject).is_empty());
+        assert!(crate::monitor::outpoints_spent_by(&None, &subject).is_empty());
+        // A proof store whose bytes are not the subject's marks no coin.
+        let conn = mk_db();
+        let coin = mk_owner_coin(&conn, &parent);
+        let (wrong, _) = mk_raw(&parent, 0, 6);
+        mk_store_proof(&conn, &subject, &wrong);
+        assert_eq!(i22_row(&conn, coin), (1, None));
+    }
+
+    #[test]
+    fn test_marks_the_proof_never_overwrites_a_competing_spend() {
+        // The owner's coin locked by the owner's own payment (spent_by set):
+        // a proof of another transaction spending the outpoint leaves it.
+        let conn = mk_db();
+        let parent = "ae".repeat(32);
+        let coin = mk_owner_coin(&conn, &parent);
+        conn.execute(
+            "INSERT INTO transactions (transaction_id, user_id, status, reference, is_outgoing, description, txid)
+             VALUES (77, ?, 'completed', 'ref-own-pay', 1, 'own payment', 'ff01')",
+            [MK_OWNER],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE outputs SET spendable = 0, spent_by = 77 WHERE output_id = ?",
+            [coin],
+        )
+        .unwrap();
+        let (raw, subject) = mk_raw(&parent, 0, 7);
+        mk_store_proof(&conn, &subject, &raw);
+        assert_eq!(i22_row(&conn, coin), (0, Some(77)));
+    }
+
+    #[test]
+    fn test_marks_a_proven_row_of_another_user_is_left() {
+        // The owner's own mined payment T, `completed` with a
+        // checked proof and its request purged; the caller internalizes T's
+        // bytes; the broadcaster refuses it.
+        let setup = || {
+            let conn = mk_db();
+            let (raw, t) = mk_raw(&"af".repeat(32), 0, 8);
+            conn.execute(
+                "INSERT INTO proven_txs (proven_tx_id, txid, height, idx, block_hash, merkle_root, merkle_path, raw_tx)
+                 VALUES (7, ?, 900000, 1, 'bh', 'root', X'00', ?)",
+                rusqlite::params![t, hex::decode(&raw).unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO transactions (transaction_id, user_id, proven_tx_id, status, reference, is_outgoing, description, txid)
+                 VALUES (100, ?, 7, 'completed', 'ref-T', 1, 'pay', ?)",
+                rusqlite::params![MK_OWNER, t],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO outputs (output_id, user_id, transaction_id, basket_id, spendable, change, vout, satoshis,
+                                      provided_by, purpose, type, txid)
+                 VALUES (1001, ?, 100, ?, 1, 1, 1, 40000, 'storage', 'change', 'P2PKH', ?)",
+                rusqlite::params![MK_OWNER, MK_OWNER_BASKET, t],
+            )
+            .unwrap();
+            (conn, raw, t)
+        };
+        // The second source errs (a hold, the transient road), or answers
+        // "not known" (the caller's own row is failed).
+        let error = || Err("WoC get_status_for_txids HTTP 429".to_string());
+        let unknown = || {
+            Ok(vec![crate::services::TxStatusDetail {
+                txid: "t".into(),
+                status: "unknown".into(),
+                depth: None,
+            }])
+        };
+        for post in [
+            mk_post_after_refusal(error(), true),
+            mk_post_after_refusal(error(), false),
+            mk_post_after_refusal(unknown(), true),
+        ] {
+            let (conn, raw, t) = setup();
+            let before = mk_rows(&conn, MK_OWNER);
+            let tx = mk_internalize(&conn, &t, &raw, &[], post);
+            assert_eq!(
+                mk_rows(&conn, MK_OWNER),
+                before,
+                "{post:?}: the owner's rows moved"
+            );
+            assert_eq!(mk_balance(&conn, MK_OWNER), 40000, "{post:?}");
+            if matches!(post, MkPost::Rejected) {
+                // "Not known": the caller's own row alone is failed.
+                let status: String = conn
+                    .query_row(
+                        "SELECT status FROM transactions WHERE transaction_id = ?",
+                        [tx],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(status, "failed");
+                assert_eq!(mk_balance(&conn, MK_CALLER), 0);
+            }
+        }
+        // Never a row that is completed or carries a proof, even the caller's.
+        let (conn, _, _) = setup();
+        assert_eq!(
+            conn.execute(
+                COMPENSATE_FAIL_TX_SQL,
+                rusqlite::params!["tc", 100, MK_OWNER]
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.execute(
+                COMPENSATE_ZERO_OUTPUTS_SQL,
+                rusqlite::params!["tc", 100, MK_OWNER]
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute(
+            "UPDATE transactions SET status = 'unproven' WHERE transaction_id = 100",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                COMPENSATE_FAIL_TX_SQL,
+                rusqlite::params!["tc", 100, MK_OWNER]
+            )
+            .unwrap(),
+            0,
+            "a row carrying a proof is never failed"
+        );
+    }
+
+    #[test]
+    fn test_a_held_refusal_is_answered_while_nothing_is_credited() {
+        let conn = mk_db();
+        let answer = "Transaction t rejected by network (invalid tx): refused";
+        conn.execute_batch(&format!(
+            "INSERT INTO transactions (transaction_id, user_id, reference, status, is_outgoing, description, txid)
+             VALUES (100, {MK_CALLER}, 'held', 'unproven', 0, 'held', 't'),
+                    (101, {MK_OWNER}, 'other', 'unproven', 0, 'other', 't');
+             INSERT INTO outputs (output_id, user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, spendable, change)
+             VALUES (1000, {MK_CALLER}, 100, {MK_CALLER_BASKET}, 0, 1000, 'storage', 'change', 'P2PKH', 't', 0, 1),
+                    (1001, {MK_OWNER}, 101, {MK_OWNER_BASKET}, 0, 1000, 'storage', 'change', 'P2PKH', 't', 1, 1);
+             INSERT INTO proven_tx_reqs (txid, status, raw_tx, history) VALUES ('t', 'unmined', x'00', 'attempted 3 times');"
+        ))
+        .unwrap();
+        let read = |sql: &str, tx: i64| -> Option<String> {
+            conn.query_row(sql, rusqlite::params!["t", tx, tx], |r| r.get(0))
+                .ok()
+        };
+        // Nothing recorded: nothing answered.
+        assert_eq!(read(REFUSAL_HELD_ON_MERGE_SQL, 100), None);
+        conn.execute(
+            RECORD_REFUSAL_HELD_SQL,
+            rusqlite::params!["now", answer, "t"],
+        )
+        .unwrap();
+        // A history that was not an object is kept under `previous`.
+        let history: String = conn
+            .query_row(
+                "SELECT history FROM proven_tx_reqs WHERE txid = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let history: serde_json::Value = serde_json::from_str(&history).unwrap();
+        assert_eq!(history["previous"], "attempted 3 times");
+        assert_eq!(history["refusalHeld"]["answer"], answer);
+        // The caller's row, its outputs not credited: answered.
+        assert_eq!(
+            read(REFUSAL_HELD_ON_MERGE_SQL, 100).as_deref(),
+            Some(answer)
+        );
+        // A new row while another row's output of the txid is credited: not.
+        assert_eq!(read(REFUSAL_HELD_ON_NEW_ROW_SQL, 100), None);
+        conn.execute(
+            "UPDATE outputs SET spendable = 0 WHERE output_id = 1001",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            read(REFUSAL_HELD_ON_NEW_ROW_SQL, 100).as_deref(),
+            Some(answer)
+        );
+        // The caller's own output credited: the merge is not answered so.
+        conn.execute(
+            "UPDATE outputs SET spendable = 1 WHERE output_id = 1000",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read(REFUSAL_HELD_ON_MERGE_SQL, 100), None);
+        assert_eq!(
+            read(REFUSAL_HELD_ON_NEW_ROW_SQL, 100).as_deref(),
+            Some(answer)
+        );
+        conn.execute(
+            "UPDATE outputs SET spendable = 0 WHERE output_id = 1000",
+            [],
+        )
+        .unwrap();
+        // The caller's row proven: not answered.
+        conn.execute(
+            "UPDATE transactions SET status = 'completed' WHERE transaction_id = 100",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read(REFUSAL_HELD_ON_MERGE_SQL, 100), None);
+        conn.execute(
+            "UPDATE transactions SET status = 'unproven' WHERE transaction_id = 100",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            read(REFUSAL_HELD_ON_MERGE_SQL, 100).as_deref(),
+            Some(answer)
+        );
+        // The request completed: not answered, and never recorded again.
+        conn.execute(
+            "UPDATE proven_tx_reqs SET status = 'completed' WHERE txid = 't'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read(REFUSAL_HELD_ON_MERGE_SQL, 100), None);
+        assert_eq!(read(REFUSAL_HELD_ON_NEW_ROW_SQL, 100), None);
+        let changed = conn
+            .execute(
+                RECORD_REFUSAL_HELD_SQL,
+                rusqlite::params!["later", answer, "t"],
+            )
+            .unwrap();
+        assert_eq!(changed, 0);
+    }
+
+    #[test]
+    fn test_marks_network_word() {
+        use crate::services::TxStatusDetail;
+        let one = |s: &str| {
+            Ok(vec![TxStatusDetail {
+                txid: "t".into(),
+                status: s.into(),
+                depth: None,
+            }])
+        };
+        assert_eq!(network_word(one("mined")), NetworkWord::Knows);
+        assert_eq!(network_word(one("known")), NetworkWord::Knows);
+        assert_eq!(network_word(one("unknown")), NetworkWord::DoesNotKnow);
+        assert_eq!(network_word(Ok(vec![])), NetworkWord::Unavailable);
+        assert_eq!(network_word(Err("down".into())), NetworkWord::Unavailable);
+    }
+
+    #[test]
+    fn test_marks_a_subject_without_proof_or_parents_is_refused() {
+        // BEEF V2: no BUMP, the subject alone; then with its parent.
+        let (parent_hex, parent) = mk_raw(&"b0".repeat(32), 0, 9);
+        let (subject_hex, subject) = mk_raw(&parent, 0, 10);
+        let beef = |txs: &[(u8, &str)]| {
+            let mut b = vec![0x02, 0x00, 0xbe, 0xef, 0, txs.len() as u8];
+            for (format, body) in txs {
+                b.push(*format);
+                b.extend(hex::decode(body).unwrap());
+            }
+            Beef::from_binary(&b).unwrap()
+        };
+        let lone = beef(&[(0, &subject_hex)]);
+        assert!(unproven_subject_lacks_a_parent(
+            &lone,
+            &subject,
+            std::slice::from_ref(&parent)
+        ));
+        let whole = beef(&[(0, &parent_hex), (0, &subject_hex)]);
+        assert!(!unproven_subject_lacks_a_parent(
+            &whole,
+            &subject,
+            std::slice::from_ref(&parent)
+        ));
+        // A coinbase input names no parent.
+        assert!(!unproven_subject_lacks_a_parent(
+            &lone,
+            &subject,
+            &["00".repeat(32)]
+        ));
+        assert_eq!(
+            VALID_ATOMIC_BEEF_TEXT,
+            "The tx parameter must be valid AtomicBEEF"
+        );
     }
 }

@@ -561,5 +561,276 @@ try {
     assert.equal(zeroPosts, posts)
   })
 } finally { await zero.mf.dispose() }
+
+// A coin's row is marked from a checked proof of its spender, and a call takes back what it
+// wrote unless its transaction is taken: two users, production's settings. The owner (B, the
+// fixture's user) holds a confirmed coin; the caller (A, another identity) internalizes a
+// transaction naming it. Every row of the owner and its balance are read before and after.
+let markArcade = 'accept', markWoc = 'unknown', markPosts = 0
+const markProofs = new Map(), markMined = new Set(), markKnown = new Set(), markSpent = new Map()
+const marks = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.test', CHAINTRACKS_URL: 'https://headers.test', BEEF_VERIFICATION: 'strict', INTERNALIZE_ZERO_CONF: 'true' }, async request => {
+  const url = new URL(request.url)
+  const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+  if (url.host === 'arcade.test' && request.method === 'POST' && ['/tx', '/txs'].includes(url.pathname)) {
+    markPosts++
+    if (markArcade === 'invalid') return json({ error: 'local fixture structural refusal' }, 400)
+    if (markArcade === 'policy') return json({ error: 'transaction failed validation', reason: 'local fixture policy refusal 465', status: 465, title: 'fixture' }, 400)
+    return json({ txStatus: 'RECEIVED' }, 202)
+  }
+  if (url.host === 'arcade.test' && url.pathname === '/events') {
+    const txStatus = { accept: 'SEEN_ON_NETWORK', double: 'DOUBLE_SPEND_ATTEMPTED', unverified: 'RECEIVED' }[markArcade] ?? 'RECEIVED'
+    return new Response(`data: ${JSON.stringify({ txid: url.searchParams.get('callbackToken'), txStatus })}\n\n`, { headers: { 'content-type': 'text/event-stream' } })
+  }
+  if (url.host === 'arcade.test' && url.pathname === '/policy') return json({ policy: { miningFee: { satoshis: 100, bytes: 1000 } } })
+  if (url.host === 'headers.test' && url.pathname === '/findHeaderHexForHeight') {
+    const height = Number(url.searchParams.get('height'))
+    return json({ status: 'success', value: { merkleRoot: roots.get(height) ?? '00'.repeat(32), height } })
+  }
+  if (url.host === 'api.whatsonchain.com' && request.method === 'POST' && url.pathname.endsWith('/txs/status')) {
+    const { txids } = JSON.parse(await request.text())
+    if (markWoc === 'error' && !txids.some(t => markMined.has(t))) return new Response('local fixture refusal', { status: 400 })
+    return json(txids.map(t => markMined.has(t) ? { txid: t, blockhash: 'cd'.repeat(32), blockheight: 900100, confirmations: 1 } : markKnown.has(t) ? { txid: t } : { txid: t, error: 'unknown' }))
+  }
+  const spent = url.host === 'api.whatsonchain.com' && request.method === 'GET' && url.pathname.match(/\/tx\/([0-9a-f]{64})\/(\d+)\/spent$/)
+  if (spent) return markSpent.has(`${spent[1]}:${spent[2]}`) ? json({ txid: markSpent.get(`${spent[1]}:${spent[2]}`), vin: 0, status: 'unconfirmed' }) : new Response('not found', { status: 404 })
+  const m = url.pathname.match(/^\/v1\/tx\/([0-9a-f]{64})$/)
+  if (url.host.startsWith('arc.') && request.method === 'GET' && m && markProofs.has(m[1])) {
+    const p = markProofs.get(m[1])
+    return json({ txid: m[1], txStatus: 'MINED', blockHeight: p.height, blockHash: 'cd'.repeat(32), merklePath: p.hex })
+  }
+  return new Response('not found', { status: 404 })
+})
+try {
+  const display = b => Buffer.from(b).reverse().toString('hex')
+  const owner = (await marks.db.prepare('SELECT user_id FROM users ORDER BY user_id LIMIT 1').first()).user_id
+  const ownerBasket = (await marks.db.prepare("SELECT basket_id FROM output_baskets WHERE user_id = ? AND name = 'default'").bind(owner).first()).basket_id
+  const callerKey = PrivateKey.fromRandom()
+  const caller = marks.session(callerKey)
+  await caller('findOrInsertUser', [callerKey.toPublicKey().toString()])
+  const ownerBalance = async () => (await marks.rpc('getBalance', [{ identityKey: '' }, { basket: 'default' }])).result.balance
+  const ownerRows = async () => JSON.stringify([
+    (await marks.db.prepare('SELECT transaction_id, status, proven_tx_id, txid FROM transactions WHERE user_id = ? ORDER BY transaction_id').bind(owner).all()).results,
+    (await marks.db.prepare('SELECT output_id, spendable, spent_by, satoshis, basket_id FROM outputs WHERE user_id = ? ORDER BY output_id').bind(owner).all()).results])
+  // The owner's confirmed coin at output 0 of a parent proven at 810000 + n.
+  const coin = async n => {
+    const parent = raw(Buffer.alloc(32, n), 0x51, n)
+    roots.set(810000 + n, display(hash(parent)))
+    await marks.exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx) VALUES (?, ?, 'completed', 0, 'owner coin', ?, ?)", owner, `coin-${n}`, txid(parent), parent)
+    const tx = (await marks.db.prepare('SELECT transaction_id FROM transactions WHERE reference = ?').bind(`coin-${n}`).first()).transaction_id
+    await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", owner, tx, ownerBasket, txid(parent), Buffer.from([0x51]))
+    const output = (await marks.db.prepare('SELECT output_id FROM outputs WHERE transaction_id = ?').bind(tx).first()).output_id
+    return { parent, height: 810000 + n, output }
+  }
+  const spendOf = (c, marker) => raw(hash(c.parent), 0x51, marker)
+  const withParent = (c, subject) => Buffer.concat([u32(0x01010101), hash(subject), bumped(c.parent, c.height), Buffer.from([2, 1, 0]), c.parent, Buffer.from([0]), subject])
+  const bare = subject => Buffer.concat([u32(0x01010101), hash(subject), u32(0xefbe0002), Buffer.from([0, 1, 0]), subject])
+  const take = (atomic, n) => caller('internalizeAction', [{ identityKey: '' }, { tx: atomic.toString('hex'), outputs: [{ outputIndex: 0, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: 'cHJlZml4', derivationSuffix: Buffer.from(`m${n}`).toString('base64'), senderIdentityKey: sender } }], description: 'marks', labels: [], seekPermission: false }])
+  const coinRow = c => marks.db.prepare('SELECT spendable, spent_by FROM outputs WHERE output_id = ?').bind(c.output).first()
+  const callerTx = t => marks.db.prepare('SELECT t.status FROM transactions t JOIN users u ON u.user_id = t.user_id WHERE t.txid = ? AND u.identity_key = ?').bind(t, callerKey.toPublicKey().toString()).first()
+  const unchanged = async (label, f) => {
+    const rows = await ownerRows(), balance = await ownerBalance()
+    const r = await f()
+    assert.equal(await ownerRows(), rows, `${label}: the owner's rows moved`)
+    assert.equal(await ownerBalance(), balance, `${label}: the owner's balance moved`)
+    return r
+  }
+  await check('mk1 a subject with neither proof nor parent, naming another user\'s coin, refused before any write as the reference refuses it; the owner\'s rows and balance as they were', async () => {
+    markArcade = 'invalid'; markWoc = 'unknown'
+    const c = await coin(201); const subject = spendOf(c, 202)
+    const posts = markPosts
+    const r = await unchanged('mk1', () => take(bare(subject), 201))
+    assert.deepEqual(r.error, { code: -32602, message: 'The tx parameter must be valid AtomicBEEF' }, JSON.stringify(r))
+    assert.equal(await callerTx(txid(subject)), null); assert.equal(markPosts, posts)
+  })
+  for (const [label, arcadeAnswer] of [['invalid', 'invalid'], ['double-spend', 'double']]) {
+    await check(`mk2 with the parent: the broadcaster's ${label} and the second source's "not known" leave the owner's rows and balance as they were; the caller's own row is failed`, async () => {
+      markArcade = arcadeAnswer; markWoc = 'unknown'
+      const c = await coin(arcadeAnswer === 'invalid' ? 211 : 221); const subject = spendOf(c, arcadeAnswer === 'invalid' ? 212 : 222)
+      const r = await unchanged(`mk2 ${label}`, () => take(withParent(c, subject), arcadeAnswer === 'invalid' ? 211 : 221))
+      assert.ok(r.error, JSON.stringify(r)); assert.match(r.error.message, /rejected by network/)
+      assert.equal((await callerTx(txid(subject))).status, 'failed')
+    })
+  }
+  await check('mk3 a policy refusal (465) leaves the owner\'s rows and balance as they were', async () => {
+    markArcade = 'policy'; markWoc = 'unknown'
+    const c = await coin(231); const subject = spendOf(c, 232)
+    const r = await unchanged('mk3 policy', () => take(withParent(c, subject), 231))
+    assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+    assert.equal((await callerTx(txid(subject))).status, 'sending')
+  })
+  await check('mk4 no verdict under INTERNALIZE_ZERO_CONF=true leaves the owner\'s rows and balance as they were; the caller\'s payment is credited as before', async () => {
+    markArcade = 'unverified'; markWoc = 'unknown'
+    const c = await coin(241); const subject = spendOf(c, 242)
+    const r = await unchanged('mk4 transient', () => take(withParent(c, subject), 241))
+    assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+    const credit = await marks.db.prepare('SELECT spendable FROM outputs WHERE txid = ?').bind(txid(subject)).first()
+    assert.equal(credit.spendable, 1)
+  })
+  for (const [label, woc] of [['errs', 'error'], ['answers "not known"', 'unknown']]) {
+    await check(`mk5 the owner's mined payment, proven, its request purged; another user internalizes its bytes, the broadcaster refuses, the second source ${label}: the owner's rows and balance as they were`, async () => {
+      markArcade = 'invalid'; markWoc = woc
+      const n = woc === 'error' ? 251 : 261
+      const c = await coin(n)
+      // The owner's own payment T spends the coin; T is mined and proven, its change is the owner's.
+      const t = spendOf(c, n + 1)
+      await marks.exec('UPDATE outputs SET spendable = 0 WHERE output_id = ?', c.output)
+      await marks.exec("INSERT INTO proven_txs (txid, height, idx, block_hash, merkle_root, merkle_path, raw_tx) VALUES (?, 900200, 0, ?, ?, ?, ?)", txid(t), 'cd'.repeat(32), display(hash(t)), Buffer.from([0]), t)
+      const proven = (await marks.db.prepare('SELECT proven_tx_id FROM proven_txs WHERE txid = ?').bind(txid(t)).first()).proven_tx_id
+      await marks.exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx, proven_tx_id) VALUES (?, ?, 'completed', 1, 'owner payment', ?, ?, ?)", owner, `pay-${n}`, txid(t), t, proven)
+      const tx = (await marks.db.prepare('SELECT transaction_id FROM transactions WHERE reference = ?').bind(`pay-${n}`).first()).transaction_id
+      await marks.exec('UPDATE outputs SET spent_by = ? WHERE output_id = ?', tx, c.output)
+      await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", owner, tx, ownerBasket, txid(t), Buffer.from([0x51]))
+      const r = await unchanged(`mk5 ${label}`, () => take(withParent(c, t), n))
+      if (woc === 'error') {
+        // A refusal the second source could not answer: answered the refusal, the caller's row held, its output not credited.
+        assert.ok(r.error, JSON.stringify(r)); assert.equal(r.error.code, -32602); assert.match(r.error.message, /rejected by network \(invalid tx\)/)
+        assert.equal((await callerTx(txid(t))).status, 'unproven')
+        const held = await marks.db.prepare('SELECT o.spendable FROM outputs o JOIN users u ON u.user_id = o.user_id WHERE o.txid = ? AND u.identity_key = ?').bind(txid(t), callerKey.toPublicKey().toString()).first()
+        assert.equal(held.spendable, 0)
+      }
+      else { assert.ok(r.error, JSON.stringify(r)); assert.equal((await callerTx(txid(t))).status, 'failed') }
+    })
+  }
+  await check('mk8 a refusal whose restore of the caller\'s own coin errs: the call answers the error, and the credit of the refused transaction is still taken back', async () => {
+    markArcade = 'invalid'; markWoc = 'unknown'
+    const me = (await marks.db.prepare('SELECT user_id FROM users WHERE identity_key = ?').bind(callerKey.toPublicKey().toString()).first()).user_id
+    const myBasket = (await marks.db.prepare("SELECT basket_id FROM output_baskets WHERE user_id = ? AND name = 'default'").bind(me).first()).basket_id
+    const parent = raw(Buffer.alloc(32, 281), 0x51, 281)
+    roots.set(810281, display(hash(parent)))
+    await marks.exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx) VALUES (?, 'own-coin-281', 'completed', 0, 'caller coin', ?, ?)", me, txid(parent), parent)
+    const ptx = (await marks.db.prepare("SELECT transaction_id FROM transactions WHERE reference = 'own-coin-281'").first()).transaction_id
+    await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", me, ptx, myBasket, txid(parent), Buffer.from([0x51]))
+    const own = { parent, height: 810281, output: (await marks.db.prepare('SELECT output_id FROM outputs WHERE transaction_id = ?').bind(ptx).first()).output_id }
+    const subject = spendOf(own, 282)
+    // Every statement that would make the caller's coin spendable again errs.
+    await marks.exec(`CREATE TRIGGER fixture_restore_errs BEFORE UPDATE OF spendable ON outputs WHEN OLD.output_id = ${Number(own.output)} AND NEW.spendable = 1 BEGIN SELECT RAISE(ABORT, 'fixture: the restore errs'); END`)
+    let r
+    try { r = await unchanged('mk8', () => take(withParent(own, subject), 281)) } finally { await marks.exec('DROP TRIGGER fixture_restore_errs') }
+    // The restore's storage error is the answer (the server does not echo its text).
+    assert.deepEqual(r.error, { code: -32603, message: 'An internal error has occurred.' }, JSON.stringify(r))
+    // The restore did not run: the caller's coin stays marked by its own call.
+    assert.equal((await coinRow(own)).spendable, 0)
+    // The refused transaction's credit is taken back all the same.
+    assert.equal((await callerTx(txid(subject))).status, 'failed')
+    const credit = await marks.db.prepare('SELECT o.spendable FROM outputs o WHERE o.txid = ? AND o.user_id = ?').bind(txid(subject), me).first()
+    assert.equal(credit.spendable, 0)
+    assert.equal((await marks.db.prepare('SELECT status FROM proven_tx_reqs WHERE txid = ?').bind(txid(subject)).first()).status, 'invalid')
+  })
+  let real
+  await check('mk6a real spend of another user\'s coin: the call leaves the owner\'s coin as it was', async () => {
+    markArcade = 'accept'; markWoc = 'unknown'
+    const c = await coin(271); const subject = spendOf(c, 272)
+    real = { c, subject }
+    const r = await unchanged('real spend, at the call', () => take(withParent(c, subject), 271))
+    assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+  })
+  await check('mk7 the same spend is marked when its checked proof is stored', async () => {
+    assert.ok(real, 'no spend from mk6')
+    const id = txid(real.subject), leaf = hash(real.subject), sibling = Buffer.alloc(32, 0x5b)
+    const height = 900100
+    const path = Buffer.concat([Buffer.from([0xfe]), u32(height), Buffer.from([1, 2, 0, 2]), leaf, Buffer.from([1, 0]), sibling])
+    roots.set(height, display(hash(Buffer.concat([leaf, sibling]))))
+    markProofs.set(id, { hex: path.toString('hex'), height }); markMined.add(id)
+    const balance = await ownerBalance()
+    const response = await marks.mf.dispatchFetch(new URL('/monitor/run?key=fixture-monitor', marks.base), { method: 'POST' })
+    assert.equal(response.status, 200, await response.text())
+    assert.ok(await marks.db.prepare('SELECT 1 FROM proven_txs WHERE txid = ?').bind(id).first(), 'the proof was not stored')
+    assert.deepEqual({ ...(await coinRow(real.c)) }, { spendable: 0, spent_by: null })
+    assert.equal(await ownerBalance(), balance - 1000)
+  })
+  // A refusal the second source cannot answer: the caller is answered the refusal, as a
+  // refusal is answered, and the rows are held without credit until the proof or the failure.
+  const callerId = (await marks.db.prepare('SELECT user_id FROM users WHERE identity_key = ?').bind(callerKey.toPublicKey().toString()).first()).user_id
+  const callerBalance = async () => (await caller('getBalance', [{ identityKey: '' }, { basket: 'default' }])).result.balance
+  const heldRows = async (t, user = callerId) => ({
+    tx: (await marks.db.prepare('SELECT status FROM transactions WHERE txid = ? AND user_id = ?').bind(t, user).first())?.status,
+    spendable: (await marks.db.prepare('SELECT spendable FROM outputs WHERE txid = ? AND user_id = ?').bind(t, user).first())?.spendable,
+    req: (await marks.db.prepare('SELECT status FROM proven_tx_reqs WHERE txid = ?').bind(t).first())?.status,
+    hold: JSON.parse((await marks.db.prepare('SELECT history FROM proven_tx_reqs WHERE txid = ?').bind(t).first())?.history ?? '{}').refusalHeld?.answer ?? null,
+  })
+  const refusal = r => { assert.ok(r.error, JSON.stringify(r)); assert.equal(r.error.code, -32602, JSON.stringify(r)); assert.match(r.error.message, /^Transaction [0-9a-f]{64} rejected by network \(invalid tx\): /); return r }
+  let held
+  await check('mk9 the broadcaster refuses and the second source errs: answered the refusal (-32602, "rejected by network"); the row held (`unproven`), its output not offered (`spendable 0`), its request `unmined`; the owner\'s rows and balance as they were', async () => {
+    markArcade = 'invalid'; markWoc = 'error'
+    const c = await coin(311); const subject = spendOf(c, 312)
+    const balance = await callerBalance()
+    const r = refusal(await unchanged('mk9', () => take(withParent(c, subject), 311)))
+    // v0.7.5's answer for this case, byte for byte.
+    assert.equal(JSON.stringify(r.error), JSON.stringify({ code: -32602, message: `Transaction ${txid(subject)} rejected by network (invalid tx): Arcade submit HTTP 400: {"error":"local fixture structural refusal"}` }))
+    assert.deepEqual(await heldRows(txid(subject)), { tx: 'unproven', spendable: 0, req: 'unmined', hold: r.error.message })
+    assert.equal(await callerBalance(), balance)
+    held = { c, subject, first: JSON.stringify(r.error), balance }
+  })
+  await check('mk10 the same transaction presented again while its row is held without credit, by the caller and by another user: answered as the first presentation was, nothing announced, nothing credited', async () => {
+    assert.ok(held, 'no hold from mk9')
+    const posts = markPosts, t = txid(held.subject)
+    const again = await unchanged('mk10 again', () => take(withParent(held.c, held.subject), 311))
+    assert.equal(JSON.stringify(again.error), held.first, JSON.stringify(again))
+    const otherKey = PrivateKey.fromRandom(), other = marks.session(otherKey)
+    const otherUser = (await other('findOrInsertUser', [otherKey.toPublicKey().toString()])).result.user.userId
+    const theirs = await unchanged('mk10 another user', () => other('internalizeAction', [{ identityKey: '' }, { tx: withParent(held.c, held.subject).toString('hex'), outputs: [{ outputIndex: 0, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: 'cHJlZml4', derivationSuffix: Buffer.from('m311b').toString('base64'), senderIdentityKey: sender } }], description: 'marks', labels: [], seekPermission: false }]))
+    assert.equal(JSON.stringify(theirs.error), held.first, JSON.stringify(theirs))
+    assert.equal(markPosts, posts, 'a held presentation was announced')
+    assert.deepEqual(await heldRows(t), { tx: 'unproven', spendable: 0, req: 'unmined', hold: JSON.parse(held.first).message })
+    assert.deepEqual({ ...(await heldRows(t, otherUser)), hold: null }, { tx: 'unproven', spendable: 0, req: 'unmined', hold: null })
+    assert.equal((await marks.db.prepare('SELECT COUNT(*) AS c FROM transactions WHERE txid = ? AND user_id = ?').bind(t, callerId).first()).c, 1)
+    assert.equal(await callerBalance(), held.balance)
+    held.otherUser = otherUser
+  })
+  await check('mk11 the held transaction\'s checked proof is stored: its row `completed`, its output offered, the caller credited once; presented again, accepted as a merge with nothing more credited', async () => {
+    assert.ok(held, 'no hold from mk9')
+    const t = txid(held.subject), leaf = hash(held.subject), sibling = Buffer.alloc(32, 0x5c), height = 900300
+    const path = Buffer.concat([Buffer.from([0xfe]), u32(height), Buffer.from([1, 2, 0, 2]), leaf, Buffer.from([1, 0]), sibling])
+    roots.set(height, display(hash(Buffer.concat([leaf, sibling]))))
+    markProofs.set(t, { hex: path.toString('hex'), height }); markMined.add(t); markWoc = 'unknown'
+    const response = await marks.mf.dispatchFetch(new URL('/monitor/run?key=fixture-monitor', marks.base), { method: 'POST' })
+    assert.equal(response.status, 200, await response.text())
+    assert.deepEqual({ ...(await heldRows(t)), hold: null }, { tx: 'completed', spendable: 1, req: 'completed', hold: null })
+    assert.equal(await callerBalance(), held.balance + 1000)
+    const r = await take(withParent(held.c, held.subject), 311)
+    assert.ok(r.result, JSON.stringify(r))
+    assert.deepEqual([r.result.accepted, r.result.isMerge, r.result.satoshis], [true, true, 0])
+    assert.equal(await callerBalance(), held.balance + 1000)
+  })
+  await check('mk12 a held transaction failed by its request\'s own road (a confirmed double spend at the monitor\'s escalation): its rows `failed`, its output never offered; presented again, refused', async () => {
+    markArcade = 'invalid'; markWoc = 'error'
+    const c = await coin(321); const subject = spendOf(c, 322), t = txid(subject)
+    refusal(await take(withParent(c, subject), 321))
+    assert.deepEqual({ ...(await heldRows(t)), hold: null }, { tx: 'unproven', spendable: 0, req: 'unmined', hold: null })
+    // The coin is spent on the network by another transaction the network knows.
+    const spender = spendOf(c, 323)
+    markKnown.add(txid(spender)); markSpent.set(`${txid(c.parent)}:0`, txid(spender))
+    await marks.exec("INSERT INTO proven_tx_reqs (txid, raw_tx, status) VALUES (?, ?, 'unmined')", txid(spender), spender)
+    await marks.exec('UPDATE proven_tx_reqs SET attempts = 3 WHERE txid = ?', t)
+    markWoc = 'unknown'
+    const response = await marks.mf.dispatchFetch(new URL('/monitor/run?key=fixture-monitor', marks.base), { method: 'POST' })
+    assert.equal(response.status, 200, await response.text())
+    assert.deepEqual({ ...(await heldRows(t)), hold: null }, { tx: 'failed', spendable: 0, req: 'doubleSpend', hold: null })
+    const r = await take(withParent(c, subject), 321)
+    assert.ok(r.error, JSON.stringify(r)); assert.equal(r.result, undefined)
+  })
+  // The restore of the caller's own coin errs on the held arms: the call answers that error,
+  // and the held transaction's outputs are demoted all the same.
+  for (const [label, arcade, woc, n, tx, req] of [['a policy refusal (465)', 'policy', 'unknown', 291, 'sending', 'unsent'], ['a refusal the second source cannot answer', 'invalid', 'error', 301, 'unproven', 'unmined']]) {
+    await check(`mk13 ${label} whose restore of the caller's own coin errs: the call answers the error; the transaction's output is not offered, its row \`${tx}\`, its request \`${req}\``, async () => {
+      markArcade = arcade; markWoc = woc
+      const myBasket = (await marks.db.prepare("SELECT basket_id FROM output_baskets WHERE user_id = ? AND name = 'default'").bind(callerId).first()).basket_id
+      const parent = raw(Buffer.alloc(32, n), 0x51, n)
+      roots.set(810000 + n, display(hash(parent)))
+      await marks.exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx) VALUES (?, ?, 'completed', 0, 'caller coin', ?, ?)", callerId, `own-coin-${n}`, txid(parent), parent)
+      const ptx = (await marks.db.prepare('SELECT transaction_id FROM transactions WHERE reference = ?').bind(`own-coin-${n}`).first()).transaction_id
+      await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", callerId, ptx, myBasket, txid(parent), Buffer.from([0x51]))
+      const own = { parent, height: 810000 + n, output: (await marks.db.prepare('SELECT output_id FROM outputs WHERE transaction_id = ?').bind(ptx).first()).output_id }
+      const subject = spendOf(own, n + 1)
+      await marks.exec(`CREATE TRIGGER fixture_restore_errs BEFORE UPDATE OF spendable ON outputs WHEN OLD.output_id = ${Number(own.output)} AND NEW.spendable = 1 BEGIN SELECT RAISE(ABORT, 'fixture: the restore errs'); END`)
+      let r
+      try { r = await unchanged(`mk13 ${arcade}`, () => take(withParent(own, subject), n)) } finally { await marks.exec('DROP TRIGGER fixture_restore_errs') }
+      assert.deepEqual(r.error, { code: -32603, message: 'An internal error has occurred.' }, JSON.stringify(r))
+      assert.equal((await coinRow(own)).spendable, 0)
+      const rows = await heldRows(txid(subject))
+      assert.deepEqual([rows.tx, rows.spendable, rows.req], [tx, 0, req])
+    })
+  }
+} finally { await marks.mf.dispose() }
 console.log(`Tracker Worker witnesses: ${ran - failed} passed; ${failed} failed`)
 if (failed) process.exitCode = 1
