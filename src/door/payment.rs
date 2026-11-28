@@ -1,10 +1,13 @@
-//! A payment's bytes at the door: at most [`MAX_PAYMENT_BYTES`] of them are read.
+//! A payment's bytes at the door: at most the door's figure of them are read.
 //!
-//! A door that takes a payment's bytes from a caller reads at most one
-//! mebibyte of them (the BEEF or the transaction as bytes, whatever encoding
-//! carried it) and refuses a larger one before any of it is parsed or
-//! verified and before anything is written. A Worker's isolate is
-//! memory-limited and a door bounds what it reads. The doors:
+//! A door that takes a payment's bytes from a caller reads at most the
+//! figure in force of them (the BEEF or the transaction as bytes, whatever
+//! encoding carried it) and refuses a larger one before any of it is parsed
+//! or verified and before anything is written. The figure is a setting of
+//! the Worker, [`SETTING`], read by [`budget_from`]: 614,400 bytes (600 KiB,
+//! [`DEFAULT_MAX_PAYMENT_BYTES`]) where it is missing, zero or not a number.
+//! A Worker's isolate is memory-limited and a door bounds what it reads. The
+//! doors:
 //!
 //! - `internalizeAction` inline: the AtomicBEEF in `tx` (a JSON array of
 //!   bytes or a hex string), bounded as the request is decoded
@@ -19,6 +22,11 @@
 //! under a process with no isolate ceiling and name no such figure; this host
 //! differs on purpose.
 //!
+//! An answer a provider sends (a merkle proof, a raw transaction, a stored
+//! transaction record, the broadcaster's callback) is held to the same figure
+//! before it is parsed ([`admit_answer`]): over it, the answer is not read and
+//! the provider is taken as unavailable at that moment.
+//!
 //! The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then.
 
 use std::cell::Cell;
@@ -31,31 +39,47 @@ use serde_json::{Map, Value};
 use crate::error::Error;
 use crate::json_rpc::JsonRpcRequest;
 
-/// The most bytes of a payment a door reads, one mebibyte.
+/// The most bytes of a payment a door reads where the setting names no
+/// other figure: 614,400 bytes, 600 KiB. An ordinary payment is a few
+/// kilobytes; an operator who must take a larger one raises the setting.
 ///
 /// The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then.
-pub const MAX_PAYMENT_BYTES: u64 = 1_048_576;
+pub const DEFAULT_MAX_PAYMENT_BYTES: u64 = 614_400;
+
+/// The Worker's setting (a var in `[vars]`) that names the figure in bytes.
+pub const SETTING: &str = "MAX_PAYMENT_BYTES";
+
+/// The figure in force from the setting's value: a positive whole number of
+/// bytes, or [`DEFAULT_MAX_PAYMENT_BYTES`] where the value is missing, zero
+/// or malformed. Never "no figure".
+pub fn budget_from(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_PAYMENT_BYTES)
+}
 
 /// The typed code of the refusal.
 pub const CODE: &str = "ERR_PAYMENT_SIZE";
 
 const TAIL: &str = "a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.";
 
-/// The refusal's sentence: with the payment's size where the door knows it.
-pub fn description(size: Option<u64>) -> String {
+/// The refusal's sentence under the figure `budget`: with the payment's size
+/// where the door knows it.
+pub fn description(size: Option<u64>, budget: u64) -> String {
     match size {
         Some(size) => format!(
-            "Not judged: this payment is {size} bytes, and this host reads at most {MAX_PAYMENT_BYTES} bytes of a payment: {TAIL}"
+            "Not judged: this payment is {size} bytes, and this host reads at most {budget} bytes of a payment: {TAIL}"
         ),
         None => format!(
-            "Not judged: this payment is more than {MAX_PAYMENT_BYTES} bytes, the most this host reads of a payment: {TAIL}"
+            "Not judged: this payment is more than {budget} bytes, the most this host reads of a payment: {TAIL}"
         ),
     }
 }
 
 /// The refusal's `data`: the code, the budget, and the size where known.
-pub fn data(size: Option<u64>) -> Value {
-    let mut data = serde_json::json!({ "code": CODE, "budget": MAX_PAYMENT_BYTES });
+pub fn data(size: Option<u64>, budget: u64) -> Value {
+    let mut data = serde_json::json!({ "code": CODE, "budget": budget });
     if let Some(size) = size {
         data["size"] = Value::from(size);
     }
@@ -63,27 +87,51 @@ pub fn data(size: Option<u64>) -> Value {
 }
 
 /// A payment of `size` bytes is admitted when it is at most the budget.
-pub fn admit(size: u64) -> Result<(), Error> {
-    if size > MAX_PAYMENT_BYTES {
-        return Err(Error::PaymentSize { size: Some(size) });
+pub fn admit(size: u64, budget: u64) -> Result<(), Error> {
+    if size > budget {
+        return Err(Error::PaymentSize {
+            size: Some(size),
+            budget,
+        });
     }
     Ok(())
 }
 
 /// The line that counts a refusal, beside the payer's public identity key.
-pub fn log_line(size: Option<u64>, identity_key: &str) -> String {
+pub fn log_line(size: Option<u64>, budget: u64, identity_key: &str) -> String {
     let size = size.map_or_else(|| "none".to_string(), |s| s.to_string());
     format!(
-        "payment.not_judged code={CODE} resource=Size size={size} budget={MAX_PAYMENT_BYTES} identity_key={identity_key}"
+        "payment.not_judged code={CODE} resource=Size size={size} budget={budget} identity_key={identity_key}"
     )
 }
 
 /// Count a refusal in the Worker's log.
-pub fn log(size: Option<u64>, identity_key: &str) {
+pub fn log(size: Option<u64>, budget: u64, identity_key: &str) {
     #[cfg(target_arch = "wasm32")]
-    worker::console_log!("{}", log_line(size, identity_key));
+    worker::console_log!("{}", log_line(size, budget, identity_key));
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = (size, identity_key);
+    let _ = (size, budget, identity_key);
+}
+
+/// The line that counts a provider's answer not read for its size.
+pub fn answer_log_line(provider: &str, what: &str, size: u64, budget: u64) -> String {
+    format!(
+        "provider.answer_not_read provider={provider} answer={what} size={size} budget={budget}"
+    )
+}
+
+/// A provider's answer of `size` bytes, about to be parsed, is read when it
+/// is at most the budget. Over it the answer is not read: one log line names
+/// the provider and the size, and the `Err` is the provider's error, which
+/// each caller already takes as that provider unavailable at that moment.
+pub fn admit_answer(provider: &str, what: &str, size: u64, budget: u64) -> Result<(), String> {
+    if size <= budget {
+        return Ok(());
+    }
+    let line = answer_log_line(provider, what, size, budget);
+    #[cfg(target_arch = "wasm32")]
+    worker::console_log!("{}", line);
+    Err(line)
 }
 
 /// The argument that carries a method's payment, where the method takes one.
@@ -118,10 +166,10 @@ struct Head {
 }
 
 /// Read a JSON-RPC body. For a method that takes a payment, its argument is
-/// decoded under the budget: an array of more than [`MAX_PAYMENT_BYTES`]
-/// items is refused at the first item past it, and a hex string of more than
-/// that many bytes is refused on its length, before it is decoded.
-pub fn parse_request(body: &[u8]) -> Parsed {
+/// decoded under the figure `budget`: an array of more than `budget` items is
+/// refused at the first item past it, and a hex string of more than that many
+/// bytes is refused on its length, before it is decoded.
+pub fn parse_request(body: &[u8], budget: u64) -> Parsed {
     let Ok(head) = serde_json::from_slice::<Head>(body) else {
         return Parsed::Malformed;
     };
@@ -133,9 +181,13 @@ pub fn parse_request(body: &[u8]) -> Parsed {
     };
     let over = Cell::new(None);
     let mut de = serde_json::Deserializer::from_slice(body);
-    let params = RequestSeed { field, over: &over }
-        .deserialize(&mut de)
-        .and_then(|params| de.end().map(|()| params));
+    let params = RequestSeed {
+        field,
+        budget,
+        over: &over,
+    }
+    .deserialize(&mut de)
+    .and_then(|params| de.end().map(|()| params));
     match (params, over.get()) {
         (_, Some(size)) => Parsed::Refused { id: head.id, size },
         (Ok(params), None) => Parsed::Request(JsonRpcRequest {
@@ -188,6 +240,7 @@ macro_rules! strings {
 /// The request object: its `params` read by [`ParamsSeed`], the rest passed over.
 struct RequestSeed<'a> {
     field: &'static str,
+    budget: u64,
     over: Over<'a>,
 }
 
@@ -209,6 +262,7 @@ impl<'de> Visitor<'de> for RequestSeed<'_> {
             if key == "params" {
                 params = map.next_value_seed(ParamsSeed {
                     field: self.field,
+                    budget: self.budget,
                     over: self.over,
                     top: true,
                 })?;
@@ -225,6 +279,7 @@ impl<'de> Visitor<'de> for RequestSeed<'_> {
 #[derive(Clone, Copy)]
 struct ParamsSeed<'a> {
     field: &'static str,
+    budget: u64,
     over: Over<'a>,
     top: bool,
 }
@@ -261,7 +316,10 @@ impl<'de> Visitor<'de> for ParamsSeed<'_> {
         let mut fields = Map::new();
         while let Some(key) = map.next_key::<String>()? {
             let value = if key == self.field {
-                map.next_value_seed(PaymentSeed { over: self.over })?
+                map.next_value_seed(PaymentSeed {
+                    budget: self.budget,
+                    over: self.over,
+                })?
             } else {
                 map.next_value::<Value>()?
             };
@@ -273,6 +331,7 @@ impl<'de> Visitor<'de> for ParamsSeed<'_> {
 
 /// The payment's argument, read no further than the budget.
 struct PaymentSeed<'a> {
+    budget: u64,
     over: Over<'a>,
 }
 
@@ -285,7 +344,7 @@ impl PaymentSeed<'_> {
     /// A hex string carries half its length in bytes.
     fn hex<E: de::Error>(&self, v: &str) -> Result<(), E> {
         let size = (v.len() / 2) as u64;
-        if size > MAX_PAYMENT_BYTES {
+        if size > self.budget {
             return Err(self.refuse(Some(size)));
         }
         Ok(())
@@ -316,7 +375,7 @@ impl<'de> Visitor<'de> for PaymentSeed<'_> {
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
         let mut items = Vec::new();
         while let Some(item) = seq.next_element::<Value>()? {
-            if items.len() as u64 == MAX_PAYMENT_BYTES {
+            if items.len() as u64 == self.budget {
                 return Err(self.refuse(None));
             }
             items.push(item);
@@ -337,7 +396,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const CAP: usize = MAX_PAYMENT_BYTES as usize;
+    const BUDGET: u64 = DEFAULT_MAX_PAYMENT_BYTES;
+    const CAP: usize = BUDGET as usize;
 
     fn body(method: &str, params: Value) -> Vec<u8> {
         serde_json::to_vec(
@@ -354,45 +414,81 @@ mod tests {
     }
 
     #[test]
-    fn the_figure_is_one_mebibyte() {
-        assert_eq!(MAX_PAYMENT_BYTES, 1024 * 1024);
-        assert!(admit(MAX_PAYMENT_BYTES).is_ok());
-        match admit(MAX_PAYMENT_BYTES + 1) {
-            Err(Error::PaymentSize { size }) => assert_eq!(size, Some(MAX_PAYMENT_BYTES + 1)),
+    fn the_default_figure_is_600_kib() {
+        assert_eq!(DEFAULT_MAX_PAYMENT_BYTES, 600 * 1024);
+        assert_eq!(DEFAULT_MAX_PAYMENT_BYTES, 614_400);
+        assert!(admit(BUDGET, BUDGET).is_ok());
+        match admit(BUDGET + 1, BUDGET) {
+            Err(Error::PaymentSize { size, budget }) => {
+                assert_eq!((size, budget), (Some(BUDGET + 1), BUDGET))
+            }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_setting_names_the_figure_and_anything_else_is_the_default() {
+        assert_eq!(budget_from(Some("1048576")), 1_048_576);
+        assert_eq!(budget_from(Some(" 2000 ")), 2000);
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-5"),
+            Some("600k"),
+            Some("1.5"),
+            Some("none"),
+            Some("99999999999999999999999"),
+        ] {
+            assert_eq!(budget_from(value), DEFAULT_MAX_PAYMENT_BYTES, "{value:?}");
         }
     }
 
     #[test]
     fn the_sentences_are_pinned() {
         assert_eq!(
-            description(Some(1_048_577)),
-            "Not judged: this payment is 1048577 bytes, and this host reads at most 1048576 bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block."
+            description(Some(614_401), BUDGET),
+            "Not judged: this payment is 614401 bytes, and this host reads at most 614400 bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block."
         );
         assert_eq!(
-            description(None),
-            "Not judged: this payment is more than 1048576 bytes, the most this host reads of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block."
+            description(None, BUDGET),
+            "Not judged: this payment is more than 614400 bytes, the most this host reads of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block."
         );
         assert_eq!(
-            data(Some(9)),
-            json!({ "code": "ERR_PAYMENT_SIZE", "budget": 1_048_576, "size": 9 })
+            data(Some(9), BUDGET),
+            json!({ "code": "ERR_PAYMENT_SIZE", "budget": 614_400, "size": 9 })
         );
         assert_eq!(
-            data(None),
-            json!({ "code": "ERR_PAYMENT_SIZE", "budget": 1_048_576 })
+            data(None, BUDGET),
+            json!({ "code": "ERR_PAYMENT_SIZE", "budget": 614_400 })
         );
     }
 
     #[test]
-    fn the_log_line_is_pinned() {
+    fn the_log_lines_are_pinned() {
         assert_eq!(
-            log_line(Some(1_048_577), "02ab"),
-            "payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=1048577 budget=1048576 identity_key=02ab"
+            log_line(Some(614_401), BUDGET, "02ab"),
+            "payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=614401 budget=614400 identity_key=02ab"
         );
         assert_eq!(
-            log_line(None, "02ab"),
-            "payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=none budget=1048576 identity_key=02ab"
+            log_line(None, BUDGET, "02ab"),
+            "payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=none budget=614400 identity_key=02ab"
         );
+        assert_eq!(
+            answer_log_line("woc", "raw_tx", 614_401, BUDGET),
+            "provider.answer_not_read provider=woc answer=raw_tx size=614401 budget=614400"
+        );
+    }
+
+    #[test]
+    fn a_provider_answer_over_the_figure_is_not_read() {
+        assert!(admit_answer("arc", "proof", BUDGET, BUDGET).is_ok());
+        assert_eq!(
+            admit_answer("arc", "proof", BUDGET + 1, BUDGET),
+            Err(answer_log_line("arc", "proof", BUDGET + 1, BUDGET))
+        );
+        assert!(admit_answer("arc", "proof", 2001, 2000).is_err());
+        assert!(admit_answer("arc", "proof", 2000, 2000).is_ok());
     }
 
     #[test]
@@ -405,7 +501,7 @@ mod tests {
                 json!([{ field: hex::encode(&at) }]),
             ] {
                 let b = body(method, params);
-                let ours = request(parse_request(&b));
+                let ours = request(parse_request(&b, BUDGET));
                 let theirs: JsonRpcRequest = serde_json::from_slice(&b).unwrap();
                 assert_eq!(ours.params, theirs.params, "{method}");
                 assert_eq!((ours.method, ours.id), (theirs.method, theirs.id));
@@ -422,11 +518,11 @@ mod tests {
                 (json!({ field: over }), None),
                 (
                     json!([{ "identityKey": "02ab" }, { field: hex::encode(&over) }]),
-                    Some(MAX_PAYMENT_BYTES + 1),
+                    Some(BUDGET + 1),
                 ),
             ];
             for (params, size) in cases {
-                match parse_request(&body(method, params)) {
+                match parse_request(&body(method, params), BUDGET) {
                     Parsed::Refused { id, size: got } => {
                         assert_eq!(id, json!(7));
                         assert_eq!(got, size, "{method}");
@@ -438,13 +534,57 @@ mod tests {
     }
 
     #[test]
+    fn a_door_follows_another_figure() {
+        // A host that names 2,000 bytes: exactly 2,000 decodes as before, one
+        // byte over is refused, and the refusal names the figure in force.
+        let figure = budget_from(Some("2000"));
+        for (method, field) in [("internalizeAction", "tx"), ("processAction", "rawTx")] {
+            let at = body(method, json!([{ field: vec![7u8; 2000] }]));
+            let theirs: JsonRpcRequest = serde_json::from_slice(&at).unwrap();
+            assert_eq!(request(parse_request(&at, figure)).params, theirs.params);
+            let over_hex = body(method, json!([{ field: hex::encode(vec![7u8; 2001]) }]));
+            assert!(matches!(
+                parse_request(&over_hex, figure),
+                Parsed::Refused {
+                    size: Some(2001),
+                    ..
+                }
+            ));
+            let over_array = body(method, json!([{ field: vec![7u8; 2001] }]));
+            assert!(matches!(
+                parse_request(&over_array, figure),
+                Parsed::Refused { size: None, .. }
+            ));
+            // The same 2,001 bytes pass under the default.
+            assert!(matches!(
+                parse_request(&over_array, BUDGET),
+                Parsed::Request(_)
+            ));
+        }
+        assert!(admit(2000, figure).is_ok());
+        assert!(matches!(
+            admit(2001, figure),
+            Err(Error::PaymentSize {
+                size: Some(2001),
+                budget: 2000
+            })
+        ));
+        assert!(description(Some(2001), figure)
+            .starts_with("Not judged: this payment is 2001 bytes, and this host reads at most 2000 bytes of a payment: "));
+        assert_eq!(
+            data(None, figure),
+            json!({ "code": "ERR_PAYMENT_SIZE", "budget": 2000 })
+        );
+    }
+
+    #[test]
     fn another_method_and_another_argument_keep_their_own_limits() {
         let over = vec![7u8; CAP + 1];
         for b in [
             body("listOutputs", json!([{ "tx": over }])),
             body("internalizeAction", json!([{ "outputs": over }])),
         ] {
-            let ours = request(parse_request(&b));
+            let ours = request(parse_request(&b, BUDGET));
             let theirs: JsonRpcRequest = serde_json::from_slice(&b).unwrap();
             assert_eq!(ours.params, theirs.params);
         }
@@ -452,13 +592,17 @@ mod tests {
 
     #[test]
     fn a_malformed_body_is_malformed() {
-        assert!(matches!(parse_request(b"{"), Parsed::Malformed));
+        assert!(matches!(parse_request(b"{", BUDGET), Parsed::Malformed));
         assert!(matches!(
-            parse_request(br#"{"jsonrpc":"2.0","method":"processAction","id":1,"params":[1,]}"#),
+            parse_request(
+                br#"{"jsonrpc":"2.0","method":"processAction","id":1,"params":[1,]}"#,
+                BUDGET
+            ),
             Parsed::Malformed
         ));
         let no_params = request(parse_request(
             br#"{"jsonrpc":"2.0","method":"processAction","id":1}"#,
+            BUDGET,
         ));
         assert_eq!(no_params.params, Value::Null);
     }

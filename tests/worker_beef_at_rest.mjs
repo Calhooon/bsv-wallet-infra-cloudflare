@@ -67,9 +67,11 @@ const chain = (n, pad = 0) => {
   return { beef: Buffer.concat([head, ...txs]), txid: display(prev), raw: subject }
 }
 
-// The payment budget (door::payment): at most a mebibyte of a payment is read.
-const CAP = 1048576
-const LINKS = 16910
+// The payment budget (door::payment): at most the figure in force of a
+// payment is read, 614,400 bytes (600 KiB) where the setting MAX_PAYMENT_BYTES
+// names no other (it is unset here).
+const CAP = 614400
+const LINKS = 9908
 /** The chain of LINKS transactions `over` bytes past the budget (0: exactly it). */
 const atBudget = (over = 0) => {
   const pad = CAP - chain(LINKS).beef.length + over
@@ -275,8 +277,8 @@ print(json.dumps(statements))
     say(`inline, unproven (${beef.length} bytes): accepted ${txid}; posted to ${whole.map(p => p.host).join(' and ')}: application/octet-stream, leading 0200beef, byte for byte the BEEF behind the prefix (${want.bytes} bytes)`)
   }
 
-  // 2 and 3. A chain at rest of exactly the payment budget (16,910 links,
-  // 1,048,576 bytes): accepted, streamed, copied byte for byte.
+  // 2 and 3. A chain at rest of exactly the payment budget (9,908 links,
+  // 614,400 bytes): accepted, streamed, copied byte for byte.
   const paid = {}
   for (const [n, key] of [[LINKS, '02aa/nl7-at-budget.beef']]) {
     const { beef, txid, raw } = atBudget()
@@ -306,7 +308,7 @@ print(json.dumps(statements))
     say(`at rest, ${n} links (${beef.length} bytes): accepted ${txid} in ${ms} ms; the BEEF copied into BLOBS twice byte for byte; the output in nl7, held until the monitor sees it`)
   }
 
-  // 3b. The payment budget (door::payment): exactly a mebibyte passes to the
+  // 3b. The payment budget (door::payment): exactly the figure passes to the
   // door's own handling, inline and at rest; one byte more is refused before any of it is
   // parsed or read, by the pinned sentence and code, counted by one log line,
   // and no row is written and nothing is copied.
@@ -360,7 +362,7 @@ print(json.dumps(statements))
     say(`counted: ${counted.length} lines, the first "${counted[0]}"`)
 
     // Exactly the budget, inline: the one-transaction payment is accepted; the
-    // chain of 16,910 meets the measure (its parse over the measure's budget).
+    // chain of 9,908 meets the measure (its parse over the measure's budget).
     const exact = oneLarge(0)
     rootAt.set(BIG_HEIGHT, exact.root)
     const r = await internalize({ tx: exact.beef.toString('hex') }, 'exactly the budget')

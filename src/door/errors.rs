@@ -22,7 +22,9 @@ pub fn public_parts(e: &Error) -> (i32, String) {
         Error::DatabaseError(_) | Error::InternalError(_) => {
             (INTERNAL_ERROR, INTERNAL_TEXT.to_string())
         }
-        Error::PaymentSize { size } => (INVALID_PARAMS, super::payment::description(*size)),
+        Error::PaymentSize { size, budget } => {
+            (INVALID_PARAMS, super::payment::description(*size, *budget))
+        }
     }
 }
 
@@ -36,8 +38,8 @@ pub fn rpc_error(id: Value, e: &Error) -> Value {
     }
     let (code, message) = public_parts(e);
     let mut answer = JsonRpcError::new(id, code, message);
-    if let Error::PaymentSize { size } = e {
-        answer.error.data = Some(super::payment::data(*size));
+    if let Error::PaymentSize { size, budget } = e {
+        answer.error.data = Some(super::payment::data(*size, *budget));
     }
     serde_json::to_value(answer).unwrap_or(Value::Null)
 }
@@ -72,7 +74,8 @@ mod tests {
         let answer = rpc_error(
             json!(3),
             &Error::PaymentSize {
-                size: Some(1_048_577),
+                size: Some(614_401),
+                budget: 614_400,
             },
         );
         assert_eq!(
@@ -81,20 +84,26 @@ mod tests {
                 "jsonrpc": "2.0",
                 "error": {
                     "code": -32602,
-                    "message": crate::door::payment::description(Some(1_048_577)),
-                    "data": { "code": "ERR_PAYMENT_SIZE", "budget": 1_048_576, "size": 1_048_577 },
+                    "message": crate::door::payment::description(Some(614_401), 614_400),
+                    "data": { "code": "ERR_PAYMENT_SIZE", "budget": 614_400, "size": 614_401 },
                 },
                 "id": 3,
             })
         );
-        let unknown = rpc_error(json!(3), &Error::PaymentSize { size: None });
+        let unknown = rpc_error(
+            json!(3),
+            &Error::PaymentSize {
+                size: None,
+                budget: 614_400,
+            },
+        );
         assert_eq!(
             unknown["error"]["data"],
-            json!({ "code": "ERR_PAYMENT_SIZE", "budget": 1_048_576 })
+            json!({ "code": "ERR_PAYMENT_SIZE", "budget": 614_400 })
         );
         assert!(unknown["error"]["message"]
             .as_str()
             .unwrap()
-            .starts_with("Not judged: this payment is more than 1048576 bytes"));
+            .starts_with("Not judged: this payment is more than 614400 bytes"));
     }
 }

@@ -47,6 +47,19 @@ fn env_value(env: &Env, name: &str) -> Option<String> {
         .or_else(|| env.var(name).ok().map(|v| v.to_string()))
 }
 
+/// The most bytes of a payment a door reads, and of a provider's answer the
+/// Worker parses (`door::payment`): the var `MAX_PAYMENT_BYTES`, read as the
+/// other settings with a default are; missing, zero or malformed, the default
+/// of 614,400 bytes (600 KiB), never no figure.
+pub(crate) fn payment_budget(env: &Env) -> u64 {
+    door::payment::budget_from(
+        env.var(door::payment::SETTING)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    )
+}
+
 /// ChainTracker for the monitor: ChainTracks (CHAINTRACKS_URL) with WoC fallback.
 fn build_monitor_headers(env: &Env) -> crate::services::chaintracker::HeaderProvider {
     let chaintracks_url = env
@@ -89,7 +102,8 @@ fn build_provider(
         arc_api_key,
         woc_api_key,
         chaintracks_url,
-    );
+    )
+    .with_payment_budget(payment_budget(env));
     let choice = crate::services::selected::BroadcasterChoice::parse(
         env_value(env, "BROADCASTER").as_deref(),
     )?;
@@ -532,13 +546,16 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     }
 
     // Parse JSON-RPC request. A payment's argument is decoded no further than
-    // the payment budget (`door::payment`): over it, the call is refused as
-    // a refused argument before any of the payment is parsed.
-    let rpc_request: JsonRpcRequest = match door::payment::parse_request(&request_body) {
+    // the payment budget (`door::payment`, the setting MAX_PAYMENT_BYTES):
+    // over it, the call is refused as a refused argument before any of the
+    // payment is parsed.
+    let budget = payment_budget(&env);
+    let rpc_request: JsonRpcRequest = match door::payment::parse_request(&request_body, budget) {
         door::payment::Parsed::Request(r) => r,
         door::payment::Parsed::Refused { id, size } => {
-            door::payment::log(size, &auth_context.identity_key);
-            let error = door::errors::rpc_error(id, &crate::error::Error::PaymentSize { size });
+            door::payment::log(size, budget, &auth_context.identity_key);
+            let error =
+                door::errors::rpc_error(id, &crate::error::Error::PaymentSize { size, budget });
             return sign_json_response(&error, 200, &[], &session)
                 .map_err(|e| Error::from(e.to_string()));
         }
@@ -628,7 +645,8 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     let mut storage = StorageD1::new(&db, &blobs, &provider)
         .with_beef_verification(beef_mode, &header_provider)
-        .with_internalize_zero_conf(internalize_zero_conf);
+        .with_internalize_zero_conf(internalize_zero_conf)
+        .with_payment_budget(budget);
     if let Some(at_rest) = at_rest.as_ref() {
         storage = storage.with_beef_at_rest(at_rest);
     }

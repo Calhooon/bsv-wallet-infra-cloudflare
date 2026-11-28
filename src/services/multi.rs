@@ -64,6 +64,17 @@ impl MultiProvider {
             chaintracks_url: chaintracks_url.map(|u| u.trim_end_matches('/').to_string()),
         }
     }
+
+    /// The most bytes of a proof or a raw transaction read from any of the
+    /// three providers' answers (`crate::door::payment`, the setting
+    /// `MAX_PAYMENT_BYTES`). Over it, an answer is not parsed and that
+    /// provider is taken as unavailable: the next is asked, as on its error.
+    pub fn with_payment_budget(mut self, budget: u64) -> Self {
+        self.arc = self.arc.with_payment_budget(budget);
+        self.woc = self.woc.with_payment_budget(budget);
+        self.bitails = self.bitails.with_payment_budget(budget);
+        self
+    }
 }
 
 // =============================================================================

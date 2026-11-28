@@ -136,11 +136,13 @@ pub async fn handle(
         .or_else(|| env.var("WOC_API_KEY").ok().map(|v| v.to_string()));
     let headers =
         crate::services::chaintracker::build_header_provider(chaintracks_url, woc_api_key);
+    // The most bytes of a merkle path read (`door::payment`, MAX_PAYMENT_BYTES).
+    let budget = crate::payment_budget(env);
 
     let mut processed = 0u32;
     let mut ignored = 0u32;
     for ev in events {
-        match handle_one(db, blobs, &headers, &arcade_url, &ev).await {
+        match handle_one(db, blobs, &headers, &arcade_url, budget, &ev).await {
             Ok(true) => processed += 1,
             Ok(false) => ignored += 1,
             Err(e) => {
@@ -166,6 +168,7 @@ async fn handle_one(
     blobs: &Bucket,
     headers: &crate::services::chaintracker::HeaderProvider,
     arcade_url: &str,
+    budget: u64,
     ev: &TxEvent,
 ) -> std::result::Result<bool, String> {
     // Rung 1 scope: the PROOF push. MINED/IMMUTABLE carry (or imply) a merklePath;
@@ -219,6 +222,10 @@ async fn handle_one(
         return Err("MINED but no merklePath available (payload or record)".to_string());
     };
 
+    // A merkle path of more than the payment figure is not decoded or parsed:
+    // the event is left to the monitor, as any per-tx problem here is
+    // (`door::payment`; nothing is stored).
+    crate::door::payment::admit_answer("arcade", "proof", (mp_hex.len() / 2) as u64, budget)?;
     let mp_bin = hex::decode(&mp_hex).map_err(|e| format!("merklePath hex: {e}"))?;
     let mp = MerklePath::from_binary(&mp_bin).map_err(|e| format!("BUMP parse: {e:?}"))?;
 

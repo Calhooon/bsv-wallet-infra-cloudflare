@@ -45,6 +45,9 @@ pub struct StorageD1<'a, B: BroadcastService + ProofService = crate::services::w
     /// the binding `BEEF_AT_REST` and its bucket's name. `None`: the
     /// reference form is refused.
     beef_at_rest: Option<&'a AtRestBucket<'a>>,
+    /// The most bytes of a payment a door reads (`crate::door::payment`,
+    /// the Worker's setting `MAX_PAYMENT_BYTES`).
+    payment_budget: u64,
 }
 
 impl<'a, B: BroadcastService + ProofService> StorageD1<'a, B> {
@@ -58,6 +61,7 @@ impl<'a, B: BroadcastService + ProofService> StorageD1<'a, B> {
             header_provider: None,
             internalize_zero_conf: false,
             beef_at_rest: None,
+            payment_budget: crate::door::payment::DEFAULT_MAX_PAYMENT_BYTES,
         }
     }
 
@@ -71,6 +75,17 @@ impl<'a, B: BroadcastService + ProofService> StorageD1<'a, B> {
     pub fn with_beef_at_rest(mut self, bucket: &'a AtRestBucket<'a>) -> Self {
         self.beef_at_rest = Some(bucket);
         self
+    }
+
+    /// The most bytes of a payment a door reads (the setting `MAX_PAYMENT_BYTES`).
+    pub fn with_payment_budget(mut self, budget: u64) -> Self {
+        self.payment_budget = budget;
+        self
+    }
+
+    /// The figure in force for a payment's bytes.
+    pub fn payment_budget(&self) -> u64 {
+        self.payment_budget
     }
 
     pub fn internalize_zero_conf(&self) -> bool {

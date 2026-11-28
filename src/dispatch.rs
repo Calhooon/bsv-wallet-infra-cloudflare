@@ -132,9 +132,9 @@ pub async fn dispatch<B: crate::services::BroadcastService + crate::services::Pr
     match result {
         Ok(val) => val,
         Err(e) => {
-            if let Error::PaymentSize { size } = &e {
+            if let Error::PaymentSize { size, budget } = &e {
                 let identity_key = auth.map_or("none", |a| a.identity_key.as_str());
-                crate::door::payment::log(*size, identity_key);
+                crate::door::payment::log(*size, *budget, identity_key);
             }
             crate::door::errors::rpc_error(id, &e)
         }

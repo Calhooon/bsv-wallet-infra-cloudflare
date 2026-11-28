@@ -1,6 +1,7 @@
 // Local compiled-Worker witness for #49: hold the proof pending until the header answers.
 // A proof pushed by the Arcade callback and a proof found by the monitor, with the header
-// service unanswered, then answering, then a planted bad root. Every request the Worker
+// service unanswered, then answering, then a planted bad root, then a proof over the
+// payment figure on both paths. Every request the Worker
 // makes is answered here; nothing leaves this process. No deploy.
 //
 // worker-build --release
@@ -29,6 +30,7 @@ const TOKEN = 'fixture-callback', KEY = 'fixture-monitor'
 let headersUp = false
 const arcProofs = new Map() // txid -> { hex, height }
 const roots = new Map() // height -> the root our header service carries
+const logs = [] // the Worker's log lines
 const mf = new Miniflare({ modules: true, scriptPath: resolve('build/worker/shim.mjs'),
   modulesRules: [{ type: 'ESModule', include: ['**/*.js', '**/*.mjs'] }, { type: 'CompiledWasm', include: ['**/*.wasm'] }],
   compatibilityDate: '2024-01-01', host: '127.0.0.1', port: 0,
@@ -49,6 +51,7 @@ const mf = new Miniflare({ modules: true, scriptPath: resolve('build/worker/shim
     }
     return new Response('not found', { status: 404 })
   },
+  handleStructuredLogs: ({ message }) => { logs.push(String(message).trim()) },
 })
 let failed = 0
 try {
@@ -127,6 +130,36 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
     assert.deepEqual(await req(badPush), b1); assert.deepEqual(await req(badFound), b2)
     assert.equal((await holds(badPush)).length, 0); assert.equal((await holds(badFound)).length, 0)
   })
-  console.log(`Proof hold Worker witnesses: ${6 - failed} passed; ${failed} failed`)
+  // g. A provider's answer over the payment figure (door::payment, 614,400
+  // bytes where MAX_PAYMENT_BYTES is unset) is not parsed: the pushed proof
+  // and ARC's answer to the monitor each carry a merkle path one byte over,
+  // its root the one the header service carries. Each is taken as that
+  // provider unavailable: nothing is stored, no hold, the request keeps its
+  // state, and one line names the provider and the size.
+  const CAP = 614400
+  const OVER_PUSHED = 900005, OVER_FOUND = 900006
+  const overPush = await seed(6, OVER_PUSHED), overFound = await seed(7, OVER_FOUND)
+  roots.set(OVER_PUSHED, overPush.root); roots.set(OVER_FOUND, overFound.root)
+  for (const o of [overPush, overFound]) o.hex += '00'.repeat(CAP + 1 - o.hex.length / 2)
+  arcProofs.clear(); arcProofs.set(overFound.txid, overFound)
+  await check('g a proof over the payment figure is not read on either path: nothing written, no hold, the request keeps its state, a line names the provider and the size', async () => {
+    assert.equal(overPush.hex.length / 2, CAP + 1)
+    const n = await provenCount(), b1 = await req(overPush), b2 = await req(overFound)
+    const logsBefore = logs.length
+    const r = await callback(overPush); assert.equal(r.processed, 0)
+    await monitor()
+    assert.equal(await provenCount(), n); assert.equal(await proven(overPush), null); assert.equal(await proven(overFound), null)
+    assert.deepEqual(await req(overPush), b1); assert.equal((await req(overFound)).status, b2.status)
+    assert.equal((await req(overFound)).proven_tx_id, null)
+    assert.equal((await holds(overPush)).length, 0); assert.equal((await holds(overFound)).length, 0)
+    const line = provider => `provider.answer_not_read provider=${provider} answer=proof size=${CAP + 1} budget=${CAP}`
+    const deadline = Date.now() + 5000
+    const seen = provider => logs.slice(logsBefore).some(l => l.includes(line(provider)))
+    while (!(seen('arcade') && seen('arc')) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50))
+    assert.ok(seen('arcade'), 'no line for the pushed proof')
+    assert.ok(seen('arc'), "no line for ARC's answer")
+    console.log(`  ${line('arcade')}; ${line('arc')}`)
+  })
+  console.log(`Proof hold Worker witnesses: ${7 - failed} passed; ${failed} failed`)
 } finally { await mf.dispose() }
 if (failed) process.exitCode = 1

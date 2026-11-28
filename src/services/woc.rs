@@ -114,6 +114,9 @@ pub struct WocProvider {
     /// chain state; falling back to WoC's `/block/height/{h}` when it isn't
     /// set or errors keeps this change backward-compatible.
     chaintracks_url: Option<String>,
+    /// The most bytes of a proof or a raw transaction read from an answer
+    /// (`crate::door::payment`, the setting `MAX_PAYMENT_BYTES`).
+    payment_budget: u64,
 }
 
 impl Default for WocProvider {
@@ -128,7 +131,14 @@ impl WocProvider {
             header_cache: RefCell::new(HashMap::new()),
             api_key,
             chaintracks_url: None,
+            payment_budget: crate::door::payment::DEFAULT_MAX_PAYMENT_BYTES,
         }
+    }
+
+    /// The most bytes of a proof or a raw transaction read from an answer.
+    pub fn with_payment_budget(mut self, budget: u64) -> Self {
+        self.payment_budget = budget;
+        self
     }
 
     /// Configure the ChainTracks URL used for canonical block-hash lookups.
@@ -291,7 +301,7 @@ impl ProofService for WocProvider {
         // reorg). Earlier code took the first entry unconditionally and
         // silently cached stale orphan proofs — the exact failure mode that
         // blocked consolidation on claude at height 943424.
-        let proofs = fetch_tsc_proof(txid, api_key).await?;
+        let proofs = fetch_tsc_proof(txid, api_key, self.payment_budget).await?;
         if proofs.is_empty() {
             return Ok(None);
         }
@@ -433,6 +443,14 @@ impl ProofService for WocProvider {
             if hex_str.is_empty() {
                 return Ok(None);
             }
+            // A transaction of more than the payment figure is not decoded:
+            // WoC is taken as unavailable for it (`door::payment`).
+            crate::door::payment::admit_answer(
+                "woc",
+                "raw_tx",
+                (hex_str.len() / 2) as u64,
+                self.payment_budget,
+            )?;
 
             return hex::decode(hex_str)
                 .map(Some)
@@ -642,9 +660,13 @@ fn parse_tsc_proof_response(text: &str) -> std::result::Result<Vec<WocTscProof>,
 /// Retries on 429 and 5xx via `RetryConfig::is_retryable_status`. CF Workers
 /// are single-threaded so retries are immediate (no sleep) — the value is
 /// hitting a different WoC backend on the next attempt.
+///
+/// An answer of more than twice `budget` characters (the proof's nodes travel
+/// as hex) is not parsed: WoC is taken as unavailable (`door::payment`).
 async fn fetch_tsc_proof(
     txid: &str,
     api_key: Option<&str>,
+    budget: u64,
 ) -> std::result::Result<Vec<WocTscProof>, String> {
     let url = format!("{}/tx/{}/proof/tsc", WOC_BASE, txid);
     let retry = RetryConfig::default();
@@ -702,6 +724,7 @@ async fn fetch_tsc_proof(
         }
 
         let text = response.text().await.map_err(|e| e.to_string())?;
+        crate::door::payment::admit_answer("woc", "proof", (text.len() / 2) as u64, budget)?;
         let result = parse_tsc_proof_response(&text);
         if let Ok(ref v) = result {
             if v.is_empty() {

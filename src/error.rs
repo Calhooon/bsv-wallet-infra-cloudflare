@@ -10,9 +10,10 @@ pub enum Error {
     NotFound(String),
     InternalError(String),
     /// A payment's bytes over the door's budget (`crate::door::payment`):
-    /// its size where the door knows it.
+    /// its size where the door knows it, and the figure in force.
     PaymentSize {
         size: Option<u64>,
+        budget: u64,
     },
 }
 
@@ -23,8 +24,8 @@ impl fmt::Display for Error {
             Error::DatabaseError(msg) => write!(f, "Database error: {}", msg),
             Error::NotFound(msg) => write!(f, "Not found: {}", msg),
             Error::InternalError(msg) => write!(f, "Internal error: {}", msg),
-            Error::PaymentSize { size } => {
-                write!(f, "{}", crate::door::payment::description(*size))
+            Error::PaymentSize { size, budget } => {
+                write!(f, "{}", crate::door::payment::description(*size, *budget))
             }
         }
     }
@@ -138,7 +139,13 @@ mod tests {
             (Error::NotFound("n".into()), -32001),
             (Error::DatabaseError("d".into()), -32603),
             (Error::InternalError("i".into()), -32603),
-            (Error::PaymentSize { size: None }, -32602),
+            (
+                Error::PaymentSize {
+                    size: None,
+                    budget: 614_400,
+                },
+                -32602,
+            ),
         ];
 
         for (error, expected_code) in test_cases {
@@ -147,7 +154,9 @@ mod tests {
                 Error::NotFound(m) => (-32001, m.clone()),
                 Error::DatabaseError(m) => (-32603, m.clone()),
                 Error::InternalError(m) => (-32603, m.clone()),
-                Error::PaymentSize { size } => (-32602, crate::door::payment::description(*size)),
+                Error::PaymentSize { size, budget } => {
+                    (-32602, crate::door::payment::description(*size, *budget))
+                }
             };
             assert_eq!(code, expected_code, "wrong code for {:?}", error);
         }
@@ -185,7 +194,9 @@ mod tests {
                 Error::NotFound(m) => m.clone(),
                 Error::DatabaseError(m) => m.clone(),
                 Error::InternalError(m) => m.clone(),
-                Error::PaymentSize { size } => crate::door::payment::description(*size),
+                Error::PaymentSize { size, budget } => {
+                    crate::door::payment::description(*size, *budget)
+                }
             })
             .collect();
 

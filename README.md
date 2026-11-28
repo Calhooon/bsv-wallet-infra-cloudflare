@@ -55,39 +55,56 @@ bound.
 
 ### A payment's bytes
 
-A door that takes a payment's bytes from a caller reads at most one mebibyte
-of them, 1,048,576 bytes of the payment itself (the BEEF or the transaction as
-bytes, whatever encoding carried it), and refuses a larger one before it
-parses or verifies any of it and before anything is written
-(`door::payment::MAX_PAYMENT_BYTES`). A Worker's isolate is memory-limited
-and a door bounds what it reads. The doors are `internalizeAction`'s
-AtomicBEEF inline (`tx`, a JSON array of bytes or a hex string),
-`processAction`'s signed transaction (`rawTx`), and `internalizeAction`'s
-BEEF at rest (`beefAtRest`, held on the length its reference names, which the
-object's head must match, before the object is opened). An array is decoded
-no further than the budget and a hex string is held on its length before it
-is decoded; a request's other arguments keep their own limits. The figure is
-provisional: it is read again at this crate's next bsv-rs pin and raised to
-the door's natural figure then.
+A door that takes a payment's bytes from a caller reads at most the figure in
+force of them (the BEEF or the transaction as bytes, whatever encoding
+carried it) and refuses a larger one before it parses or verifies any of it
+and before anything is written (`door::payment`). The figure is the Worker's
+setting `MAX_PAYMENT_BYTES`, a var in bytes; where it is missing, zero or not
+a whole number it is 614,400 bytes (600 KiB). An ordinary payment is a few
+kilobytes (in 727 real payments the median was 5.4 KB and the largest
+434 KB); an operator who must take a larger one raises the setting. A
+Worker's isolate is memory-limited and a door bounds what it reads. The
+doors are `internalizeAction`'s AtomicBEEF inline (`tx`, a JSON array of
+bytes or a hex string), `processAction`'s signed transaction (`rawTx`), and
+`internalizeAction`'s BEEF at rest (`beefAtRest`, held on the length its
+reference names, which the object's head must match, before the object is
+opened). An array is decoded no further than the figure and a hex string is
+held on its length before it is decoded; a request's other arguments keep
+their own limits. The request's bound of 1,000,000 array items is unchanged:
+an array between the figure and that bound is refused by the figure. The
+figure is provisional: it is read again at this crate's next bsv-rs pin and
+raised to the door's natural figure then.
 
 The refusal is the JSON-RPC error of a refused argument, `-32602`, its
 `message` one of two sentences with the door's values, and its `data` the
-typed code with the budget and, where the door knows it, the size:
+typed code with the figure in force and, where the door knows it, the size:
 
 ```json
 {"code": -32602,
- "message": "Not judged: this payment is 1048577 bytes, and this host reads at most 1048576 bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.",
- "data": {"code": "ERR_PAYMENT_SIZE", "budget": 1048576, "size": 1048577}}
+ "message": "Not judged: this payment is 614401 bytes, and this host reads at most 614400 bytes of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.",
+ "data": {"code": "ERR_PAYMENT_SIZE", "budget": 614400, "size": 614401}}
 ```
 
 Where the payment is an array whose length is read only as it is decoded,
 `size` is absent and the message reads `Not judged: this payment is more than
-1048576 bytes, the most this host reads of a payment: ...` with the same
+614400 bytes, the most this host reads of a payment: ...` with the same
 close. The door reads and keeps nothing of a refused payment. Each refusal is
 counted by one log line:
-`payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=<bytes or none> budget=1048576 identity_key=<the caller's public identity key>`.
+`payment.not_judged code=ERR_PAYMENT_SIZE resource=Size size=<bytes or none> budget=<the figure> identity_key=<the caller's public identity key>`.
 The reference's servers run under a process with no isolate ceiling and name
 no such figure; this host differs on purpose.
+
+An answer a provider sends that the Worker hands to bsv-rs is held to the
+same figure before it is parsed: a merkle proof from ARC (its `merklePath`),
+from WhatsOnChain or Bitails (the TSC answer, whose nodes travel as hex, at
+half its length), a raw transaction from WhatsOnChain (`/tx/{txid}/hex`), and
+the merkle path the broadcaster's callback (`/arcade/callback`) carries or
+its stored record names. Over the figure the answer is not parsed and that
+provider is taken as unavailable at that moment, the road a provider's error
+already takes (the next provider is asked, the request is held for the
+monitor's next run); it is never a verdict on a transaction. Each is counted
+by one log line:
+`provider.answer_not_read provider=<arc|woc|bitails|arcade> answer=<proof|raw_tx> size=<bytes> budget=<the figure>`.
 
 The BRC-31 handshake is answered by the middleware; an authenticated request to any other path is a 404. The
 cron trigger in [wrangler.toml](wrangler.toml) (`*/5 * * * *`) runs the monitor.
