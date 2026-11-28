@@ -688,8 +688,33 @@ try {
       else { assert.ok(r.error, JSON.stringify(r)); assert.equal((await callerTx(txid(t))).status, 'failed') }
     })
   }
+  await check('mk8 a refusal whose restore of the caller\'s own coin errs: the call answers the error, and the credit of the refused transaction is still taken back', async () => {
+    markArcade = 'invalid'; markWoc = 'unknown'
+    const me = (await marks.db.prepare('SELECT user_id FROM users WHERE identity_key = ?').bind(callerKey.toPublicKey().toString()).first()).user_id
+    const myBasket = (await marks.db.prepare("SELECT basket_id FROM output_baskets WHERE user_id = ? AND name = 'default'").bind(me).first()).basket_id
+    const parent = raw(Buffer.alloc(32, 281), 0x51, 281)
+    roots.set(810281, display(hash(parent)))
+    await marks.exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx) VALUES (?, 'own-coin-281', 'completed', 0, 'caller coin', ?, ?)", me, txid(parent), parent)
+    const ptx = (await marks.db.prepare("SELECT transaction_id FROM transactions WHERE reference = 'own-coin-281'").first()).transaction_id
+    await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", me, ptx, myBasket, txid(parent), Buffer.from([0x51]))
+    const own = { parent, height: 810281, output: (await marks.db.prepare('SELECT output_id FROM outputs WHERE transaction_id = ?').bind(ptx).first()).output_id }
+    const subject = spendOf(own, 282)
+    // Every statement that would make the caller's coin spendable again errs.
+    await marks.exec(`CREATE TRIGGER fixture_restore_errs BEFORE UPDATE OF spendable ON outputs WHEN OLD.output_id = ${Number(own.output)} AND NEW.spendable = 1 BEGIN SELECT RAISE(ABORT, 'fixture: the restore errs'); END`)
+    let r
+    try { r = await unchanged('mk8', () => take(withParent(own, subject), 281)) } finally { await marks.exec('DROP TRIGGER fixture_restore_errs') }
+    // The restore's storage error is the answer (the server does not echo its text).
+    assert.deepEqual(r.error, { code: -32603, message: 'An internal error has occurred.' }, JSON.stringify(r))
+    // The restore did not run: the caller's coin stays marked by its own call.
+    assert.equal((await coinRow(own)).spendable, 0)
+    // The refused transaction's credit is taken back all the same.
+    assert.equal((await callerTx(txid(subject))).status, 'failed')
+    const credit = await marks.db.prepare('SELECT o.spendable FROM outputs o WHERE o.txid = ? AND o.user_id = ?').bind(txid(subject), me).first()
+    assert.equal(credit.spendable, 0)
+    assert.equal((await marks.db.prepare('SELECT status FROM proven_tx_reqs WHERE txid = ?').bind(txid(subject)).first()).status, 'invalid')
+  })
   let real
-  await check('mk6 a real spend of another user\'s coin: the call leaves the owner\'s coin as it was', async () => {
+  await check('mk6a real spend of another user\'s coin: the call leaves the owner\'s coin as it was', async () => {
     markArcade = 'accept'; markWoc = 'unknown'
     const c = await coin(271); const subject = spendOf(c, 272)
     real = { c, subject }
