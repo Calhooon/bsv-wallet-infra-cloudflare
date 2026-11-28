@@ -11,6 +11,16 @@ use super::StorageD1;
 use crate::d1::{batch::BatchCollector, QVal, Query};
 use crate::error::{Error, Result};
 
+/// The stack-memory budget of the local script check, in bytes, on the
+/// interpreter's own count under a flag word: one budget over the main and the
+/// alt stack, each element's bytes plus a fixed per-element overhead, every
+/// growth charged before it happens. A script whose stacks would pass it is
+/// declined by the interpreter as a resource limit, which
+/// [`script_refusal`] answers as no verdict, so the broadcaster's answer decides.
+/// A host that verifies a caller's script in a memory-limited isolate sets such
+/// a budget at or below a sixteenth of the isolate's ceiling (GHSA-7vx5-cf5p-5c48).
+const SCRIPT_MEMORY_LIMIT: usize = 1_000_000;
+
 /// With no stored creation heights, refuse only a script that fails under every
 /// supported block era and both UTXO eras. Policy flags are never applied.
 /// A local resource refusal or absent input context is no consensus verdict.
@@ -62,7 +72,7 @@ pub fn script_refusal(tx: &Transaction, sources: &[TransactionOutput]) -> Option
                     unlocking_script: input.unlocking_script.as_ref()?.clone(),
                     input_sequence: input.sequence,
                     lock_time: tx.lock_time,
-                    memory_limit: None,
+                    memory_limit: Some(SCRIPT_MEMORY_LIMIT),
                     work_limit: None,
                 });
                 spend.set_flags(ScriptFlags::block(era));
@@ -202,5 +212,98 @@ impl<B: crate::services::BroadcastService + crate::services::ProofService> Stora
         batch.add(&format!("UPDATE transactions SET status = 'failed', updated_at = ? WHERE transaction_id IN ({IDS})"), vec![QVal::Text(now), QVal::Text(txid.into()), QVal::Int(user_id)])?;
         batch.execute().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsv_sdk::script::{LockingScript, UnlockingScript};
+    use bsv_sdk::transaction::TransactionInput;
+
+    fn subject(unlock: &[u8]) -> Transaction {
+        Transaction::with_params(
+            1,
+            vec![TransactionInput {
+                source_transaction: None,
+                source_txid: Some("ab".repeat(32)),
+                source_output_index: 0,
+                unlocking_script: Some(UnlockingScript::from_binary(unlock).unwrap()),
+                unlocking_script_template: None,
+                sequence: u32::MAX,
+            }],
+            vec![TransactionOutput {
+                satoshis: Some(1000),
+                locking_script: LockingScript::from_binary(&[0x51]).unwrap(),
+                change: false,
+            }],
+            0,
+        )
+    }
+
+    fn source(lock: &[u8]) -> TransactionOutput {
+        TransactionOutput {
+            satoshis: Some(1000),
+            locking_script: LockingScript::from_binary(lock).unwrap(),
+            change: false,
+        }
+    }
+
+    /// A minimal push of a positive script number.
+    fn push_num(script: &mut Vec<u8>, n: usize) {
+        let mut bytes = n.to_le_bytes().to_vec();
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        if bytes.last().is_some_and(|b| b & 0x80 != 0) {
+            bytes.push(0);
+        }
+        script.push(bytes.len() as u8);
+        script.extend_from_slice(&bytes);
+    }
+
+    /// `OP_1 <size> OP_NUM2BIN OP_DROP OP_0`: one element of `size` bytes, then
+    /// a false result. Within the budget the script's own verdict is a refusal.
+    fn element_then_false(size: usize) -> Vec<u8> {
+        let mut lock = vec![0x51];
+        push_num(&mut lock, size);
+        lock.extend_from_slice(&[0x80, 0x75, 0x00]);
+        lock
+    }
+
+    #[test]
+    fn a_stack_over_the_budget_is_no_verdict() {
+        // `<8 KB> (OP_DUP OP_CAT) x 8 OP_DROP OP_0`: the stack passes the
+        // budget, so the check gives no verdict instead of the script's own.
+        let mut unlock = vec![0x4d, 0x00, 0x20];
+        unlock.extend_from_slice(&[0x42; 8 * 1024]);
+        let mut lock = Vec::new();
+        for _ in 0..8 {
+            lock.extend_from_slice(&[0x76, 0x7e]);
+        }
+        lock.extend_from_slice(&[0x75, 0x00]);
+        assert_eq!(script_refusal(&subject(&unlock), &[source(&lock)]), None);
+    }
+
+    #[test]
+    fn a_small_script_keeps_its_verdict_under_the_budget() {
+        // The honest verdicts are pinned in tests/tracker_rule.rs
+        // (`true_script_is_not_a_refusal`, `false_source_script_is_a_local_refusal`);
+        // a small element is judged on its own result.
+        assert_eq!(script_refusal(&subject(&[]), &[source(&[0x51])]), None);
+        assert!(script_refusal(&subject(&[]), &[source(&element_then_false(1024))]).is_some());
+    }
+
+    #[test]
+    fn the_check_runs_under_the_named_budget() {
+        // One element and its per-element overhead fill the budget exactly; one
+        // byte more is declined. Fails if the call site passes another budget.
+        let overhead = bsv_sdk::script::flags::STACK_ELEMENT_OVERHEAD;
+        let at = SCRIPT_MEMORY_LIMIT - overhead;
+        assert!(script_refusal(&subject(&[]), &[source(&element_then_false(at))]).is_some());
+        assert_eq!(
+            script_refusal(&subject(&[]), &[source(&element_then_false(at + 1))]),
+            None
+        );
     }
 }
