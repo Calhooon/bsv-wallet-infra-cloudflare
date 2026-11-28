@@ -355,7 +355,9 @@ print(json.dumps(statements))
     // sends, is refused before it is hashed or parsed (-32602, the pinned
     // sentence, ERR_PAYMENT_SIZE with the budget; its size is not known where
     // the array is read no further than the budget), counted by one log line,
-    // and nothing is written. Exactly a mebibyte passes the budget to the
+    // and nothing is written. Exactly a mebibyte passes the payment budget and
+    // meets the request's array budget (1,000,000 items, door::bounds), as any
+    // array over it does; a transaction of 1,000,000 bytes passes both to the
     // storage's own handling.
     const CAP = 1048576
     const pinnedMore = `Not judged: this payment is more than ${CAP} bytes, the most this host reads of a payment: a bound of this host, not a rule of the chain, and no verdict on the payment. Pay with other coins. If this payment's size is unconfirmed ancestry, it will be smaller after the next block.`
@@ -398,11 +400,15 @@ print(json.dumps(statements))
     assert.deepEqual(notJudged(), expected)
     const exact = signed(CAP)
     assert.equal(exact.length, CAP)
-    const handled = await processOf(exact)
+    const atBudget = await processOf(exact)
+    assert.deepEqual(atBudget.error, { code: -32602, message: 'RPC arrays must not exceed 1000000 items' }, JSON.stringify(atBudget).slice(0, 600))
+    const million = signed(1000000)
+    const handled = await processOf(million)
     assert.notEqual(handled.error?.data?.code, 'ERR_PAYMENT_SIZE', JSON.stringify(handled).slice(0, 600))
+    assert.notEqual(handled.error?.message, 'RPC arrays must not exceed 1000000 items', JSON.stringify(handled).slice(0, 600))
     assert.notEqual(handled.error?.message, 'the transaction is too large to process', JSON.stringify(handled).slice(0, 600))
     assert.equal(notJudged().length, expected.length)
-    say(`payment budget: processAction's ${over.length}-byte transaction (array) -32602 ${JSON.stringify(overRefused.error.data)}; internalizeAction's ${overBeef.length}-byte AtomicBEEF (hex) -32602 ${JSON.stringify(beefRefused.error.data)}; counted "${expected[0]}"; no table gained or lost a row; the ${exact.length}-byte transaction passed to the storage: ${JSON.stringify(handled.error ?? handled.result).slice(0, 160)}`)
+    say(`payment budget: processAction's ${over.length}-byte transaction (array) -32602 ${JSON.stringify(overRefused.error.data)}; internalizeAction's ${overBeef.length}-byte AtomicBEEF (hex) -32602 ${JSON.stringify(beefRefused.error.data)}; counted "${expected[0]}"; no table gained or lost a row; the ${exact.length}-byte transaction meets the array budget (-32602 "${atBudget.error.message}"); the ${million.length}-byte transaction passed to the storage: ${JSON.stringify(handled.error ?? handled.result).slice(0, 160)}`)
   }
 
   // 9. The two rate limits, in one window of the limiter (aligned to its period).
