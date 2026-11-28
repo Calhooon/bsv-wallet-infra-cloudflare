@@ -362,3 +362,42 @@ fn a_beef_that_is_not_atomic_is_refused() {
     let err = block_on(read_at_rest(&mut source, &ChainHeaders::honest(), size)).unwrap_err();
     assert_eq!(err, AtRestError::NotAtomic);
 }
+
+/// A subject of exactly 64 bytes whose entry names a BUMP (the parent's, which
+/// does not carry it): the library takes it as unproven, and so does the
+/// reading: no proof is handed over.
+#[test]
+fn a_64_byte_subject_is_handed_over_without_a_proof() {
+    use bsv_sdk::primitives::sha256d;
+    use support::beef_chain::{funding, varint};
+    let parent = funding();
+    let mut subject = 1u32.to_le_bytes().to_vec();
+    subject.push(1);
+    subject.extend_from_slice(&funding_root());
+    subject.extend_from_slice(&[0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 1]);
+    subject.extend_from_slice(&1000u64.to_le_bytes());
+    subject.extend_from_slice(&[4, 0x51, 0x61, 0x61, 0x61, 0, 0, 0, 0]);
+    assert_eq!(subject.len(), 64);
+    let subject_id = sha256d(&subject);
+    let mut beef = 0x0101_0101u32.to_le_bytes().to_vec();
+    beef.extend_from_slice(&subject_id);
+    beef.extend_from_slice(&0xefbe_0002u32.to_le_bytes());
+    beef.push(1);
+    beef.extend(varint(HEIGHT));
+    beef.extend_from_slice(&[1, 1, 0, 2]);
+    beef.extend_from_slice(&funding_root());
+    beef.push(2);
+    beef.extend_from_slice(&[1, 0]);
+    beef.extend_from_slice(&parent);
+    beef.extend_from_slice(&[1, 0]);
+    beef.extend_from_slice(&subject);
+    let size = beef.len() as u64;
+    let mut source = Chunked {
+        inner: std::io::Cursor::new(beef),
+        size: 7,
+    };
+    let read = block_on(read_at_rest(&mut source, &ChainHeaders::honest(), size)).unwrap();
+    assert_eq!(read.txid, display(&subject_id));
+    assert_eq!(read.raw_tx, subject);
+    assert!(!read.has_proof);
+}

@@ -48,6 +48,15 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::services::chaintracker::HeaderService;
 
+/// Whether the door takes a subject as proven by the BUMP its entry names
+/// (`bump_named`): a transaction of exactly 64 bytes is never taken as proven
+/// by a merkle path: the library judges it as an unproven transaction, and so
+/// does this door. Both forms of `internalizeAction` ask it, the inline and
+/// the at-rest.
+pub fn bump_proves_subject(raw_tx: &[u8], bump_named: bool) -> bool {
+    bump_named && raw_tx.len() != 64
+}
+
 // =============================================================================
 // The argument
 // =============================================================================
@@ -134,7 +143,8 @@ pub struct AtRestReading {
     pub lock_time: u32,
     /// Each output's satoshis and locking script.
     pub outputs: Vec<(u64, Vec<u8>)>,
-    /// The subject carries a BUMP of its own.
+    /// The subject carries a BUMP of its own and is not 64 bytes long
+    /// (`bump_proves_subject`).
     pub has_proof: bool,
     pub bytes_read: u64,
 }
@@ -434,8 +444,8 @@ pub async fn read_at_rest<S: AsyncByteSource, H: HeaderService>(
         version: body.version,
         lock_time: body.lock_time,
         outputs,
+        has_proof: bump_proves_subject(&body.raw, has_proof),
         raw_tx: body.raw,
-        has_proof,
         bytes_read: tee.read,
     })
 }
@@ -632,4 +642,22 @@ pub async fn read_small(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bump_proves_subject;
+
+    #[test]
+    fn a_subject_of_exactly_64_bytes_is_never_proven_by_a_bump() {
+        for len in [63usize, 64, 65] {
+            let raw = vec![0u8; len];
+            assert!(!bump_proves_subject(&raw, false), "{len} bytes, no BUMP");
+            assert_eq!(
+                bump_proves_subject(&raw, true),
+                len != 64,
+                "{len} bytes, a BUMP"
+            );
+        }
+    }
 }

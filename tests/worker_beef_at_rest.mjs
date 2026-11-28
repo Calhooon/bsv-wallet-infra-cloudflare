@@ -128,6 +128,8 @@ let carry = true
 // is recorded: the host, the content type and length, the bytes' SHA-256.
 let arcAnswers = false
 const posts = []
+// The bodies of those posts, in the same order.
+const postBodies = []
 // While `arcOver` names an answer, ARC answers each post with it followed by
 // 1,300,000 spaces: past the answer bound (1,294,336 bytes at the default
 // figure), an answer that read whole would accept (`seen`) or refuse (`rejected`).
@@ -152,6 +154,7 @@ const outbound = async request => {
       lead: bytes?.subarray(0, 4).toString('hex'),
       sha: bytes && createHash('sha256').update(bytes).digest('hex'),
     })
+    postBodies.push(bytes)
     return new Response(JSON.stringify({ txid: '', txStatus: 'SEEN_ON_NETWORK' }),
       { headers: { 'content-type': 'application/json' } })
   }
@@ -317,6 +320,62 @@ print(json.dumps(statements))
       while (notRead().length < 1 && Date.now() < deadline) await new Promise(r => setTimeout(r, 50))
       assert.ok(notRead().length >= 1, `${answer}: no line names the answer not read`)
       say(`inline, ARC's answer past the bound (${answer} if read whole): ${JSON.stringify(got)}, as an unanswered post; "${notRead()[0]}"`)
+    }
+  }
+
+  // 1d. A subject of exactly 64 bytes is taken as unproven, whatever BUMP its
+  // entry names (the library's rule, GHSA-jjhc-7hvh-c3hm): at rest with its
+  // entry naming the parent's BUMP, and inline carried by a BUMP of its own,
+  // its parent along. Each is recorded unproven, posted, and left to the
+  // monitor with a request; no proof is stored.
+  {
+    const SUBJECT_HEIGHT = HEIGHT + 2
+    // One input (funding:0, an empty unlock), one output of `sats` locked by
+    // 51 61 61 61: 64 bytes.
+    const tx64 = sats => {
+      const value = Buffer.alloc(8); value.writeBigUInt64LE(BigInt(sats))
+      const raw = Buffer.concat([u32(1), Buffer.from([1]), fundingRoot, u32(0), Buffer.from([0]), u32(0xffffffff),
+        Buffer.from([1]), value, Buffer.from([4, 0x51, 0x61, 0x61, 0x61]), u32(0)])
+      assert.equal(raw.length, 64)
+      return { raw, id: sha256d(raw) }
+    }
+    const parentBump = Buffer.concat([varint(HEIGHT), Buffer.from([1, 1, 0, 2]), fundingRoot])
+    const parentEntry = Buffer.concat([Buffer.from([1, 0]), funding])
+    const beefOf = (id, bumps, entries) => Buffer.concat([
+      u32(0x01010101), id, u32(0xefbe0002), varint(bumps.length), ...bumps, varint(entries.length), ...entries,
+    ])
+    const atRestSubject = tx64(1000)
+    const atRestBeef = beefOf(atRestSubject.id, [parentBump],
+      [parentEntry, Buffer.concat([Buffer.from([1, 0]), atRestSubject.raw])])
+    const inlineSubject = tx64(999)
+    const sibling = Buffer.alloc(32, 0x5a)
+    const ownBump = Buffer.concat([varint(SUBJECT_HEIGHT), Buffer.from([1, 2, 0, 2]), inlineSubject.id, Buffer.from([1, 0]), sibling])
+    rootAt.set(SUBJECT_HEIGHT, sha256d(Buffer.concat([inlineSubject.id, sibling])))
+    const inlineBeef = beefOf(inlineSubject.id, [parentBump, ownBump],
+      [parentEntry, Buffer.concat([Buffer.from([1, 1]), inlineSubject.raw])])
+    for (const [form, subject, beefArg] of [
+      ['at rest, its entry naming the parent\'s BUMP', atRestSubject, async () => ({ beefAtRest: await upload('02aa/w82-64-at-rest.beef', atRestBeef) })],
+      ['inline, a BUMP of its own', inlineSubject, async () => ({ tx: inlineBeef.toString('hex') })],
+    ]) {
+      const txid = display(subject.id)
+      postBodies.length = 0
+      arcAnswers = true
+      const r = await internalize(await beefArg(), `64 bytes ${form}`)
+      const carried = () => postBodies.filter(b => b && b.includes(subject.raw)).length
+      const deadline = Date.now() + 5000
+      while (carried() < 1 && Date.now() < deadline) await new Promise(r => setTimeout(r, 50))
+      arcAnswers = false
+      assert.ok(r.result && r.result.accepted, `${form}: ${JSON.stringify(r).slice(0, 600)}`)
+      assert.equal(r.result.txid, txid)
+      const tx = await db.prepare('SELECT status, proven_tx_id FROM transactions WHERE txid = ?').bind(txid).first()
+      assert.deepEqual([tx.status, tx.proven_tx_id], ['unproven', null], `${form}: ${JSON.stringify(tx)}`)
+      assert.equal(await db.prepare('SELECT COUNT(*) AS n FROM proven_txs WHERE txid = ?').bind(txid).first('n'), 0)
+      const req = await db.prepare('SELECT status FROM proven_tx_reqs WHERE txid = ?').bind(txid).first()
+      assert.equal(req?.status, 'unmined', `${form}: ${JSON.stringify(req)}`)
+      const output = await db.prepare('SELECT o.satoshis, b.name FROM outputs o JOIN output_baskets b ON b.basket_id = o.basket_id WHERE o.txid = ? AND o.vout = 0').bind(txid).first()
+      assert.equal(output?.name, 'nl7', `${form}: ${JSON.stringify(output)}`)
+      assert.ok(carried() >= 1, `${form}: the subject was not posted`)
+      say(`64 bytes, ${form}: accepted ${txid}; unproven, no proof stored, the request unmined; posted ${carried()} times`)
     }
   }
 
