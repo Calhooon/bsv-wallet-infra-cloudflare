@@ -231,22 +231,30 @@ print(json.dumps(statements))`], { input: readFileSync('migrations/' + name, 'ut
     assert.ok(event.length > BOUND)
     const n = await provenCount(), before = await req(viaCallback)
     const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }
+    // The Worker answers without reading the rest of the body, so the client
+    // may see its upload cut off before the answer reaches it; where the
+    // answer arrives, it is the acknowledgement.
+    const answerOf = async sent => {
+      try { const r = await sent; return { status: r.status, body: await r.json() } } catch (e) { return { transport: String(e?.cause?.code ?? e?.message ?? e) } }
+    }
+    const acknowledged = answer => {
+      if ('transport' in answer) return `the upload cut off at the client (${answer.transport})`
+      assert.equal(answer.status, 200); assert.deepEqual(answer.body, { ok: true, processed: 0 }); return '200 {"ok":true,"processed":0}'
+    }
     let since = logs.length
-    const declaredAnswer = await fetch(new URL('/arcade/callback', base), { method: 'POST', headers, body: event })
-    assert.equal(declaredAnswer.status, 200); assert.deepEqual(await declaredAnswer.json(), { ok: true, processed: 0 })
+    const declaredAnswer = acknowledged(await answerOf(fetch(new URL('/arcade/callback', base), { method: 'POST', headers, body: event })))
     const [declaredLine] = await waitFor(since, [notReadLine('arcade', 'callback')])
     assert.ok(declaredLine, 'no line for the declared body'); assert.deepEqual(readOf(declaredLine), { how: 'declared', n: Buffer.byteLength(event) })
     since = logs.length
     const head = JSON.stringify(fields).slice(0, -1) + ',"pad":"'
     const body = streamed(STREAM_TOTAL, head, '"}')
-    const streamedAnswer = await mf.dispatchFetch(new URL('/arcade/callback', base), { method: 'POST', headers, body, duplex: 'half' })
-    assert.equal(streamedAnswer.status, 200); assert.deepEqual(await streamedAnswer.json(), { ok: true, processed: 0 })
+    const streamedAnswer = acknowledged(await answerOf(mf.dispatchFetch(new URL('/arcade/callback', base), { method: 'POST', headers, body, duplex: 'half' })))
     const [streamedLine] = await waitFor(since, [notReadLine('arcade', 'callback')])
     assert.ok(streamedLine, 'no line for the streamed body')
     const r = readOf(streamedLine); assert.equal(r.how, 'read'); assert.ok(r.n > BOUND && r.n < STREAM_TOTAL, streamedLine)
     assert.equal(await provenCount(), n); assert.equal(await proven(viaCallback), null)
     assert.deepEqual(await req(viaCallback), before); assert.equal((await holds(viaCallback)).length, 0)
-    console.log(`  ${declaredLine}; ${streamedLine} (of ${STREAM_TOTAL} streamed)`)
+    console.log(`  ${declaredLine} (answer: ${declaredAnswer}); ${streamedLine} (of ${STREAM_TOTAL} streamed; answer: ${streamedAnswer})`)
   })
   await check("j Arcade's stored record over the bound, declared and streamed, is not read past it: the event is acknowledged and ignored, nothing written, the request keeps its state", async () => {
     const n = await provenCount(), before = await req(viaRecord)
