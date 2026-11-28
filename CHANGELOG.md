@@ -4,6 +4,30 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.5, 2026-11-28: the script check runs under a stack-memory budget
+
+### Changed
+
+- **The local script check runs under a stack-memory budget of 1,000,000
+  bytes** (`tracker_rule::SCRIPT_MEMORY_LIMIT`). The check behind `internalizeAction`,
+  `processAction` and `updateTransactionStatusAfterBroadcast` passes the
+  budget to every `Spend` it builds; the count is the interpreter's under the
+  block word (both stacks, each element with its per-element overhead). A
+  script whose stacks would pass the budget is declined by the interpreter as
+  a resource limit, which the check answers as no verdict, as it answers any
+  local resource limit: the broadcaster's answer decides, and no transaction
+  is refused for it. A host that verifies a caller's script in a
+  memory-limited isolate sets such a budget (GHSA-7vx5-cf5p-5c48). The lock
+  is unchanged (bsv-rs 0.8.11); no migration, no `wrangler.toml` change.
+
+### Tests
+
+- `storage::tracker_rule::tests`: a spend whose stack passes the budget is
+  no verdict; a small script keeps its verdict (with `tests/tracker_rule.rs`,
+  which pins the honest verdicts); one element filling the budget exactly is
+  judged and one byte more is declined, so the check runs under the named
+  budget.
+
 ## 0.7.4, 2026-11-27: one row per payment under concurrent calls
 
 ### Changed
