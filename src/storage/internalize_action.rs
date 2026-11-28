@@ -130,6 +130,41 @@ const COMPENSATE_REQ_SQL: &str = "INSERT INTO proven_tx_reqs ( \
      ) SELECT ?, 'invalid', 0, '{}', '{}', 0, ?, NULL, ?, ? \
        WHERE NOT EXISTS (SELECT 1 FROM proven_tx_reqs WHERE txid = ?)";
 
+/// A refusal held on the request for its txid: the answer the call gave,
+/// kept under the history's own `refusalHeld` key (the notes, which keep the
+/// newest 32, are not where it lives). Never on a `completed` request.
+/// Binds: when, answer, txid.
+const RECORD_REFUSAL_HELD_SQL: &str = "UPDATE proven_tx_reqs SET history = json_set(\
+    CASE WHEN json_valid(history) AND json_type(history) = 'object' THEN history \
+         ELSE json_object('previous', history) END, \
+    '$.refusalHeld', json_object('when', ?, 'answer', ?)) \
+     WHERE txid = ? AND status != 'completed'";
+
+/// The answer a held refusal gave, while the request for the txid is not
+/// `completed` and the caller's row (bound second) is neither `completed`
+/// nor proven. `REFUSAL_HELD_ON_MERGE_SQL` holds while none of that row's
+/// outputs is credited; `REFUSAL_HELD_ON_NEW_ROW_SQL`, for a row just
+/// written, while no other row's output of the txid is.
+/// Binds: txid, transaction_id, transaction_id.
+macro_rules! refusal_held_answer_sql {
+    ($outputs:literal) => {
+        concat!(
+            "SELECT json_extract(r.history, '$.refusalHeld.answer') AS answer \
+             FROM proven_tx_reqs r \
+             WHERE r.txid = ? AND r.status != 'completed' \
+               AND json_valid(r.history) AND json_type(r.history, '$.refusalHeld.answer') = 'text' \
+               AND NOT EXISTS (SELECT 1 FROM transactions t \
+                     WHERE t.transaction_id = ? AND (t.status = 'completed' OR t.proven_tx_id IS NOT NULL)) \
+               AND NOT EXISTS (SELECT 1 FROM outputs o \
+                     WHERE o.txid = r.txid AND o.spendable = 1 AND o.transaction_id ",
+            $outputs,
+            " ?) LIMIT 1"
+        )
+    };
+}
+const REFUSAL_HELD_ON_MERGE_SQL: &str = refusal_held_answer_sql!("=");
+const REFUSAL_HELD_ON_NEW_ROW_SQL: &str = refusal_held_answer_sql!("!=");
+
 /// What the second source says of a txid the broadcaster refused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NetworkWord {
@@ -285,9 +320,11 @@ enum PostOutcome {
     /// queued `unsent` for the monitor's re-announce.
     PolicyHeld,
     /// The broadcaster refused it (double-spend or invalid) and the second
-    /// source could not be asked (an error): a hold, as a transient fault
-    /// is, but never credited, whatever INTERNALIZE_ZERO_CONF says.
-    RefusalHeld,
+    /// source could not be asked (an error): the rows are held, as a
+    /// transient fault's are, but never credited, whatever
+    /// INTERNALIZE_ZERO_CONF says, and the call is answered with this
+    /// message, the refusal's own.
+    RefusalHeld(String),
     /// The broadcaster refused it (double-spend or invalid) and the second
     /// source answered that it does not know it: the call is refused with
     /// this message.
@@ -677,6 +714,15 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
 
         if let Some(ref etx) = existing_tx {
             validate_merge_status(&etx.status)?;
+            // A row held on a refusal, with nothing credited: the call is
+            // answered as the presentation that wrote it was, before any
+            // write.
+            if let Some(answer) = self
+                .refusal_held_answer(REFUSAL_HELD_ON_MERGE_SQL, &txid, etx.transaction_id)
+                .await?
+            {
+                return Err(Error::ValidationError(answer));
+            }
         }
 
         // Step 4: Extract and validate output specifications
@@ -1183,7 +1229,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
             // watch for confirmation.
             if !linked {
                 let post = match self
-                    .create_proven_tx_req(&txid, &raw_tx, &beef, has_proof)
+                    .create_proven_tx_req(&txid, &raw_tx, &beef, has_proof, transaction_id)
                     .await
                 {
                     Ok(post) => post,
@@ -1236,7 +1282,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 let demote = match post {
                     PostOutcome::Sent | PostOutcome::Rejected(_) => false,
                     PostOutcome::Transient => !self.internalize_zero_conf,
-                    PostOutcome::PolicyHeld | PostOutcome::RefusalHeld => true,
+                    PostOutcome::PolicyHeld | PostOutcome::RefusalHeld(_) => true,
                 };
 
                 if demote {
@@ -1299,6 +1345,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     );
                 }
                 restore?;
+                if let PostOutcome::RefusalHeld(reason) = post {
+                    // The rows stay held without credit; the caller is
+                    // answered the refusal.
+                    return Err(Error::ValidationError(reason));
+                }
             }
         }
 
@@ -1552,6 +1603,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         raw_tx: &[u8],
         input_beef: &BeefBlob<'_>,
         has_verified_proof: bool,
+        transaction_id: i64,
     ) -> Result<PostOutcome> {
         #[derive(Deserialize)]
         #[allow(dead_code)]
@@ -1566,6 +1618,17 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 .await?;
 
         if existing.is_some() {
+            // A refusal held on the standing request, with nothing credited:
+            // this call's rows are held as that call's were, and it is
+            // answered the same.
+            if !has_verified_proof {
+                if let Some(answer) = self
+                    .refusal_held_answer(REFUSAL_HELD_ON_NEW_ROW_SQL, txid, transaction_id)
+                    .await?
+                {
+                    return Ok(PostOutcome::RefusalHeld(answer));
+                }
+            }
             return Ok(PostOutcome::Sent);
         }
 
@@ -1646,9 +1709,13 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         );
                         PostOutcome::Sent
                     }
-                    // The second source gave no answer: a hold, as a
-                    // transient fault is; the monitor re-asks.
-                    NetworkWord::Unavailable => PostOutcome::RefusalHeld,
+                    // The second source gave no answer: the rows are held, as
+                    // a transient fault's are, and the caller is answered the
+                    // refusal; the monitor re-asks.
+                    NetworkWord::Unavailable => PostOutcome::RefusalHeld(format!(
+                        "Transaction {} rejected by network (double-spend): {}",
+                        txid, msg
+                    )),
                     NetworkWord::DoesNotKnow => {
                         return Ok(PostOutcome::Rejected(format!(
                             "Transaction {} rejected by network (double-spend): {}",
@@ -1668,7 +1735,10 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                         );
                         PostOutcome::Sent
                     }
-                    NetworkWord::Unavailable => PostOutcome::RefusalHeld,
+                    NetworkWord::Unavailable => PostOutcome::RefusalHeld(format!(
+                        "Transaction {} rejected by network (invalid tx): {}",
+                        txid, msg
+                    )),
                     NetworkWord::DoesNotKnow => {
                         return Ok(PostOutcome::Rejected(format!(
                             "Transaction {} rejected by network (invalid tx): {}",
@@ -1736,8 +1806,46 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
         if let Some(note) = policy_hint {
             super::tracker_rule::append_note(self.db, txid, note).await?;
         }
+        if let PostOutcome::RefusalHeld(answer) = &post {
+            // Best-effort: the caller's rows are held below whatever this
+            // write returns.
+            if let Err(e) = Query::new(RECORD_REFUSAL_HELD_SQL)
+                .bind(now.to_rfc3339())
+                .bind(answer.as_str())
+                .bind(txid)
+                .execute(self.db)
+                .await
+            {
+                worker::console_error!(
+                    "internalize: the held refusal of {} was not recorded on its request: {}",
+                    txid,
+                    e
+                );
+            }
+        }
 
         Ok(post)
+    }
+
+    /// The answer of a refusal held on the request for `txid`, for the
+    /// caller's row `transaction_id` (`refusal_held_answer_sql!`).
+    async fn refusal_held_answer(
+        &self,
+        sql: &str,
+        txid: &str,
+        transaction_id: i64,
+    ) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct AnswerRow {
+            answer: Option<String>,
+        }
+        let row: Option<AnswerRow> = Query::new(sql)
+            .bind(txid)
+            .bind(transaction_id)
+            .bind(transaction_id)
+            .fetch_optional(self.db)
+            .await?;
+        Ok(row.and_then(|r| r.answer))
     }
 
     /// The second source's word on a txid the broadcaster refused: known,
@@ -3724,6 +3832,107 @@ mod tests {
             0,
             "a row carrying a proof is never failed"
         );
+    }
+
+    #[test]
+    fn test_a_held_refusal_is_answered_while_nothing_is_credited() {
+        let conn = mk_db();
+        let answer = "Transaction t rejected by network (invalid tx): refused";
+        conn.execute_batch(&format!(
+            "INSERT INTO transactions (transaction_id, user_id, reference, status, is_outgoing, description, txid)
+             VALUES (100, {MK_CALLER}, 'held', 'unproven', 0, 'held', 't'),
+                    (101, {MK_OWNER}, 'other', 'unproven', 0, 'other', 't');
+             INSERT INTO outputs (output_id, user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, spendable, change)
+             VALUES (1000, {MK_CALLER}, 100, {MK_CALLER_BASKET}, 0, 1000, 'storage', 'change', 'P2PKH', 't', 0, 1),
+                    (1001, {MK_OWNER}, 101, {MK_OWNER_BASKET}, 0, 1000, 'storage', 'change', 'P2PKH', 't', 1, 1);
+             INSERT INTO proven_tx_reqs (txid, status, raw_tx, history) VALUES ('t', 'unmined', x'00', 'attempted 3 times');"
+        ))
+        .unwrap();
+        let read = |sql: &str, tx: i64| -> Option<String> {
+            conn.query_row(sql, rusqlite::params!["t", tx, tx], |r| r.get(0))
+                .ok()
+        };
+        // Nothing recorded: nothing answered.
+        assert_eq!(read(REFUSAL_HELD_ON_MERGE_SQL, 100), None);
+        conn.execute(
+            RECORD_REFUSAL_HELD_SQL,
+            rusqlite::params!["now", answer, "t"],
+        )
+        .unwrap();
+        // A history that was not an object is kept under `previous`.
+        let history: String = conn
+            .query_row(
+                "SELECT history FROM proven_tx_reqs WHERE txid = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let history: serde_json::Value = serde_json::from_str(&history).unwrap();
+        assert_eq!(history["previous"], "attempted 3 times");
+        assert_eq!(history["refusalHeld"]["answer"], answer);
+        // The caller's row, its outputs not credited: answered.
+        assert_eq!(
+            read(REFUSAL_HELD_ON_MERGE_SQL, 100).as_deref(),
+            Some(answer)
+        );
+        // A new row while another row's output of the txid is credited: not.
+        assert_eq!(read(REFUSAL_HELD_ON_NEW_ROW_SQL, 100), None);
+        conn.execute(
+            "UPDATE outputs SET spendable = 0 WHERE output_id = 1001",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            read(REFUSAL_HELD_ON_NEW_ROW_SQL, 100).as_deref(),
+            Some(answer)
+        );
+        // The caller's own output credited: the merge is not answered so.
+        conn.execute(
+            "UPDATE outputs SET spendable = 1 WHERE output_id = 1000",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read(REFUSAL_HELD_ON_MERGE_SQL, 100), None);
+        assert_eq!(
+            read(REFUSAL_HELD_ON_NEW_ROW_SQL, 100).as_deref(),
+            Some(answer)
+        );
+        conn.execute(
+            "UPDATE outputs SET spendable = 0 WHERE output_id = 1000",
+            [],
+        )
+        .unwrap();
+        // The caller's row proven: not answered.
+        conn.execute(
+            "UPDATE transactions SET status = 'completed' WHERE transaction_id = 100",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read(REFUSAL_HELD_ON_MERGE_SQL, 100), None);
+        conn.execute(
+            "UPDATE transactions SET status = 'unproven' WHERE transaction_id = 100",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            read(REFUSAL_HELD_ON_MERGE_SQL, 100).as_deref(),
+            Some(answer)
+        );
+        // The request completed: not answered, and never recorded again.
+        conn.execute(
+            "UPDATE proven_tx_reqs SET status = 'completed' WHERE txid = 't'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read(REFUSAL_HELD_ON_MERGE_SQL, 100), None);
+        assert_eq!(read(REFUSAL_HELD_ON_NEW_ROW_SQL, 100), None);
+        let changed = conn
+            .execute(
+                RECORD_REFUSAL_HELD_SQL,
+                rusqlite::params!["later", answer, "t"],
+            )
+            .unwrap();
+        assert_eq!(changed, 0);
     }
 
     #[test]

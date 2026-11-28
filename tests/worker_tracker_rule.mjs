@@ -567,7 +567,7 @@ try {
 // fixture's user) holds a confirmed coin; the caller (A, another identity) internalizes a
 // transaction naming it. Every row of the owner and its balance are read before and after.
 let markArcade = 'accept', markWoc = 'unknown', markPosts = 0
-const markProofs = new Map(), markMined = new Set()
+const markProofs = new Map(), markMined = new Set(), markKnown = new Set(), markSpent = new Map()
 const marks = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.test', CHAINTRACKS_URL: 'https://headers.test', BEEF_VERIFICATION: 'strict', INTERNALIZE_ZERO_CONF: 'true' }, async request => {
   const url = new URL(request.url)
   const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -589,8 +589,10 @@ const marks = await boot({ BROADCASTER: 'arcade', ARCADE_URL: 'https://arcade.te
   if (url.host === 'api.whatsonchain.com' && request.method === 'POST' && url.pathname.endsWith('/txs/status')) {
     const { txids } = JSON.parse(await request.text())
     if (markWoc === 'error' && !txids.some(t => markMined.has(t))) return new Response('local fixture refusal', { status: 400 })
-    return json(txids.map(t => markMined.has(t) ? { txid: t, blockhash: 'cd'.repeat(32), blockheight: 900100, confirmations: 1 } : { txid: t, error: 'unknown' }))
+    return json(txids.map(t => markMined.has(t) ? { txid: t, blockhash: 'cd'.repeat(32), blockheight: 900100, confirmations: 1 } : markKnown.has(t) ? { txid: t } : { txid: t, error: 'unknown' }))
   }
+  const spent = url.host === 'api.whatsonchain.com' && request.method === 'GET' && url.pathname.match(/\/tx\/([0-9a-f]{64})\/(\d+)\/spent$/)
+  if (spent) return markSpent.has(`${spent[1]}:${spent[2]}`) ? json({ txid: markSpent.get(`${spent[1]}:${spent[2]}`), vin: 0, status: 'unconfirmed' }) : new Response('not found', { status: 404 })
   const m = url.pathname.match(/^\/v1\/tx\/([0-9a-f]{64})$/)
   if (url.host.startsWith('arc.') && request.method === 'GET' && m && markProofs.has(m[1])) {
     const p = markProofs.get(m[1])
@@ -680,8 +682,9 @@ try {
       await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", owner, tx, ownerBasket, txid(t), Buffer.from([0x51]))
       const r = await unchanged(`mk5 ${label}`, () => take(withParent(c, t), n))
       if (woc === 'error') {
-        // A refusal the second source could not answer: held, the caller's output not credited.
-        assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
+        // A refusal the second source could not answer: answered the refusal, the caller's row held, its output not credited.
+        assert.ok(r.error, JSON.stringify(r)); assert.equal(r.error.code, -32602); assert.match(r.error.message, /rejected by network \(invalid tx\)/)
+        assert.equal((await callerTx(txid(t))).status, 'unproven')
         const held = await marks.db.prepare('SELECT o.spendable FROM outputs o JOIN users u ON u.user_id = o.user_id WHERE o.txid = ? AND u.identity_key = ?').bind(txid(t), callerKey.toPublicKey().toString()).first()
         assert.equal(held.spendable, 0)
       }
@@ -734,6 +737,77 @@ try {
     assert.ok(await marks.db.prepare('SELECT 1 FROM proven_txs WHERE txid = ?').bind(id).first(), 'the proof was not stored')
     assert.deepEqual({ ...(await coinRow(real.c)) }, { spendable: 0, spent_by: null })
     assert.equal(await ownerBalance(), balance - 1000)
+  })
+  // A refusal the second source cannot answer: the caller is answered the refusal, as a
+  // refusal is answered, and the rows are held without credit until the proof or the failure.
+  const callerId = (await marks.db.prepare('SELECT user_id FROM users WHERE identity_key = ?').bind(callerKey.toPublicKey().toString()).first()).user_id
+  const callerBalance = async () => (await caller('getBalance', [{ identityKey: '' }, { basket: 'default' }])).result.balance
+  const heldRows = async (t, user = callerId) => ({
+    tx: (await marks.db.prepare('SELECT status FROM transactions WHERE txid = ? AND user_id = ?').bind(t, user).first())?.status,
+    spendable: (await marks.db.prepare('SELECT spendable FROM outputs WHERE txid = ? AND user_id = ?').bind(t, user).first())?.spendable,
+    req: (await marks.db.prepare('SELECT status FROM proven_tx_reqs WHERE txid = ?').bind(t).first())?.status,
+    hold: JSON.parse((await marks.db.prepare('SELECT history FROM proven_tx_reqs WHERE txid = ?').bind(t).first())?.history ?? '{}').refusalHeld?.answer ?? null,
+  })
+  const refusal = r => { assert.ok(r.error, JSON.stringify(r)); assert.equal(r.error.code, -32602, JSON.stringify(r)); assert.match(r.error.message, /^Transaction [0-9a-f]{64} rejected by network \(invalid tx\): /); return r }
+  let held
+  await check('mk9 the broadcaster refuses and the second source errs: answered the refusal (-32602, "rejected by network"); the row held (`unproven`), its output not offered (`spendable 0`), its request `unmined`; the owner\'s rows and balance as they were', async () => {
+    markArcade = 'invalid'; markWoc = 'error'
+    const c = await coin(311); const subject = spendOf(c, 312)
+    const balance = await callerBalance()
+    const r = refusal(await unchanged('mk9', () => take(withParent(c, subject), 311)))
+    // v0.7.5's answer for this case, byte for byte.
+    assert.equal(JSON.stringify(r.error), JSON.stringify({ code: -32602, message: `Transaction ${txid(subject)} rejected by network (invalid tx): Arcade submit HTTP 400: {"error":"local fixture structural refusal"}` }))
+    assert.deepEqual(await heldRows(txid(subject)), { tx: 'unproven', spendable: 0, req: 'unmined', hold: r.error.message })
+    assert.equal(await callerBalance(), balance)
+    held = { c, subject, first: JSON.stringify(r.error), balance }
+  })
+  await check('mk10 the same transaction presented again while its row is held without credit, by the caller and by another user: answered as the first presentation was, nothing announced, nothing credited', async () => {
+    assert.ok(held, 'no hold from mk9')
+    const posts = markPosts, t = txid(held.subject)
+    const again = await unchanged('mk10 again', () => take(withParent(held.c, held.subject), 311))
+    assert.equal(JSON.stringify(again.error), held.first, JSON.stringify(again))
+    const otherKey = PrivateKey.fromRandom(), other = marks.session(otherKey)
+    const otherUser = (await other('findOrInsertUser', [otherKey.toPublicKey().toString()])).result.user.userId
+    const theirs = await unchanged('mk10 another user', () => other('internalizeAction', [{ identityKey: '' }, { tx: withParent(held.c, held.subject).toString('hex'), outputs: [{ outputIndex: 0, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: 'cHJlZml4', derivationSuffix: Buffer.from('m311b').toString('base64'), senderIdentityKey: sender } }], description: 'marks', labels: [], seekPermission: false }]))
+    assert.equal(JSON.stringify(theirs.error), held.first, JSON.stringify(theirs))
+    assert.equal(markPosts, posts, 'a held presentation was announced')
+    assert.deepEqual(await heldRows(t), { tx: 'unproven', spendable: 0, req: 'unmined', hold: JSON.parse(held.first).message })
+    assert.deepEqual({ ...(await heldRows(t, otherUser)), hold: null }, { tx: 'unproven', spendable: 0, req: 'unmined', hold: null })
+    assert.equal((await marks.db.prepare('SELECT COUNT(*) AS c FROM transactions WHERE txid = ? AND user_id = ?').bind(t, callerId).first()).c, 1)
+    assert.equal(await callerBalance(), held.balance)
+    held.otherUser = otherUser
+  })
+  await check('mk11 the held transaction\'s checked proof is stored: its row `completed`, its output offered, the caller credited once; presented again, accepted as a merge with nothing more credited', async () => {
+    assert.ok(held, 'no hold from mk9')
+    const t = txid(held.subject), leaf = hash(held.subject), sibling = Buffer.alloc(32, 0x5c), height = 900300
+    const path = Buffer.concat([Buffer.from([0xfe]), u32(height), Buffer.from([1, 2, 0, 2]), leaf, Buffer.from([1, 0]), sibling])
+    roots.set(height, display(hash(Buffer.concat([leaf, sibling]))))
+    markProofs.set(t, { hex: path.toString('hex'), height }); markMined.add(t); markWoc = 'unknown'
+    const response = await marks.mf.dispatchFetch(new URL('/monitor/run?key=fixture-monitor', marks.base), { method: 'POST' })
+    assert.equal(response.status, 200, await response.text())
+    assert.deepEqual({ ...(await heldRows(t)), hold: null }, { tx: 'completed', spendable: 1, req: 'completed', hold: null })
+    assert.equal(await callerBalance(), held.balance + 1000)
+    const r = await take(withParent(held.c, held.subject), 311)
+    assert.ok(r.result, JSON.stringify(r))
+    assert.deepEqual([r.result.accepted, r.result.isMerge, r.result.satoshis], [true, true, 0])
+    assert.equal(await callerBalance(), held.balance + 1000)
+  })
+  await check('mk12 a held transaction failed by its request\'s own road (a confirmed double spend at the monitor\'s escalation): its rows `failed`, its output never offered; presented again, refused', async () => {
+    markArcade = 'invalid'; markWoc = 'error'
+    const c = await coin(321); const subject = spendOf(c, 322), t = txid(subject)
+    refusal(await take(withParent(c, subject), 321))
+    assert.deepEqual({ ...(await heldRows(t)), hold: null }, { tx: 'unproven', spendable: 0, req: 'unmined', hold: null })
+    // The coin is spent on the network by another transaction the network knows.
+    const spender = spendOf(c, 323)
+    markKnown.add(txid(spender)); markSpent.set(`${txid(c.parent)}:0`, txid(spender))
+    await marks.exec("INSERT INTO proven_tx_reqs (txid, raw_tx, status) VALUES (?, ?, 'unmined')", txid(spender), spender)
+    await marks.exec('UPDATE proven_tx_reqs SET attempts = 3 WHERE txid = ?', t)
+    markWoc = 'unknown'
+    const response = await marks.mf.dispatchFetch(new URL('/monitor/run?key=fixture-monitor', marks.base), { method: 'POST' })
+    assert.equal(response.status, 200, await response.text())
+    assert.deepEqual({ ...(await heldRows(t)), hold: null }, { tx: 'failed', spendable: 0, req: 'doubleSpend', hold: null })
+    const r = await take(withParent(c, subject), 321)
+    assert.ok(r.error, JSON.stringify(r)); assert.equal(r.result, undefined)
   })
 } finally { await marks.mf.dispose() }
 console.log(`Tracker Worker witnesses: ${ran - failed} passed; ${failed} failed`)
