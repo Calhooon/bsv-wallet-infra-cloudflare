@@ -4,6 +4,27 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.8, 2026-11-28: the monitor's reorg passes store a proof only after it is checked
+
+### Changed
+
+- **The monitor's two reorg passes store a provider's proof only after it is
+  checked.** The hourly shallow sweep and the pass on a drop of the chain's
+  height check a provider's proof against the transaction's own txid and the
+  header service's root at that height before they store it. A stored row
+  takes the check's own height, index and root; a proof that is not stored
+  leaves the row as it is and is named in one log line (the txid, the
+  provider, the reason).
+- **On a drop of the chain's height, a stored proof whose root the header
+  service no longer carries at its height is replaced only by a checked proof
+  from a provider.** Otherwise the row and its request are left as they are,
+  the pass records the row as the deep sweep does (`deep_reorg_unrepaired`),
+  and the deep sweep asks for a proof again on each of its passes. When the
+  header service does not answer, nothing is changed and nothing is stored.
+  Neither pass writes a request, a transaction or an output.
+- **Proof answers carry the name of the provider that gave them**, for the
+  monitor's log lines.
+
 ## 0.7.7, 2026-11-28: a door reads at most 600 KiB of a payment's bytes
 
 ### Changed
