@@ -63,7 +63,7 @@ const DEEP_CURSOR_INSERT_SQL: &str =
 
 /// Distinct proof groups above the cursor, ascending. Served by
 /// `idx_proven_txs_height_pair` (migration 0004) when present; correct without it.
-/// Rows nulled by `handle_reorg` (block_hash = '') are owned by check_for_proofs.
+/// Rows with no stored block hash (block_hash = '') hold no proof to judge and are skipped.
 const DEEP_PAIRS_AFTER_SQL: &str = "SELECT height, block_hash, merkle_root, COUNT(*) AS n \
      FROM proven_txs \
      WHERE height > ? AND block_hash IS NOT NULL AND block_hash != '' \
