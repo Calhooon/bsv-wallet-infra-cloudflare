@@ -4,6 +4,37 @@ The tag is the release of record. From 0.4.2 on, the crate on crates.io,
 `bsv-wallet-infra-cloudflare`, carries the tag's version; entries before it
 are named by their program and their date, and the manifest then read 0.1.0.
 
+## 0.7.9, 2026-11-28: bsv-rs 0.8.15
+
+### Changed
+
+- **bsv-rs `0.8.15`** (the caret, from `0.8.11`), the newest 0.8 on the index;
+  bsv-middleware-cloudflare stays `=0.7.2` and the lock holds one bsv-rs. The
+  lock moves bsv-rs and this crate's own version, nothing else. The published
+  advisories of bsv-rs this release takes, by the release that carries each
+  fix: 0.8.12, GHSA-33fm-jcm5-4m3m; 0.8.13, GHSA-j4w5-4g84-q3f4; 0.8.14,
+  GHSA-wh67-gjx6-4qqh, GHSA-56fp-4337-6vfh, GHSA-7vx5-cf5p-5c48,
+  GHSA-63w6-rpmj-r9gg, GHSA-grrj-gwrr-v7r3, GHSA-mqr8-3gvc-hhg3,
+  GHSA-fm3p-cmwv-rf6h, GHSA-4gp5-q4cj-4qjf, GHSA-33px-hj7f-4cpj and
+  GHSA-43mf-m7fg-m74w; 0.8.15, GHSA-pfv3-7r7f-mhgh, GHSA-f2rq-878r-pgxv,
+  GHSA-mp9c-g2q9-q3qw, GHSA-jx5m-j63r-7fgw, GHSA-jgrp-wvcx-vxf3 and
+  GHSA-jjhc-7hvh-c3hm.
+- **The estimate's constants are measured against bsv-rs 0.8.15's reader.**
+  The measure of a BEEF (`door::beef_measure`) counts, beside each BUMP's
+  leaves, the leaves that carry a hash, over every BUMP and in the BUMP that
+  carries the most; the estimate has a term for each. The four BUMP leaf
+  constants are the least that hold the estimate a fifth over every measured
+  parse of 0.8.15, rounded up. The budget (24 MiB), the payment figure and the refusals'
+  wire shapes are unchanged.
+- **Tests.** The many-leaves BUMP fixtures are as tall as their offsets need.
+  `tests/support/beef_shapes.rs` builds five more BUMP families (a row of
+  txids, leaves on every level of 64, txids on paths apart, one BUMP and
+  many); `tests/beef_measure.rs` holds the estimate over the measured parse
+  on every family at the payment figure and on the BUMP families at the sizes
+  between, and holds the largest payment the doors admit within the payment
+  figure, through `internalizeAction`'s steps, under the request ceiling.
+- No migration, no `wrangler.toml` change.
+
 ## 0.7.8, 2026-11-28: the monitor's reorg passes store a proof only after it is checked
 
 ### Changed
