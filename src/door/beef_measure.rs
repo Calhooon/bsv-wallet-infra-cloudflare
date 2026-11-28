@@ -6,13 +6,14 @@
 //! follows the number of elements as much as the number of bytes. Before a
 //! caller's bytes are parsed, [`measure`] walks them once in the BEEF layout
 //! (the version and the AtomicBEEF prefix, each BUMP with its levels and
-//! leaves, each transaction entry with its format byte, its inputs and its
-//! outputs) and counts what the parse's cost depends on, holding nothing
-//! proportional to the elements. [`estimate`] turns the counts into an upper
-//! bound of the heap `Beef::from_binary` followed by `Beef::sort_txs` reaches,
-//! and [`admit_beef`] refuses a BEEF whose estimate is over [`PARSE_BUDGET`].
+//! leaves and which of them carry a hash, each transaction entry with its
+//! format byte, its inputs and its outputs) and counts what the parse's cost
+//! depends on, holding nothing proportional to the elements. [`estimate`]
+//! turns the counts into an upper bound of the heap `Beef::from_binary`
+//! followed by `Beef::sort_txs` reaches, and [`admit_beef`] refuses a BEEF
+//! whose estimate is over [`PARSE_BUDGET`].
 //!
-//! The constants are measured, not derived: bsv-rs 0.8.11's parse and sort
+//! The constants are measured, not derived: bsv-rs 0.8.15's parse and sort
 //! under a counting allocator that charges every block its size plus 16 bytes
 //! (`tests/beef_measure.rs`, which holds the estimate over the measured peak on
 //! every shape it builds). A native build's types are at least as large as a
@@ -60,6 +61,10 @@ pub struct BeefCounts {
     pub bump_leaves: u64,
     /// The most leaves in any one BUMP.
     pub max_bump_leaves: u64,
+    /// BUMP leaves that carry a hash, over every BUMP.
+    pub bump_hashes: u64,
+    /// The most leaves that carry a hash in any one BUMP.
+    pub max_bump_hashes: u64,
     /// Transaction entries, txid-only ones among them.
     pub entries: u64,
     /// Txid-only entries.
@@ -113,14 +118,23 @@ const PER_INPUT: u64 = 950;
 const PER_OUTPUT: u64 = 175;
 const PER_BUMP: u64 = 64;
 const PER_BUMP_LEVEL: u64 = 230;
-const PER_BUMP_LEAF: u64 = 45;
+// The four BUMP leaf constants (the two below, `BUMP_PER_LEAF` and
+// `BUMP_PER_HASH`) are measured against bsv-rs 0.8.15's reader: the least that
+// hold the estimate a fifth over every measured parse, rounded up. They are
+// measured again at each bsv-rs pin: `tests/beef_measure.rs`,
+// `the_estimate_bounds_the_parse`, prints each shape's estimate over its
+// measured parse.
+const PER_BUMP_LEAF: u64 = 85;
+const PER_BUMP_HASH: u64 = 40;
 // The transient of one transaction's own parse (bsv-rs reads a raw entry twice).
 const TX_PER_PARSE: u64 = 256;
 const TX_PER_BYTE: u64 = 7;
 const TX_PER_INPUT: u64 = 32;
 const TX_PER_OUTPUT: u64 = 110;
-// The transient of one BUMP's own parse (its leaves sorted and indexed).
-const BUMP_PER_LEAF: u64 = 90;
+// The transient of one BUMP's own parse (its leaves sorted and indexed, its
+// root computed from every txid it carries).
+const BUMP_PER_LEAF: u64 = 510;
+const BUMP_PER_HASH: u64 = 355;
 
 fn tx_cost(tx: &TxCounts) -> u64 {
     TX_PER_PARSE
@@ -142,7 +156,9 @@ pub fn estimate(c: &BeefCounts) -> u64 {
         PER_BUMP.saturating_mul(c.bumps),
         PER_BUMP_LEVEL.saturating_mul(c.bump_levels),
         PER_BUMP_LEAF.saturating_mul(c.bump_leaves),
+        PER_BUMP_HASH.saturating_mul(c.bump_hashes),
         BUMP_PER_LEAF.saturating_mul(c.max_bump_leaves),
+        BUMP_PER_HASH.saturating_mul(c.max_bump_hashes),
         tx_cost(&c.largest_tx),
     ];
     terms.iter().fold(0u64, |a, t| a.saturating_add(*t))
@@ -281,6 +297,7 @@ fn walk(cur: &mut Cursor<'_>, c: &mut BeefCounts) -> Option<()> {
         c.bumps += 1;
         c.bump_levels += u64::from(height);
         let mut leaves_here = 0u64;
+        let mut hashes_here = 0u64;
         for _ in 0..height {
             let leaves = cur.varint()?;
             for _ in 0..leaves {
@@ -288,6 +305,9 @@ fn walk(cur: &mut Cursor<'_>, c: &mut BeefCounts) -> Option<()> {
                 let flags = cur.u8()?;
                 if flags & 1 == 0 {
                     cur.take(32)?;
+                    c.bump_hashes += 1;
+                    hashes_here += 1;
+                    c.max_bump_hashes = c.max_bump_hashes.max(hashes_here);
                 }
                 c.bump_leaves += 1;
                 leaves_here += 1;
@@ -470,6 +490,14 @@ mod tests {
         assert_eq!(c.bump_leaves, leaves);
         assert_eq!(c.bump_leaves, 5);
         assert_eq!(c.max_bump_leaves, 5);
+        // The leaves that carry a hash: the txid alone.
+        let hashes: u64 = beef
+            .bumps
+            .iter()
+            .map(|b| b.path.iter().flatten().filter(|l| l.hash.is_some()).count() as u64)
+            .sum();
+        assert_eq!(c.bump_hashes, hashes);
+        assert_eq!((c.bump_hashes, c.max_bump_hashes), (1, 1));
         assert_eq!(
             c.bump_levels,
             beef.bumps.iter().map(|b| b.path.len() as u64).sum::<u64>()
