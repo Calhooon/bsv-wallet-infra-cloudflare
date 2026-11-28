@@ -809,6 +809,28 @@ try {
     const r = await take(withParent(c, subject), 321)
     assert.ok(r.error, JSON.stringify(r)); assert.equal(r.result, undefined)
   })
+  // The restore of the caller's own coin errs on the held arms: the call answers that error,
+  // and the held transaction's outputs are demoted all the same.
+  for (const [label, arcade, woc, n, tx, req] of [['a policy refusal (465)', 'policy', 'unknown', 291, 'sending', 'unsent'], ['a refusal the second source cannot answer', 'invalid', 'error', 301, 'unproven', 'unmined']]) {
+    await check(`mk13 ${label} whose restore of the caller's own coin errs: the call answers the error; the transaction's output is not offered, its row \`${tx}\`, its request \`${req}\``, async () => {
+      markArcade = arcade; markWoc = woc
+      const myBasket = (await marks.db.prepare("SELECT basket_id FROM output_baskets WHERE user_id = ? AND name = 'default'").bind(callerId).first()).basket_id
+      const parent = raw(Buffer.alloc(32, n), 0x51, n)
+      roots.set(810000 + n, display(hash(parent)))
+      await marks.exec("INSERT INTO transactions (user_id, reference, status, is_outgoing, description, txid, raw_tx) VALUES (?, ?, 'completed', 0, 'caller coin', ?, ?)", callerId, `own-coin-${n}`, txid(parent), parent)
+      const ptx = (await marks.db.prepare('SELECT transaction_id FROM transactions WHERE reference = ?').bind(`own-coin-${n}`).first()).transaction_id
+      await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", callerId, ptx, myBasket, txid(parent), Buffer.from([0x51]))
+      const own = { parent, height: 810000 + n, output: (await marks.db.prepare('SELECT output_id FROM outputs WHERE transaction_id = ?').bind(ptx).first()).output_id }
+      const subject = spendOf(own, n + 1)
+      await marks.exec(`CREATE TRIGGER fixture_restore_errs BEFORE UPDATE OF spendable ON outputs WHEN OLD.output_id = ${Number(own.output)} AND NEW.spendable = 1 BEGIN SELECT RAISE(ABORT, 'fixture: the restore errs'); END`)
+      let r
+      try { r = await unchanged(`mk13 ${arcade}`, () => take(withParent(own, subject), n)) } finally { await marks.exec('DROP TRIGGER fixture_restore_errs') }
+      assert.deepEqual(r.error, { code: -32603, message: 'An internal error has occurred.' }, JSON.stringify(r))
+      assert.equal((await coinRow(own)).spendable, 0)
+      const rows = await heldRows(txid(subject))
+      assert.deepEqual([rows.tx, rows.spendable, rows.req], [tx, 0, req])
+    })
+  }
 } finally { await marks.mf.dispose() }
 console.log(`Tracker Worker witnesses: ${ran - failed} passed; ${failed} failed`)
 if (failed) process.exitCode = 1
