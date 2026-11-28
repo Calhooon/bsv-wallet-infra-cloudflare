@@ -3196,10 +3196,9 @@ mod tests {
 
     // =========================================================================
     // A coin's row is marked from a checked proof of its spender; a call
-    // takes back what it wrote unless its transaction is taken. The read's
-    // models M1 and M2 over the REAL migrations and the REAL statements: the
-    // statements one internalize call runs, in the order it runs them, for
-    // each outcome of its post.
+    // takes back what it wrote unless its transaction is taken. The
+    // statements one internalize call runs, over the real migrations, in the
+    // order it runs them, for each outcome of its post.
     // =========================================================================
 
     /// The other user (B), who holds the coin, and the caller (A).
@@ -3472,8 +3471,8 @@ mod tests {
     }
 
     #[test]
-    fn test_marks_m1_another_users_coin_is_left_on_every_outcome() {
-        // M1 (rows B1, B1'): the caller names the owner's coin as an input
+    fn test_marks_another_users_coin_is_left_on_every_outcome() {
+        // The caller names the owner's coin as an input
         // of its subject; the call writes nothing of the owner's on any
         // outcome of its post, and its own transitions are taken back on
         // every outcome but a take.
@@ -3506,7 +3505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_marks_m1_the_callers_own_coin_is_restored_unless_taken() {
+    fn test_marks_the_callers_own_coin_is_restored_unless_taken() {
         // The caller's own coin at the subject's input: marked by the call,
         // given back on every outcome but a take.
         for (post, end) in [
@@ -3540,7 +3539,7 @@ mod tests {
     }
 
     #[test]
-    fn test_marks_m1_a_real_spend_is_marked_at_its_proof() {
+    fn test_marks_a_real_spend_is_marked_at_its_proof() {
         // The legitimate spend of the owner's coin: the call leaves the
         // owner's row; the store of the subject's checked proof marks it,
         // from the stored bytes that hash to the proven txid.
@@ -3600,8 +3599,8 @@ mod tests {
     }
 
     #[test]
-    fn test_marks_m2_a_proven_row_of_another_user_is_left() {
-        // M2 (row B4): the owner's own mined payment T, `completed` with a
+    fn test_marks_a_proven_row_of_another_user_is_left() {
+        // The owner's own mined payment T, `completed` with a
         // checked proof and its request purged; the caller internalizes T's
         // bytes; the broadcaster refuses it.
         let setup = || {
