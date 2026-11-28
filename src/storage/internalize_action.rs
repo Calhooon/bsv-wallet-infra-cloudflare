@@ -339,7 +339,8 @@ struct Subject {
     lock_time: u32,
     /// Each output's satoshis and locking script.
     outputs: Vec<(u64, Vec<u8>)>,
-    /// The BEEF carries a BUMP for the subject itself.
+    /// The BEEF carries a BUMP for the subject itself and the subject is not
+    /// 64 bytes long (`crate::beef_at_rest::bump_proves_subject`).
     has_proof: bool,
 }
 
@@ -602,6 +603,7 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                 )));
             }
 
+            let raw_tx = tx.to_binary();
             Subject {
                 outputs: tx
                     .outputs
@@ -610,8 +612,11 @@ impl<'a, B: crate::services::BroadcastService + crate::services::ProofService> S
                     .collect(),
                 version: tx.version,
                 lock_time: tx.lock_time,
-                raw_tx: tx.to_binary(),
-                has_proof: beef.find_bump(&txid).is_some(),
+                has_proof: crate::beef_at_rest::bump_proves_subject(
+                    &raw_tx,
+                    beef.find_bump(&txid).is_some(),
+                ),
+                raw_tx,
                 txid,
             }
         };
@@ -1994,6 +1999,67 @@ pub(crate) fn generate_uuid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // The inline form's proof word for a subject of 64 bytes
+    // =========================================================================
+
+    /// A 64-byte subject carried by a BUMP of its own, its parent along (the
+    /// parent proven by a one-leaf BUMP): the BEEF finds the subject's BUMP,
+    /// and the inline form's word is still "no proof".
+    #[test]
+    fn a_64_byte_subject_found_in_a_bump_has_no_proof_inline() {
+        use bsv_sdk::primitives::sha256d;
+        let mut parent = vec![1, 0, 0, 0, 1];
+        parent.extend_from_slice(&[0xaa; 32]);
+        parent.extend_from_slice(&[0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 2]);
+        for _ in 0..2 {
+            parent.extend_from_slice(&1000u64.to_le_bytes());
+            parent.extend_from_slice(&[1, 0x51]);
+        }
+        parent.extend_from_slice(&[0, 0, 0, 0]);
+        let parent_id = sha256d(&parent);
+        let mut subject = vec![1, 0, 0, 0, 1];
+        subject.extend_from_slice(&parent_id);
+        subject.extend_from_slice(&[0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 1]);
+        subject.extend_from_slice(&1000u64.to_le_bytes());
+        subject.extend_from_slice(&[4, 0x51, 0x61, 0x61, 0x61, 0, 0, 0, 0]);
+        assert_eq!(subject.len(), 64);
+        let subject_id = sha256d(&subject);
+        // BUMPs: the parent's at 800000 (one leaf), the subject's at 800002
+        // (the subject at offset 0, a sibling at offset 1).
+        let mut beef = vec![1, 1, 1, 1];
+        beef.extend_from_slice(&subject_id);
+        beef.extend_from_slice(&0xefbe_0002u32.to_le_bytes());
+        beef.push(2);
+        beef.extend_from_slice(&[0xfe, 0x00, 0x35, 0x0c, 0x00, 1, 1, 0, 2]);
+        beef.extend_from_slice(&parent_id);
+        beef.extend_from_slice(&[0xfe, 0x02, 0x35, 0x0c, 0x00, 1, 2, 0, 2]);
+        beef.extend_from_slice(&subject_id);
+        beef.extend_from_slice(&[1, 0]);
+        beef.extend_from_slice(&[0x5a; 32]);
+        beef.extend_from_slice(&[2, 1, 0]);
+        beef.extend_from_slice(&parent);
+        beef.extend_from_slice(&[1, 1]);
+        beef.extend_from_slice(&subject);
+
+        let beef = parse_inline_beef(&beef).expect("parsed");
+        let txid = beef.atomic_txid.clone().expect("atomic");
+        let raw_tx = beef
+            .find_txid(&txid)
+            .and_then(|e| e.tx())
+            .unwrap()
+            .to_binary();
+        assert_eq!(raw_tx, subject);
+        assert!(
+            beef.find_bump(&txid).is_some(),
+            "the subject's BUMP is found"
+        );
+        assert!(!crate::beef_at_rest::bump_proves_subject(
+            &raw_tx,
+            beef.find_bump(&txid).is_some()
+        ));
+    }
 
     // =========================================================================
     // validate_merge_status

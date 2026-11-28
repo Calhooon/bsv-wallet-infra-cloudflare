@@ -33,6 +33,16 @@ are named by their program and their date, and the manifest then read 0.1.0.
   on every family at the payment figure and on the BUMP families at the sizes
   between, and holds the largest payment the doors admit within the payment
   figure, through `internalizeAction`'s steps, under the request ceiling.
+- **`internalizeAction` takes a subject of exactly 64 bytes as unproven**: a
+  BUMP is not read as its proof, in the inline and the at-rest form; it is
+  posted and waits for its proof like any unproven subject. The rule is the
+  library's (bsv-rs 0.8.15, GHSA-jjhc-7hvh-c3hm); one function,
+  `beef_at_rest::bump_proves_subject`, says it for both forms. Every other
+  length is read as before.
+- **Tests.** The function at 63, 64 and 65 bytes; the at-rest reading and the
+  inline form's word for a 64-byte subject; `tests/worker_beef_at_rest.mjs`
+  holds both forms on the compiled Worker: unproven, posted, a request left
+  for the monitor, no proof stored.
 - No migration, no `wrangler.toml` change.
 
 ## 0.7.8, 2026-11-28: the monitor's reorg passes store a proof only after it is checked
