@@ -632,40 +632,40 @@ try {
     assert.equal(await ownerBalance(), balance, `${label}: the owner's balance moved`)
     return r
   }
-  await check('mk1 B1: a subject with neither proof nor parent, naming another user\'s coin, refused before any write as the reference refuses it; the owner\'s rows and balance as they were', async () => {
+  await check('mk1 a subject with neither proof nor parent, naming another user\'s coin, refused before any write as the reference refuses it; the owner\'s rows and balance as they were', async () => {
     markArcade = 'invalid'; markWoc = 'unknown'
     const c = await coin(201); const subject = spendOf(c, 202)
     const posts = markPosts
-    const r = await unchanged('B1', () => take(bare(subject), 201))
+    const r = await unchanged('mk1', () => take(bare(subject), 201))
     assert.deepEqual(r.error, { code: -32602, message: 'The tx parameter must be valid AtomicBEEF' }, JSON.stringify(r))
     assert.equal(await callerTx(txid(subject)), null); assert.equal(markPosts, posts)
   })
   for (const [label, arcadeAnswer] of [['invalid', 'invalid'], ['double-spend', 'double']]) {
-    await check(`mk2 B1 with the parent: the broadcaster's ${label} and the second source's "not known" leave the owner's rows and balance as they were; the caller's own row is failed`, async () => {
+    await check(`mk2 with the parent: the broadcaster's ${label} and the second source's "not known" leave the owner's rows and balance as they were; the caller's own row is failed`, async () => {
       markArcade = arcadeAnswer; markWoc = 'unknown'
       const c = await coin(arcadeAnswer === 'invalid' ? 211 : 221); const subject = spendOf(c, arcadeAnswer === 'invalid' ? 212 : 222)
-      const r = await unchanged(`B1 ${label}`, () => take(withParent(c, subject), arcadeAnswer === 'invalid' ? 211 : 221))
+      const r = await unchanged(`mk2 ${label}`, () => take(withParent(c, subject), arcadeAnswer === 'invalid' ? 211 : 221))
       assert.ok(r.error, JSON.stringify(r)); assert.match(r.error.message, /rejected by network/)
       assert.equal((await callerTx(txid(subject))).status, 'failed')
     })
   }
-  await check('mk3 B1\': a policy refusal (465) leaves the owner\'s rows and balance as they were', async () => {
+  await check('mk3 a policy refusal (465) leaves the owner\'s rows and balance as they were', async () => {
     markArcade = 'policy'; markWoc = 'unknown'
     const c = await coin(231); const subject = spendOf(c, 232)
-    const r = await unchanged('B1\' policy', () => take(withParent(c, subject), 231))
+    const r = await unchanged('mk3 policy', () => take(withParent(c, subject), 231))
     assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
     assert.equal((await callerTx(txid(subject))).status, 'sending')
   })
-  await check('mk4 B1\': no verdict under INTERNALIZE_ZERO_CONF=true leaves the owner\'s rows and balance as they were; the caller\'s payment is credited as before', async () => {
+  await check('mk4 no verdict under INTERNALIZE_ZERO_CONF=true leaves the owner\'s rows and balance as they were; the caller\'s payment is credited as before', async () => {
     markArcade = 'unverified'; markWoc = 'unknown'
     const c = await coin(241); const subject = spendOf(c, 242)
-    const r = await unchanged('B1\' transient', () => take(withParent(c, subject), 241))
+    const r = await unchanged('mk4 transient', () => take(withParent(c, subject), 241))
     assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
     const credit = await marks.db.prepare('SELECT spendable FROM outputs WHERE txid = ?').bind(txid(subject)).first()
     assert.equal(credit.spendable, 1)
   })
   for (const [label, woc] of [['errs', 'error'], ['answers "not known"', 'unknown']]) {
-    await check(`mk5 B4: the owner's mined payment, proven, its request purged; another user internalizes its bytes, the broadcaster refuses, the second source ${label}: the owner's rows and balance as they were`, async () => {
+    await check(`mk5 the owner's mined payment, proven, its request purged; another user internalizes its bytes, the broadcaster refuses, the second source ${label}: the owner's rows and balance as they were`, async () => {
       markArcade = 'invalid'; markWoc = woc
       const n = woc === 'error' ? 251 : 261
       const c = await coin(n)
@@ -678,7 +678,7 @@ try {
       const tx = (await marks.db.prepare('SELECT transaction_id FROM transactions WHERE reference = ?').bind(`pay-${n}`).first()).transaction_id
       await marks.exec('UPDATE outputs SET spent_by = ? WHERE output_id = ?', tx, c.output)
       await marks.exec("INSERT INTO outputs (user_id, transaction_id, basket_id, vout, satoshis, provided_by, purpose, type, txid, locking_script, spendable, change) VALUES (?, ?, ?, 0, 1000, 'storage', 'change', 'P2PKH', ?, ?, 1, 1)", owner, tx, ownerBasket, txid(t), Buffer.from([0x51]))
-      const r = await unchanged(`B4 ${label}`, () => take(withParent(c, t), n))
+      const r = await unchanged(`mk5 ${label}`, () => take(withParent(c, t), n))
       if (woc === 'error') {
         // A refusal the second source could not answer: held, the caller's output not credited.
         assert.ok(r.result, JSON.stringify(r)); assert.equal(r.result.accepted, true)
