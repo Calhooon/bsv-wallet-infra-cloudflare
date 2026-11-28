@@ -4363,10 +4363,11 @@ mod tests {
 
     #[test]
     fn test_tsc_proof_to_binary_large_index() {
-        // Large index value
-        let h1 = "a".repeat(64);
-        let h2 = "b".repeat(64);
-        let proof = make_test_proof(1_000_000, vec![&h1, &h2]);
+        // Large index value, in a tree tall enough to hold it (2^20 > 1,000,000).
+        let nodes: Vec<String> = (0..20u8)
+            .map(|k| format!("{:02x}", k + 1).repeat(32))
+            .collect();
+        let proof = make_test_proof(1_000_000, nodes.iter().map(String::as_str).collect());
         let result = tsc_proof_to_binary(&proof, 800_000);
         assert!(result.is_ok());
     }
